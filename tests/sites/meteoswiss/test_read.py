@@ -1,4 +1,4 @@
-"""Read path on the OGD ICON-CH2-EPS samples under the varda schema (plan step 5).
+"""Read path on the OGD ICON-CH2-EPS samples, varda schema (requirements.md §2.5).
 
 The samples are archived natively into a temporary FDB and read back through the
 plugin's provider and storage objects. Everything that touches FDB runs in a
@@ -150,7 +150,7 @@ def test_read_model_requires_metkit_home(site_fdb, read_site):
 
 
 def test_number_context(site_fdb, read_site):
-    # metkit accepts number only with type=pf (spec §8)
+    # metkit accepts number only with type=pf (requirements.md §2.14)
     query = site_fdb["queries"]["t2m_cf"] + ",number=0"
     error = read_site({"cf": query})["results"]["cf"].get("error", "")
     assert error.startswith("WorkflowError: Invalid MARS request"), error

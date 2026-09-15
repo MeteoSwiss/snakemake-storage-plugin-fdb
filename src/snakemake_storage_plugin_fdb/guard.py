@@ -1,4 +1,4 @@
-"""Identifier guard hook for identifier-mode archiving (spec §7.7).
+"""Identifier guard hook for identifier-mode archiving (FR-STORE-008, ADR-013).
 
 A guard checks each GRIB message against the identifier the plugin built for it, before
 anything is archived. v1 ships the hook only: ``identifier_check=none`` selects

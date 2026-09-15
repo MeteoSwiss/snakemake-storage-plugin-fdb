@@ -1,4 +1,4 @@
-"""Glob on the OGD ICON-CH2-EPS samples under the varda schema (plan step 7).
+"""Glob on the OGD ICON-CH2-EPS samples under the varda schema (requirements.md §2.8).
 
 The samples are archived natively into a temporary FDB, then patterns are globbed
 through ``StorageObject.list_candidate_matches`` and Snakemake's own
@@ -82,7 +82,7 @@ def globbed(
 
 def test_glob_members(globbed):
     res = globbed["members"]
-    # each candidate is the pattern with the member substituted (spec §7.9)
+    # each candidate is the pattern with the member substituted (FR-GLOB-001)
     assert res["candidates"] == [
         apply_wildcards(res["query"], {"member": m}) for m in ("1", "2")
     ]

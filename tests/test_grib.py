@@ -28,7 +28,7 @@ def needs_raw(func):
     return pytest.mark.needs_raw(_raw_present(func))
 
 
-# spec §2.1: MARS namespace keys and paramId of the ECMWF samples
+# architecture.md §13.2: MARS namespace keys and paramId of the ECMWF samples
 RAW_SAMPLES = {
     "template.grib": (
         10800,
@@ -248,7 +248,7 @@ def test_grib2_sample_with_centre_215(grib2):
 def test_variant_zeroed():
     raw = (RAW / "template.grib").read_bytes()
     small = variant(raw, stream="oper", step=6, date=20200102)
-    assert 200 <= len(small) <= 300  # ~236 bytes (spec §9.1)
+    assert 200 <= len(small) <= 300  # ~236 bytes (NFR-PERF-004)
     mars, param_id = mars_keys(small)
     assert mars["stream"] == "oper" and mars["step"] == "6"
     assert mars["date"] == "20200102"

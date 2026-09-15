@@ -1,8 +1,8 @@
 """pyfdb access layer: config and schema resolution, per-thread handles, inspect, list,
-retrieve, archive, timestamps, request expansion and error mapping (spec §2, §5, §6).
+retrieve, archive, timestamps, expansion and error mapping (architecture.md §5.4).
 
-``pyfdb`` is imported lazily (first FDB handle or ``Backend.expand()``), never
-at module import, so the provider can export environment variables (spec §4.1) before
+``pyfdb`` is imported lazily (first FDB handle or ``Backend.expand()``), never at module
+import, so the provider can export environment variables (architecture.md §8.3) before
 FDB, metkit and eccodes load. The config and schema helpers are pure Python. Nothing in
 this module changes the process environment; ``resolve_schema_path`` only reads it.
 """
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 ConfigValue = Path | str | dict[str, Any] | None
 
-CHUNK = 8 * 1024 * 1024  # retrieve buffer (spec §7.5)
+CHUNK = 8 * 1024 * 1024  # retrieve buffer (FR-READ-007)
 PART_SUFFIX = ".part"
 
 _TIMESTAMP_RE = re.compile(r"timestamp=(\d+)\s*$")
@@ -42,7 +42,7 @@ _SCHEMA_COMMENT_RE = re.compile(r"#[^\n]*")
 _SCHEMA_KEY_RE = re.compile(r"\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*)", re.S)
 _USER_ERROR_PREFIX = re.compile(r"^(?:(?:UserError|Serious bug):\s*)+")
 
-# Substrings of pyfdb RuntimeError messages (spec §6, verified on pyfdb 5.21.4.23)
+# Substrings of pyfdb RuntimeError messages (architecture.md §8.4; pyfdb 5.21.4.23)
 _SPLITTER = "Cannot find a metkit SplitterBuilder"
 _SCHEMA_MISMATCH = ("Keywords not used", "Could not find [", "Could not find a rule")
 _CONFIG = ("Cannot open", "No writable roots available")
@@ -50,15 +50,15 @@ _CONFIG = ("Cannot open", "No writable roots available")
 
 @dataclass(frozen=True)
 class Field:
-    """One FDB field as seen by ``inspect``/``list`` (spec §6)."""
+    """One FDB field as seen by ``inspect``/``list`` (architecture.md §5.4)."""
 
     key: dict[str, str]  # combined key, canonical values
     length: int  # message length in bytes; 0 below schema level 3
-    timestamp: int  # index flush time, POSIX seconds; 0 if unknown (spec §2.2)
+    timestamp: int  # index flush time (POSIX s); 0 if unknown (architecture.md §13.3)
     uri_path: str | None  # data file path for local toc stores
 
 
-try:  # libc time(): the clock FDB stamps indexes with (spec §2.2)
+try:  # libc time(): the clock FDB stamps indexes with (architecture.md §8.7)
     _c_time = ctypes.CDLL(None).time
     _c_time.restype = ctypes.c_long
     _c_time.argtypes = [ctypes.c_void_p]
@@ -70,7 +70,8 @@ except (OSError, AttributeError, TypeError):  # TypeError: Windows (unsupported)
 def fdb_time() -> int:
     """The current second on FDB's index clock, libc ``time()``: just after a second
     boundary it can still give the previous second when ``int(time.time())`` already
-    gives the new one (spec §2.2). ``int(time.time())`` where libc cannot be loaded."""
+    gives the new one (architecture.md §8.7). ``int(time.time())`` where libc
+    cannot be loaded."""
     return _c_time(None) if _c_time is not None else int(time.time())
 
 
@@ -85,11 +86,11 @@ class SchemaInfo:
 
 
 def resolve_config(value: str | None) -> Path | str | None:
-    """Setting value -> argument for ``pyfdb.FDB`` (spec §4).
+    """Setting value -> argument for ``pyfdb.FDB`` (FR-CONF-002).
 
     An existing file becomes a ``Path``; otherwise the text must parse as a YAML (or
     JSON) mapping and is returned unchanged. Anything else raises ``WorkflowError``,
-    because pyfdb silently ignores a path string it cannot parse (spec §2.6).
+    because pyfdb ignores a path string it cannot parse (architecture.md §13.7).
     """
     if value is None:
         return None
@@ -214,7 +215,7 @@ def parse_schema(schema_text: str) -> SchemaInfo:
 
 
 def fallback_expand(request: Mapping[str, str]) -> dict[str, list[str]]:
-    """Pure-Python expansion when metkit's is unavailable (spec §3.4).
+    """Pure-Python expansion when metkit's is unavailable (architecture.md §8.8).
 
     Splits ``/`` lists and expands ``a/to/b[/by/c]`` for integers and ``YYYYMMDD``
     dates (step in days). No alias resolution; other ranges keep their items verbatim,
@@ -269,7 +270,7 @@ def _as_date(value: str) -> date | None:
 
 def count_fields(expanded: Mapping[str, list[str]]) -> int:
     """Expected field count ``E`` of an expanded request: product of the distinct
-    values per key (spec §3.4)."""
+    values per key (architecture.md §8.8)."""
     return math.prod(len(set(values)) for values in expanded.values())
 
 
@@ -281,9 +282,10 @@ def _detail(exc: BaseException) -> str:
 def map_error(
     exc: BaseException, query: str, local: str | os.PathLike[str] | None = None
 ) -> WorkflowError | None:
-    """``WorkflowError`` for a known pyfdb/GRIB failure, ``None`` otherwise (spec §6).
+    """``WorkflowError`` for a known pyfdb/GRIB failure, ``None`` otherwise.
 
-    The caller raises the result ``from exc`` or re-raises ``exc`` when ``None``.
+    The caller raises the result ``from exc`` or re-raises ``exc`` when ``None``
+    (mapping table: architecture.md §8.4).
     """
     if isinstance(exc, GribError):
         return WorkflowError(str(exc))
@@ -313,7 +315,7 @@ def map_error(
 
 class Backend:
     """pyfdb access for one provider: one archiving ``pyfdb.FDB`` per thread and a
-    fresh handle per read (spec §5).
+    fresh handle per read (architecture.md §8.6).
 
     Methods propagate pyfdb's ``RuntimeError``s unchanged; callers convert them with
     ``map_error`` so the message can name the query and local file.
@@ -349,8 +351,8 @@ class Backend:
         """A new handle for one read.
 
         A handle that has read a database keeps that catalogue: fields archived later,
-        by any handle, stay invisible to its ``inspect``/``list``/``retrieve`` (spec
-        §2.4). Opening a handle is cheap, so every read gets a fresh one.
+        by any handle, stay invisible to its ``inspect``/``list``/``retrieve``
+        (architecture.md §8.6). Opening a handle is cheap, so reads get a fresh one.
         """
         return self._open()
 
@@ -364,7 +366,7 @@ class Backend:
         level: int = 3,
         include_masked: bool = False,
     ) -> list[Field]:
-        """``fdb.list``: omitted keys are wildcards (spec §2.3)."""
+        """``fdb.list``: omitted keys are wildcards (architecture.md §13.4)."""
         elements = self.reader().list(
             dict(selection), include_masked=include_masked, level=level
         )
@@ -464,7 +466,7 @@ class Backend:
         ``expanded`` is the expansion of ``parsed.constant_pairs()`` if the caller has
         it already (else it is computed here). Keys with wildcards or ``to``/``by``
         ranges are exempt; lists are compared item by item. Empty (with a debug log)
-        if expansion is unavailable (spec §7.12).
+        if expansion is unavailable (FR-SPELL-001).
         """
         request = parsed.constant_pairs()
         if expanded is None:
@@ -486,7 +488,7 @@ class Backend:
 
     @staticmethod
     def timestamp_of(element: object) -> int:
-        """Index flush time from a ``ListElement`` repr (spec §2.2); 0 if absent."""
+        """Flush time from a ``ListElement`` repr, else 0 (architecture.md §13.3)."""
         m = _TIMESTAMP_RE.search(repr(element))
         return int(m.group(1)) if m else 0
 

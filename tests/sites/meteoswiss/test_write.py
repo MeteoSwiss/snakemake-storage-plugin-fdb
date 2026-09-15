@@ -1,4 +1,4 @@
-"""Write path on the OGD ICON-CH2-EPS samples under the varda schema (plan step 6).
+"""Write path on the OGD ICON-CH2-EPS samples, varda schema (requirements.md §2.6).
 
 Each test stores samples through ``StorageObject.store_object`` into an empty
 temporary FDB, in both archive modes, and reads them back through the plugin. As in
@@ -118,7 +118,7 @@ def test_write_ctrl(write_job, archive_mode):
     assert key["number"] == ""
     assert key["timespan"] == "none"
     assert key["param"] == "500011"
-    assert key["domain"] == ""  # removed by the schema's domain- (spec §2.8)
+    assert key["domain"] == ""  # removed by the schema (architecture.md §13.9)
 
 
 @pytest.mark.parametrize("archive_mode", MODES)
@@ -148,7 +148,7 @@ def test_write_strict_rejects_foreign_member(write_job, archive_mode):
 
 
 def test_write_identifier_param_mismatch(write_job):
-    # single-valued query keys are checked against the GRIB (spec §7.7)
+    # single-valued query keys are checked against the GRIB (FR-STORE-005)
     fields = "type=cf,param=500041"  # the file holds T_2M (500011)
     out = write_job("identifier", {"t2m_cf": ("*_step6_t_2m_ctrl.grib2", fields, {})})
     res = out["results"]["t2m_cf"]

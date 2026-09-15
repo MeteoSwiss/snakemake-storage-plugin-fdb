@@ -15,7 +15,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 DEST=$REPO/.local
 MARS_URL=https://github.com/MeteoSwiss/eccodes-cosmo-mars.git
 MARS_BRANCH=varda-ext
-# Same minor series as the eccodes bundled with the locked pyfdb (spec §11).
+# Same minor series as the eccodes bundled with the locked pyfdb (NFR-COMPAT-002).
 RESOURCES="eccodes-cosmo-resources-python>=2.47.0.1,<2.48"
 
 USAGE="usage: bash examples/meteoswiss/setup.sh [--dest DIR]   (default DIR: .local)"

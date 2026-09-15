@@ -1,4 +1,4 @@
-"""MeteoSwiss site suite: prerequisites from ``SMK_FDB_TEST_*`` env vars (spec §9.2).
+"""MeteoSwiss suite: prerequisites from ``SMK_FDB_TEST_*`` (architecture.md §8.9).
 
 Each missing prerequisite is its own skip reason; with ``SMK_FDB_TEST_REQUIRE_SITES=1``
 it is a failure instead. Nothing in ``src/`` knows about this suite.

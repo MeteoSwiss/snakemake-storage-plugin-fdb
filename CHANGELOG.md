@@ -30,3 +30,5 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MeteoSwiss site material outside the package: `examples/meteoswiss/` (schema,
   profile, workflow, definitions setup, metkit home and sample fetch scripts) and
   `docs/sites/meteoswiss.md`.
+- Documentation: a user guide, a reference and contributing notes under `docs/`, and a
+  rewritten README with a quick start.

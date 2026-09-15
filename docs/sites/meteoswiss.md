@@ -18,7 +18,7 @@ ICON GRIB2 from MeteoSwiss (centre `lssw`) needs two definition sets, cosmo-mars
 `examples/meteoswiss/setup.sh` does both into `.local/` and prints the value for the
 `eccodes_definitions` setting (or for `ECCODES_DEFINITION_PATH`):
 
-```
+```text
 .local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions
 ```
 
@@ -45,7 +45,7 @@ here): `cosmo-1e`, `cosmo-2e`, `kenda-1`, `snowpolino`, `icon-ch1-eps`,
 
 `examples/meteoswiss/realtime-varda.schema` is evalml's FDB schema:
 
-```
+```text
 [ date, time, stream, class, expver, model, type, domain-
     [ levtype, number?
         [ step, param, levelist?, timespan?none ]]]
@@ -63,14 +63,15 @@ storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]
 ```
 
 Tagged settings do not reach spawned job processes in Snakemake 9.27 (`run:` rules,
-cluster jobs); use `shell` rules with the local executor or untagged settings.
+cluster jobs); use `shell` rules with the local executor or untagged settings (see
+[Tagged settings and spawned jobs](../user-guide.md#tagged-settings-and-spawned-jobs)).
 
 The example README has the dev-FDB command (`scripts/init_dev_fdb.py --root .fdb-mch
 ...` with the site environment) and the run instructions.
 
 ## Query conventions
 
-```
+```text
 fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=20260915,time=1200,type=cf,levtype=sfc,step=6,param=500011
 fdb://...,type=cf,step=6,timespan=fs,param=500041          accumulations need timespan=fs
 fdb://...,type=pf,number=1/2,step=6,param=500011           number only with type=pf

@@ -25,7 +25,7 @@ uv run python examples/meteoswiss/make_metkit_home.py    # .local/metkit-home
 `setup.sh` is idempotent (it updates the clone and re-installs) and takes `--dest DIR`
 instead of `.local`; it prints the `eccodes_definitions` value:
 
-```
+```text
 .local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions
 ```
 
@@ -89,29 +89,14 @@ accumulations).
 
 `.raw/meteoswiss/` holds three ICON-CH2-EPS files (control T_2M, control TOT_PREC,
 perturbed T_2M members 1–2) as constant-field copies of 175–350 bytes with the original
-MARS keys. To refresh them (OGD keeps data for 24 h, so this picks the newest forecast):
-
-```bash
-ECCODES_DEFINITION_PATH=$DEFS ECCODES_VERSION_CHECK_OFF=1 \
-    uv run python examples/meteoswiss/fetch_ogd_samples.py --empty-data --force
-```
-
-Without `--empty-data` it only writes the full-size files to
-`.local/raw-full/meteoswiss/` (git-ignored); `--out DIR` and `--empty-data DIR` choose
-other directories, `--reference-datetime`, `--horizon` and `--members` other fields.
-The file names carry the reference time, which the tests read.
+MARS keys. `fetch_ogd_samples.py` downloads full-size files to the git-ignored
+`.local/raw-full/meteoswiss/`; `--out DIR` and `--empty-data DIR` choose other
+directories, `--reference-datetime`, `--horizon` and `--members` other fields. How to
+refresh the committed copies is in
+[`docs/contributing.md`](../../docs/contributing.md#refreshing-samples).
 
 ## Site tests
 
-```bash
-export SMK_FDB_TEST_MCH_SAMPLES=$PWD/.raw/meteoswiss \
-    SMK_FDB_TEST_ECCODES_DEFINITIONS=$DEFS \
-    SMK_FDB_TEST_METKIT_HOME=$PWD/.local/metkit-home \
-    ECCODES_VERSION_CHECK_OFF=1
-SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs
-```
-
-`SMK_FDB_TEST_MCH_SCHEMA` defaults to `examples/meteoswiss/realtime-varda.schema`. Without
-the variables the suite skips, naming what is missing; with `SMK_FDB_TEST_REQUIRE_SITES=1`
-it fails instead. The live OGD test runs only with `SMK_FDB_TEST_OGD_LIVE=1` and writes
-into pytest's temporary directory.
+The site test suite (`tests/sites/meteoswiss/`) uses this material; its setup and the
+`SMK_FDB_TEST_*` variables are described in
+[`docs/contributing.md`](../../docs/contributing.md#site-suite).

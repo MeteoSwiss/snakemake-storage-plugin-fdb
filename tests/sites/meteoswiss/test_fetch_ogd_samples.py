@@ -1,4 +1,4 @@
-"""``examples/meteoswiss/fetch_ogd_samples.py`` (plan step 10).
+"""``examples/meteoswiss/fetch_ogd_samples.py`` (FR-DEV-002).
 
 Neither test needs anything in the default run: the offline test needs the git-ignored
 full-size originals in ``.local/raw-full/meteoswiss/``, the live test needs network

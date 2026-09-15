@@ -1,4 +1,4 @@
-"""Query language: parser, normaliser, local path and request builders (spec §3).
+"""Query language, normalisation and local paths (requirements.md §2.1, §2.2).
 
 Pure Python: must not import ``pyfdb``, ``eccodes`` or metkit, since
 ``is_valid_query`` and ``postprocess_query`` run for every query during DAG building.
@@ -104,7 +104,7 @@ def _replace_literal(value: str, old: str, new: str) -> str:
 
 
 def comparable(key: str, value: str) -> int | str | None:
-    """Light normalisation of a MARS value for comparisons (spec §7.7): integers
+    """Light normalisation of a MARS value for comparisons (FR-STORE-005): integers
     compare numerically (``time`` of one or two digits as hours, ``12`` -> ``1200``),
     ``param`` as a paramId (``N.T`` -> ``N`` for table 128, else ``T*1000+N``),
     everything else case-insensitively. ``None`` (not comparable) for other ``param``
@@ -295,7 +295,7 @@ def _parse_value(key: str, pieces: list[_Piece]) -> str:
 
 
 def parse(query: str, order: KeyOrder | None = None) -> ParsedQuery:
-    """Parse ``query`` (spec §3.1) and sort keys by ``order`` (generic if ``None``).
+    """Parse ``query`` (FR-QUERY-001) and sort keys by ``order`` (generic if ``None``).
 
     Raises ``QueryError`` with a message naming the problem.
     """
@@ -340,7 +340,7 @@ def parse(query: str, order: KeyOrder | None = None) -> ParsedQuery:
 
 
 def normalize(query: str, order: KeyOrder | None = None) -> str:
-    """Purely syntactic normalisation (spec §3.2): whitespace, key case, key order."""
+    """Syntactic normalisation (FR-QUERY-007): whitespace, key case, key order."""
     return parse(query, order).to_query()
 
 

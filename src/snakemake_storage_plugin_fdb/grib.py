@@ -1,10 +1,10 @@
-"""GRIB helpers on eccodes: message splitting, MARS keys, variants (spec §7.7).
+"""GRIB helpers on eccodes: message splitting, MARS keys, variants (FR-STORE-001).
 
 ``eccodes`` is imported inside the functions, never at module import, so the package
 imports without the native library and definitions configured through
-``ECCODES_DEFINITION_PATH`` (spec §4.1) are in place when eccodes loads. This module
-never reads or changes that variable: keys are decoded with whatever definitions the
-process has.
+``ECCODES_DEFINITION_PATH`` (architecture.md §8.3) are in place when eccodes loads.
+This module never reads or changes that variable: keys are decoded with whatever
+definitions the process has.
 """
 
 from __future__ import annotations

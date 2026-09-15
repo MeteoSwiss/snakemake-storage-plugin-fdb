@@ -1,5 +1,5 @@
-"""Provider and storage object (provider: plan step 4, read path: step 5, write
-path: step 6, glob: step 7, ``TestStorageBase`` and interface conformance: step 8).
+"""Provider and storage object: settings, read, write, glob and interface conformance
+(requirements.md §2.1–§2.11).
 """
 
 import asyncio
@@ -41,7 +41,7 @@ REPO = Path(__file__).resolve().parents[1]
 RAW = REPO / ".raw"
 TEST_SCHEMA = Path(__file__).resolve().parent / "data" / "schema"
 ECMWF_SCHEMA = TEST_SCHEMA.with_name("ecmwf-fdb-tests.schema")  # multi-rule
-SYNTH11_QUERY = (  # .raw/synth11.grib as is (spec §2.1)
+SYNTH11_QUERY = (  # .raw/synth11.grib as is (architecture.md §13.2)
     "fdb://class=od,expver=0001,stream=oper,date=20230508,time=1200,domain=g,"
     "type=fc,levtype=sfc,step=1,param=151130"
 )
@@ -196,7 +196,7 @@ def test_interface_conformance():
     assert not StorageProvider.__abstractmethods__
     assert not StorageObject.__abstractmethods__
     assert issubclass(StorageObject, StorageObjectGlob)
-    # deliberately absent: --touch then fails upfront for FDB outputs (spec §7.10)
+    # deliberately absent: --touch fails upfront for FDB outputs (requirements.md §6.1)
     assert not issubclass(StorageObject, StorageObjectTouch)
 
 
@@ -259,7 +259,7 @@ def test_storage_object_follows_query_rewrite(make_provider):
 
 
 def _substitute(obj: StorageObject, **wildcards: str) -> StorageObject:
-    """What Snakemake does for a job: ``_IOFile.apply_wildcards`` (spec §2.7)."""
+    """Like Snakemake for a job: ``_IOFile.apply_wildcards`` (architecture.md §13.8)."""
     iofile = IOFile(flag(str(obj.local_path()), "storage_object", obj))
     return iofile.apply_wildcards(wildcards).storage_object
 
@@ -299,15 +299,15 @@ def test_wildcard_guard_unrecorded_short_query_accepted(make_provider):
     assert obj.local_suffix().endswith("param=167.grib")
 
 
-# --- read path (plan step 5) ----------------------------------------------------------
+# --- read path (requirements.md §2.5) -------------------------------------------------
 
 
 class FDBStorageBase(TestStorageBase):
     """``TestStorageBase`` on a provider for the FDB configured in ``self.config``
     (an empty temp FDB unless a test replaces it)."""
 
-    files_only = True  # directories are not supported (spec §1)
-    touch = False  # no StorageObjectTouch (spec §7.10)
+    files_only = True  # directories are not supported (FR-IFACE-001)
+    touch = False  # no StorageObjectTouch (FR-IFACE-001)
     config: dict
 
     @pytest.fixture(autouse=True)
@@ -322,7 +322,7 @@ class FDBStorageBase(TestStorageBase):
 
 
 class TestStorageRead(FDBStorageBase):
-    """Base tests on pre-archived fields (spec §9.4). ``test_storage`` and
+    """Base tests on pre-archived fields (architecture.md §8.9). ``test_storage`` and
     ``test_storage_not_existing`` read the seeded FDB and need ``.raw/``;
     ``test_query_validation`` and ``test_example_queries`` run without data."""
 
@@ -394,7 +394,7 @@ def test_exists_partial_retrieve_names_missing(seeded_provider):
 
 @needs_raw
 def test_exists_missing_optional_key_and_mtime_not_found(seeded_provider):
-    # the seeded fields carry domain=g; inspect needs it named (spec §2.3, §7.1)
+    # the seeded fields carry domain=g; inspect needs it named (FR-READ-001)
     obj = seeded_provider().object(
         f"fdb://{EA.replace(',domain=g', '')},step=0,param=167"
     )
@@ -548,11 +548,11 @@ def test_canonical_spelling_silent(seeded_provider, caplog, setting, fields):
     assert not _warnings(caplog)
 
 
-# --- write path (plan step 6) ---------------------------------------------------------
+# --- write path (requirements.md §2.6) ------------------------------------------------
 
 # expver=0002 variants of template.grib built per test (class=ea, stream=oper)
 STORE_QUERY = f"fdb://{EA2},step=0/6/12,param=167"
-# template.grib as is (stream=enda, number=0; NUL-padded GRIB1, spec §2.1)
+# template.grib as is (stream=enda, number=0; NUL-padded GRIB1, architecture.md §13.2)
 TEMPLATE_QUERY = (
     "fdb://class=ea,expver=0001,stream=enda,date=20200101,time=0000,domain=g,"
     "type=an,levtype=sfc,step=0,number=0,param=167"
@@ -624,7 +624,7 @@ def test_store_template(make_provider, schema, archive_mode, error):
     obj = _store(provider, TEMPLATE_QUERY, data)
     assert obj.exists() is True
     (message,) = split_messages(obj.local_path())
-    assert obj.size() == message.length < len(data)  # NUL padding not stored (§7.2)
+    assert obj.size() == message.length < len(data)  # padding not stored (FR-READ-005)
     (field,) = provider.backend.list({"class": "ea", "stream": "enda"})
     assert ("number" in field.key) == (schema == TEST_SCHEMA)
 
@@ -670,7 +670,7 @@ def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
     assert obj.exists() is False
     assert _in_fdb(provider, STORE_QUERY) == 2
     # foreign fields still fail (steps without earlier fields: the post-check has
-    # one-second resolution, spec §7.7)
+    # one-second resolution, FR-STORE-009)
     error = "outside the query" if archive_mode == "native" else "has step=0"
     with pytest.raises(WorkflowError, match=error):
         _store(provider, f"fdb://{EA2},step=12/18/24,param=167", _grib((0, 18)))
@@ -678,7 +678,7 @@ def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
 
 @needs_raw
 def test_store_default_native_under_multi_rule_schema(make_provider):
-    """Native is the default (spec §7.7): identifier mode needs a value for every key
+    """Native is the default (ADR-009): identifier mode needs a value for every key
     that is mandatory in any rule of a multi-rule schema."""
     provider = make_provider(schema=ECMWF_SCHEMA)
     data = (RAW / "synth11.grib").read_bytes()
@@ -729,7 +729,7 @@ def test_store_identifier_single_value_mismatch(make_provider, fields, messages,
     "key, given, canonical",
     [
         ("param", "167", "167"),
-        ("param", "167.128", "167"),  # FDB would store it verbatim (spec §2.4)
+        ("param", "167.128", "167"),  # FDB stores it verbatim (architecture.md §13.5)
         ("time", "0", "0000"),  # FDB would reject it as not canonical
         ("time", "00", "0000"),
     ],
@@ -738,7 +738,7 @@ def test_store_identifier_archives_canonical_spelling(
     make_provider, key, given, canonical
 ):
     # the GRIB says param=167.128 (paramId 167), time=0000: the pre-check passes and
-    # the identifier uses the canonical spelling (spec §7.7)
+    # the identifier uses the canonical spelling (FR-STORE-006)
     provider = make_provider(archive_mode="identifier")
     canonical_query = f"fdb://{EA2},step=0,param=167"
     query = canonical_query.replace(f"{key}={canonical}", f"{key}={given}")
@@ -766,9 +766,9 @@ def test_store_identifier_verbatim_without_expansion(
 
 @needs_raw
 def test_store_post_check_uses_fdb_clock(make_provider, monkeypatch):
-    # FDB's clock can lag int(time.time()) by a second (spec §2.2): with both the clock
-    # and the index timestamps at a past second, the store passes its post-check only
-    # if t_start is taken from fdb_time() (§7.7)
+    # FDB's clock can lag int(time.time()) by a second (architecture.md §8.7): with
+    # both the clock and the index timestamps at a past second, the store passes its
+    # post-check only if t_start is taken from fdb_time() (FR-STORE-009)
     provider = make_provider(archive_mode="identifier")
     stamp = 1_700_000_000  # below int(time.time()) for good
     real_inspect = provider.backend.inspect
@@ -915,9 +915,9 @@ def test_store_threads(make_provider):
 @needs_raw
 class TestStorageWrite(FDBStorageBase):
     """The base store sequence on an empty FDB: store, delete the local copy, exists,
-    mtime, size, checksum, inventory, retrieve, remove (a no-op with a warning, spec
-    §7.8). ``TestStorageBase`` writes the text ``test`` before ``store_object``
-    (spec §2.7, §9.4), so the object overwrites it with GRIB for the query first."""
+    mtime, size, checksum, inventory, retrieve, remove (a no-op with a warning,
+    FR-REMOVE-001). ``TestStorageBase`` writes the text ``test`` before ``store_object``
+    (architecture.md §8.9), so the object replaces it with GRIB for the query first."""
 
     __test__ = True
 
@@ -979,11 +979,11 @@ def test_remove_policy(make_provider, caplog, policy):
     ]
 
 
-# --- glob (plan step 7) ---------------------------------------------------------------
+# --- glob (requirements.md §2.8) ------------------------------------------------------
 
 
 def _glob(obj: StorageObject) -> dict[str, list[str]]:
-    """Snakemake's own ``glob_wildcards`` on a storage-object pattern (spec §2.7)."""
+    """Snakemake's own ``glob_wildcards`` on a pattern (architecture.md §13.8)."""
     return glob_wildcards(flag(obj.query, "storage_object", obj))._asdict()
 
 
@@ -999,8 +999,8 @@ def test_glob_step_candidates_match_pattern(seeded_provider, step):
 
 @needs_raw
 def test_glob_keys_absent_from_pattern_collapse(seeded_provider):
-    # param and stream are wildcards for list (spec §2.3): 6 oper variants and the
-    # enda template give three candidates
+    # param and stream are wildcards for list (architecture.md §13.4): 6 oper variants
+    # and the enda template give three candidates
     obj = seeded_provider().object("fdb://class=ea,step={step}")
     assert obj.list_candidate_matches() == [
         "fdb://class=ea,step=0",

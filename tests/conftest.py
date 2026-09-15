@@ -1,4 +1,4 @@
-"""Shared fixtures: ECMWF samples and temporary toc FDBs (spec §9.1, §9.4).
+"""Shared fixtures: ECMWF samples and temporary toc FDBs (architecture.md §8.9).
 
 ``ECKIT_EXCEPTION_IS_SILENT`` is defaulted before any test module imports the plugin,
 so pyfdb loads with it. FDBs live under pytest's temporary directories, never ``.fdb/``.
@@ -55,7 +55,7 @@ def fdb_config_file() -> Callable[..., Path]:
 class SeededFDB:
     config: dict[str, Any]
     backend: Any  # snakemake_storage_plugin_fdb.backend.Backend
-    flush_start: int  # FDB's index clock (spec §2.2)
+    flush_start: int  # FDB's index clock (architecture.md §8.7)
     flush_end: float
 
 
@@ -83,7 +83,7 @@ def seeded_fdb(tmp_path_factory) -> SeededFDB:
     return SeededFDB(config, backend, start, time.time())
 
 
-# Variables the provider reads or exports (spec §4.1); restored after each test.
+# Variables the provider reads or exports (architecture.md §8.3); restored per test.
 PROVIDER_ENV_VARS = (
     "ECCODES_DEFINITION_PATH",
     "METKIT_HOME",

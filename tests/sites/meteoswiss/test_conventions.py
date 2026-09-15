@@ -29,7 +29,7 @@ COMMON = {
     "step": "6",
 }
 
-# (file name pattern, per-message expected keys beyond COMMON), spec §2.9
+# (file name pattern, per-message expected keys beyond COMMON), architecture.md §13.10
 SAMPLES = [
     (
         "*_step6_t_2m_ctrl.grib2",

@@ -3,7 +3,7 @@
 Importing this module loads no FDB/eccodes native library: ``is_valid_query`` and
 ``postprocess_query`` are pure Python, and ``pyfdb``/``eccodes`` are imported in
 ``StorageProvider.__post_init__`` only after the environment has been prepared
-(spec §4.1, §5).
+(architecture.md §8.3).
 """
 
 import contextlib
@@ -70,10 +70,10 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _KEY_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _ENV_LOCK = threading.Lock()
 # Values this process's providers applied from eccodes_definitions / metkit_home,
-# to warn when two providers disagree (one process environment, spec §4.1).
+# to warn when two providers disagree (one process environment, architecture.md §8.3).
 _APPLIED: dict[str, str] = {}
-# Queries already warned about (once per process): non-canonical spelling (spec
-# §7.12) and remove_policy=warn (spec §7.8).
+# Queries already warned about (once per process): non-canonical spelling
+# (FR-SPELL-001) and remove_policy=warn (FR-REMOVE-001).
 _SPELLING_WARNED: set[str] = set()
 _REMOVE_WARNED: set[str] = set()
 _WARNED_LOCK = threading.Lock()
@@ -93,7 +93,7 @@ def _first_time(registry: set[str], query: str) -> bool:
 def _retry_fdb_io(func):
     """The interface's ``retry_decorator`` (3 attempts, exponential wait from 3 s)
     raising the last attempt's own exception instead of tenacity's ``RetryError``,
-    so it can be mapped (spec §6)."""
+    so it can be mapped (architecture.md §8.5)."""
     return retry_decorator(func).retry_with(reraise=True)
 
 
@@ -293,7 +293,7 @@ class StorageProvider(StorageProviderBase):
     # --- construction helpers ------------------------------------------------------
 
     def _prepare_environment(self, settings: Any) -> None:
-        """Apply spec §4.1: validate everything first, then export in one go."""
+        """Validate everything, then export in one go (architecture.md §8.3)."""
         planned = _parse_env(settings.env)
 
         def current(name: str) -> str | None:
@@ -397,9 +397,9 @@ class StorageProvider(StorageProviderBase):
         return StorageQueryValidationResult(query=query, valid=valid, reason=reason)
 
     def postprocess_query(self, query: str) -> str:
-        """Syntactic normalisation in this provider's key order (spec §3.2).
+        """Syntactic normalisation in this provider's key order (FR-QUERY-007).
 
-        The result is recorded for the over-long wildcard guard (spec §3.3). Invalid
+        The result is recorded for the over-long wildcard guard (FR-PATH-004). Invalid
         queries are returned unchanged; the storage object reports the error on use.
         """
         try:
@@ -418,7 +418,7 @@ class StorageProvider(StorageProviderBase):
 
 
 class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
-    """One query: a MARS request mapped to one local GRIB file (spec §6)."""
+    """One query: a MARS request mapped to one local GRIB file (FR-QUERY-002)."""
 
     provider: StorageProvider
 
@@ -432,8 +432,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         parsed = self._parse()
         if parsed is None or self.provider.is_normalised(self.query):
             return
-        # Built by Snakemake from apply_wildcards() (no postprocess_query, spec §2.7):
-        # hashing a component here would break local_suffix commutation (spec §3.3).
+        # Built by Snakemake from apply_wildcards(), bypassing postprocess_query:
+        # hashing a component here would break local_suffix commutation (FR-PATH-004).
         oversized = parsed.oversized_components()
         if oversized:
             key, size = oversized[0]
@@ -488,7 +488,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def _mapping_errors(
         self, local: str | os.PathLike[str] | None = None
     ) -> Iterator[None]:
-        """Raise known pyfdb and GRIB failures as the ``WorkflowError`` of spec §6."""
+        """Known pyfdb and GRIB failures as ``WorkflowError`` (architecture.md §8.4)."""
         try:
             yield
         except (RuntimeError, GribError) as e:
@@ -498,9 +498,9 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             raise mapped from e
 
     def _expanded(self) -> dict[str, list[str]]:
-        """Expanded request (spec §3.4), cached per query text.
+        """Expanded request (architecture.md §8.8), cached per query text.
 
-        The first computation runs the canonical-spelling check (spec §7.12); an
+        The first computation runs the canonical-spelling check (FR-SPELL-001); an
         invalid request raises the mapped ``WorkflowError`` and is not cached.
         """
         if self._expansion_for != self.query:
@@ -523,7 +523,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return count_fields(self._expanded())
 
     def _check_spelling(self, expanded: dict[str, list[str]] | None) -> None:
-        """Spec §7.12 on ``expanded`` (metkit's expansion of the request, if any)."""
+        """FR-SPELL-001 on ``expanded`` (metkit's expansion of the request, if any)."""
         policy = self.provider.canonical_spelling
         if policy == "ignore":
             return
@@ -555,7 +555,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return self.provider.backend.retrieve_to(request, dest, expected)
 
     def _fields(self) -> list[Field]:
-        """Fields FDB holds for the query: one ``inspect``, not cached (spec §6)."""
+        """Fields FDB holds for the query: one ``inspect``, not cached (FR-READ-010)."""
         request = self._request()
         self._expanded()  # invalid requests and spelling errors before any FDB I/O
         with self._mapping_errors():
@@ -567,15 +567,15 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     @staticmethod
     def _total_length(fields: list[Field]) -> int:
-        """Bytes of the fields' messages (= retrieved bytes, spec §7.2)."""
+        """Bytes of the fields' messages (= retrieved bytes, FR-READ-005)."""
         return sum(f.length for f in fields)
 
     def _mtime_of(self, fields: list[Field]) -> float:
-        """Latest field time (spec §7.4)."""
+        """Latest field time (FR-READ-004)."""
         return max(self._field_time(f) for f in fields)
 
     def _field_time(self, field: Field) -> float:
-        """Index timestamp; ``os.stat`` of the data file if it is 0 (spec §7.4)."""
+        """Index timestamp; ``os.stat`` of the data file if it is 0 (FR-READ-004)."""
         return float(field.timestamp) or self._stat_mtime(field.uri_path)
 
     def _stat_mtime(self, uri_path: str | None) -> float:
@@ -595,7 +595,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def _missing_message(self, fields: list[Field]) -> str:
         """Retrieve error: found/expected counts, the first missing combinations
         (keys with several values only) and, if nothing matched, the optional
-        schema keys the query does not name (spec §7.5)."""
+        schema keys the query does not name (FR-READ-008)."""
         expanded = self._expanded()
         keys = self.provider.key_order.sorted(expanded)
         values = [list(dict.fromkeys(expanded[k])) for k in keys]
@@ -621,10 +621,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             )
         return message
 
-    # --- read path (plan step 5) ---------------------------------------------------
+    # --- read path (requirements.md §2.5) ---------------------------------------------
 
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
-        """One ``inspect`` fills existence, mtime and size of this object (§7.6)."""
+        """One ``inspect`` fills existence, mtime and size (FR-READ-009)."""
         key = self.cache_key()
         if key in cache.exists_in_storage:
             return
@@ -643,7 +643,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         store; reads use a fresh handle each."""
 
     def exists(self) -> bool:
-        """All fields the query expands to are in FDB (spec §7.1)."""
+        """All fields the query expands to are in FDB (FR-READ-001)."""
         return self._complete(self._fields())
 
     def mtime(self) -> float:
@@ -656,7 +656,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return self._total_length(self._fields())
 
     def checksum(self) -> str | None:
-        """``None``: Snakemake hashes the local copy instead (spec §7.3)."""
+        """``None``: Snakemake hashes the local copy instead (FR-READ-006)."""
         return None
 
     def retrieve_object(self) -> None:
@@ -667,10 +667,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         with self._mapping_errors(local):
             self._retrieve_to(self._request(), local, self._total_length(fields))
 
-    # --- write path (plan step 6) --------------------------------------------------
+    # --- write path (requirements.md §2.6) --------------------------------------------
 
     def store_object(self) -> None:
-        """Archive the local GRIB file under the query (spec §7.7); never retried.
+        """Archive the local GRIB file under the query (FR-STORE-*); never retried.
 
         Everything that can be checked from the file (GRIB structure, field count,
         identifiers, duplicates, guard) is checked before the first ``archive()``;
@@ -705,7 +705,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                     f"and {i}); nothing was archived"
                 )
 
-        t_start = fdb_time()  # FDB's index clock, not int(time.time()) (spec §2.2)
+        t_start = fdb_time()  # FDB's index clock (architecture.md §8.7)
         self._archive(batch, local)
         fresh = [f for f in self._fields() if self._field_time(f) >= t_start]
         if len(fresh) < n:
@@ -718,7 +718,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         self, messages: list[GribMessage], local: Path
     ) -> list[dict[str, str]]:
         """FDB identifiers of ``messages`` (numbered from 1), each pre-checked against
-        the query's values and passed to the guard (spec §7.7)."""
+        the query's values and passed to the guard (FR-STORE-005, FR-STORE-008)."""
         parsed = self.parsed
         single = self._canonical_single_values()
         allowed = self._allowed_values()
@@ -756,7 +756,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return identifiers
 
     def _canonical_single_values(self) -> dict[str, str]:
-        """Single-valued query keys spelled as in the expansion (spec §7.7): FDB's
+        """Single-valued query keys spelled as in the expansion (FR-STORE-006): FDB's
         canonical spelling with metkit, the value as written with the fallback."""
         expanded = self._expanded()
         return {
@@ -811,7 +811,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         self, batch: list[tuple[bytes, dict[str, str] | None]], local: Path
     ) -> None:
         """Archive and flush once; a failure after an ``archive()`` succeeded says
-        that those fields stay in FDB (spec §7.7)."""
+        that those fields stay in FDB (FR-STORE-010)."""
         backend = self.provider.backend
         archived = 0
         try:
@@ -831,7 +831,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             ) from e
 
     def remove(self) -> None:
-        """Never deletes: FDB has no per-field deletion (spec §7.8)."""
+        """Never deletes: FDB has no per-field deletion (FR-REMOVE-001)."""
         policy = self.provider.remove_policy
         if policy == "ignore":
             return
@@ -844,14 +844,14 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         if _first_time(_REMOVE_WARNED, self.query):
             self.provider.logger.warning(message)
 
-    # --- glob (plan step 7) --------------------------------------------------------
+    # --- glob (requirements.md §2.8) --------------------------------------------------
 
     @_retry_fdb_io
     def _list(self, selection: Mapping[str, str]) -> list[Field]:
         return self.provider.backend.list(selection)
 
     def list_candidate_matches(self) -> list[str]:
-        """Concrete queries for ``glob_wildcards`` (spec §7.9), sorted.
+        """Concrete queries for ``glob_wildcards`` (FR-GLOB-001), sorted.
 
         One ``list`` of the pattern's constant keys (omitted keys are wildcards). Each
         field gives the pattern with its wildcard-bearing values replaced by the

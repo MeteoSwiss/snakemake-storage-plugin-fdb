@@ -1,4 +1,4 @@
-"""Site neutrality: no site names under ``src/`` or ``scripts/`` (spec §1 goal 7)."""
+"""Site neutrality: no site names under ``src/`` or ``scripts/`` (NFR-NEUTRAL-001)."""
 
 import re
 from pathlib import Path

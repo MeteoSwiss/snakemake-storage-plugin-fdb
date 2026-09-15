@@ -1,4 +1,4 @@
-"""End-to-end: ``snakemake`` on ``examples/ecmwf/`` against a dev FDB (plan step 9).
+"""End-to-end: ``snakemake`` on ``examples/ecmwf/`` against a dev FDB (FR-IFACE-004).
 
 ``scripts/init_dev_fdb.py --seed --variants`` creates a fresh ``.fdb/`` in a temporary
 directory next to a copy of ``examples/ecmwf/``; Snakemake runs as a subprocess with
@@ -34,7 +34,7 @@ OUTPUT_REQUEST = {
     "param": "167",
 }
 OUTPUT_QUERY = "fdb://" + ",".join(f"{k}={v}" for k, v in OUTPUT_REQUEST.items())
-# Local copies of the example's queries (spec §3.3)
+# Local copies of the example's queries (FR-PATH-001)
 LOCAL_PREFIX = (
     ".snakemake/storage/fdb/class=ea/expver=0002/stream=oper/date=20200101/time=0000/"
     "domain=g/type=an/levtype=sfc/"

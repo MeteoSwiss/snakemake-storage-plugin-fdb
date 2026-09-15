@@ -23,11 +23,11 @@ from snakemake_storage_plugin_fdb.guard import (
 )
 from snakemake_storage_plugin_fdb.query import parse
 
-# spec §4: name -> default
+# reference.md settings table: name -> default
 SETTINGS = {
     "config": None,
     "user_config": None,
-    "archive_mode": "native",  # spec §7.7 decision
+    "archive_mode": "native",  # ADR-009
     "identifier_check": "none",
     "store_check": "strict",
     "canonical_spelling": "warn",
@@ -165,7 +165,7 @@ def test_guard_identifier_mismatch():
     assert "message 2" in str(e) and "step=7" in str(e) and "step=1" in str(e)
 
 
-# --- environment precedence (spec §4.1) -------------------------------------------
+# --- environment precedence (architecture.md §8.3) ------------------------------------
 
 
 def test_settings_eccodes_definitions_prepend(make_provider, clean_env, tmp_path):

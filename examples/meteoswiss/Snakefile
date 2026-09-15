@@ -35,9 +35,10 @@ rule all:
 
 
 # A shell rule: the local executor runs it in the main process, where the tagged
-# profile settings apply (a run: rule is spawned and loses them, spec §2.7). The
-# COSMO definitions open /dev/stderr while decoding, which truncates a stderr
-# redirected to a shared file, so the decoder writes to its own log (spec §2.9).
+# profile settings apply (a run: rule is spawned and loses them, see
+# docs/user-guide.md). The COSMO definitions open /dev/stderr while decoding, which
+# truncates a stderr redirected to a shared file, so the decoder writes to its own log
+# (R-11 in docs/design/architecture.md).
 rule t2m_control:
     input:
         storage.mch(T2M_CONTROL),

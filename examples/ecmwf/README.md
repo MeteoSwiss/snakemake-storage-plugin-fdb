@@ -37,4 +37,5 @@ What to expect:
 
 The rules use `run:`, so Snakemake runs them in spawned job processes. Pass the FDB
 untagged, as above: tagged settings (`TAG::VALUE`) do not reach spawned jobs in
-Snakemake 9.27 (see the spec, §2.7).
+Snakemake 9.27 (see
+[Tagged settings and spawned jobs](../../docs/user-guide.md#tagged-settings-and-spawned-jobs)).

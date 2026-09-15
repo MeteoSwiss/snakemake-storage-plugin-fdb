@@ -1,6 +1,7 @@
-# CI (plan step 11, spec §11). Required: lint, test, site-meteoswiss. pyfdb-latest is a
-# non-blocking canary. Tests use the committed samples in .raw/; nothing else is fetched
-# except packages and the site definitions (setup.sh).
+# CI (docs/contributing.md, ADR-026 in docs/design/architecture.md). Required: lint,
+# test, site-meteoswiss. pyfdb-latest is a non-blocking canary. Tests use the committed
+# samples in .raw/; nothing else is fetched except packages and the site definitions
+# (setup.sh).
 name: CI
 
 on:
@@ -31,7 +32,7 @@ jobs:
         run: |
           uv run --locked --only-group dev ruff format --check .
           uv run --locked --only-group dev ruff check .
-      - name: No site-specific names in src/ and scripts/ (spec §1 goal 7)
+      - name: No site-specific names in src/ and scripts/ (NFR-NEUTRAL-001)
         run: "! grep -rniE 'mch|meteoswiss|cosmo|icon-ch' src/ scripts/"
       - name: CHANGELOG.md has an Unreleased section
         run: grep -qE '^## \[Unreleased\]' CHANGELOG.md
@@ -78,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # A missing prerequisite fails instead of skipping (spec §9.2).
+      # A missing prerequisite fails instead of skipping (architecture.md §8.9).
       SMK_FDB_TEST_REQUIRE_SITES: "1"
       SMK_FDB_TEST_MCH_SAMPLES: "${{ github.workspace }}/.raw/meteoswiss"
       SMK_FDB_TEST_ECCODES_DEFINITIONS: "${{ github.workspace }}/.local/eccodes-cosmo-mars/definitions:${{ github.workspace }}/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions"

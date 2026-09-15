@@ -374,7 +374,7 @@ def test_retrieve_to(seeded_fdb, tmp_path):
     assert dest.stat().st_size == total
     assert not dest.with_name(dest.name + ".part").exists()
     messages = split_messages(dest)
-    # request order, outer key first (spec §2.3)
+    # request order, outer key first (architecture.md §13.4)
     assert [(m.mars["step"], m.param_id) for m in messages] == [
         ("0", "167"), ("0", "165"), ("6", "167"), ("6", "165"),
     ]  # fmt: skip
@@ -541,7 +541,7 @@ def test_handle_per_thread():
 
 @needs_raw
 def test_reads_see_archives_after_an_earlier_read(empty_fdb):
-    # a pyfdb handle that has read a database keeps its catalogue (spec §2.4)
+    # a handle that has read a database keeps its catalogue (architecture.md §13.5)
     backend = empty_fdb()
     template = (RAW / "template.grib").read_bytes()
     identifier = {**EA_OPER, "step": "0", "param": "167"}

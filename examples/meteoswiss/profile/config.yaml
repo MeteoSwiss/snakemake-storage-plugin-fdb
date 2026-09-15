@@ -1,9 +1,9 @@
 # Snakemake profile of the MeteoSwiss example; run Snakemake from examples/meteoswiss/.
-# Values are TAG::VALUE for the storage provider tagged "mch" (spec §2.7). Relative
-# paths resolve against the working directory and point at what README.md sets up:
-# the dev FDB (.fdb-mch/), setup.sh (definitions) and make_metkit_home.py.
+# Values are TAG::VALUE for the storage provider tagged "mch" (docs/user-guide.md).
+# Relative paths resolve against the working directory and point at what README.md sets
+# up: the dev FDB (.fdb-mch/), setup.sh (definitions) and make_metkit_home.py.
 storage-fdb-config: ["mch::../../.fdb-mch/config.yaml"]
 storage-fdb-eccodes-definitions: ["mch::../../.local/eccodes-cosmo-mars/definitions:../../.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions"]
 storage-fdb-metkit-home: ["mch::../../.local/metkit-home"]
-# Silences the COSMO definitions' version banner (spec §2.9).
+# Silences the COSMO definitions' version banner (docs/sites/meteoswiss.md).
 storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]
