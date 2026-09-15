@@ -11,7 +11,6 @@ import itertools
 import os
 import re
 import threading
-import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -41,6 +40,7 @@ from .backend import (
     SchemaInfo,
     count_fields,
     fallback_expand,
+    fdb_time,
     map_error,
     parse_schema,
     resolve_config,
@@ -705,7 +705,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                     f"and {i}); nothing was archived"
                 )
 
-        t_start = int(time.time())
+        t_start = fdb_time()  # FDB's index clock, not int(time.time()) (spec §2.2)
         self._archive(batch, local)
         fresh = [f for f in self._fields() if self._field_time(f) >= t_start]
         if len(fresh) < n:

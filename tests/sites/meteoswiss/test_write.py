@@ -13,9 +13,10 @@ import pytest
 pytestmark = pytest.mark.site_meteoswiss
 
 SCRIPT = """
-import hashlib, json, logging, shutil, sys, time
+import hashlib, json, logging, shutil, sys
 from pathlib import Path
 from snakemake_storage_plugin_fdb import StorageProvider, StorageProviderSettings
+from snakemake_storage_plugin_fdb.backend import fdb_time
 
 job = json.loads(sys.argv[1])
 out = {"warnings": [], "results": {}}
@@ -42,7 +43,7 @@ for name, spec in job["stores"].items():
         local = obj.local_path()
         local.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(spec["file"], local)
-        res["t_start"] = int(time.time())
+        res["t_start"] = fdb_time()
         obj.store_object()
         local.unlink()  # Snakemake may drop the local copy; read back from FDB
         res["exists"] = obj.exists()

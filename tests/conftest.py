@@ -55,7 +55,7 @@ def fdb_config_file() -> Callable[..., Path]:
 class SeededFDB:
     config: dict[str, Any]
     backend: Any  # snakemake_storage_plugin_fdb.backend.Backend
-    flush_start: float
+    flush_start: int  # FDB's index clock (spec §2.2)
     flush_end: float
 
 
@@ -67,7 +67,7 @@ def seeded_fdb(tmp_path_factory) -> SeededFDB:
     """
     if not (RAW / "template.grib").exists():
         pytest.skip("no .raw/ ECMWF samples")
-    from snakemake_storage_plugin_fdb.backend import Backend
+    from snakemake_storage_plugin_fdb.backend import Backend, fdb_time
     from snakemake_storage_plugin_fdb.grib import variant
 
     config = fdb_config(tmp_path_factory.mktemp("seeded-fdb"))
@@ -78,7 +78,7 @@ def seeded_fdb(tmp_path_factory) -> SeededFDB:
     for step in VARIANT_STEPS:
         for param in VARIANT_PARAMS:
             backend.archive(variant(template, stream="oper", step=step, paramId=param))
-    start = time.time()
+    start = fdb_time()
     backend.flush()
     return SeededFDB(config, backend, start, time.time())
 

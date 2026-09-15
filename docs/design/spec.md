@@ -140,9 +140,19 @@ the test suite).
 - `T` is `Index::timestamp_`, a `time_t` set by `TocIndex::flush()` via `time()`, i.e.
   **the wall-clock second at which the index containing the field was flushed**
   [verified: `src/fdb5/database/Index.h:81,106,125`, `src/fdb5/toc/TocIndex.cc:150`].
-  Measured: `T == int(time.time())` at flush, 10 digits. The 9-digit values in the pyfdb
-  docstrings (`176253515`) are typos; the same docstring block also shows
-  `1762537447`.
+  Measured: `T == int(time.time())` at flush, 10 digits, **except just after a second
+  boundary**: glibc `time()` reads the kernel's coarse realtime clock, which lags
+  `time.time()` by up to one tick (4 ms at `HZ=250`), so a flush in that window gets the
+  previous second [verified: `ctypes` `time()` vs `time.time()` on Linux 5.14; a store
+  started 0.3 ms after a boundary got `T = int(time.time()) - 1` in 32 of 35 runs].
+  Times compared with `T` are therefore taken with `backend.fdb_time()`: libc `time()`
+  itself, resolved once at import via `ctypes.CDLL(None)` (the symbol `libfdb5.so`
+  imports [verified: `nm -D`]; Python has no `CLOCK_REALTIME_COARSE`), else
+  `int(time.time())` with a debug log. Linux file mtimes (the `os.stat` fallback, §7.4)
+  come from the same coarse clock [verified: 1050 writes just after a boundary,
+  `int(st_mtime)` behind `int(time.time())` in all, behind `fdb_time()` in none]. The
+  9-digit values in the pyfdb docstrings (`176253515`) are typos; the same docstring
+  block also shows `1762537447`.
 - Fields archived in one session and flushed together share `T`. Re-archiving a field
   later creates a new index file with a new `T`; the masked old copy keeps its old `T`
   (visible only with `include_masked=True`); unrelated fields in the same DB keep their
@@ -1080,7 +1090,8 @@ below are the query and `local_path()`; messages are numbered from 1.
    `WorkflowError("<query>: <local> holds duplicate fields (messages <i> and <j>); nothing was archived")`.
 4. Post-check via one `inspect(request)` on a fresh handle (both modes): let `fresh` be
    the found fields whose time (index timestamp, `os.stat` fallback as in §7.4) is
-   `>= t_start` (`t_start = int(time.time())` taken just before the first `archive()`).
+   `>= t_start` (`t_start = backend.fdb_time()`, FDB's own index clock, §2.2, taken
+   just before the first `archive()`).
    Every message must be reachable by the query: `len(fresh) < n` →
    `WorkflowError("<query>: <local> has <n> fields, the query expands to <E>; <n - len(fresh)> landed outside the query or are duplicates (they stay in FDB until the next successful store masks them)")`.
    With the count check of step 2 this is `len(fresh) == E` for `strict` and "all `n`
@@ -1462,7 +1473,8 @@ four `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
   (both modes), `test_store_guard_sees_every_message_before_archive`,
   `test_store_guard_mismatch_leaves_fdb_unchanged`, `test_store_masking_rerun`,
   `test_store_threads`, `test_store_partial_archive_failure_says_fields_stay`,
-  `test_store_wildcard_query_rejected`, `test_remove_policy`; `tests/test_backend.py::test_reads_see_archives_after_an_earlier_read`
+  `test_store_wildcard_query_rejected`, `test_store_post_check_uses_fdb_clock` and
+  `test_fdb_time_is_c_time` (§2.2 clock), `test_remove_policy`; `tests/test_backend.py::test_reads_see_archives_after_an_earlier_read`
   (§2.4). Plan step 6a: `test_store_default_native_under_multi_rule_schema`
   (`synth11.grib` under `tests/data/ecmwf-fdb-tests.schema` stores and reads back with
   default settings; explicit `identifier` fails with "cannot determine"),

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,8 @@ from snakemake_storage_plugin_fdb import (
     StorageProvider,
     StorageProviderSettings,
 )
-from snakemake_storage_plugin_fdb.backend import Backend, Field, map_error
+from snakemake_storage_plugin_fdb import backend as backend_module
+from snakemake_storage_plugin_fdb.backend import Backend, Field, fdb_time, map_error
 from snakemake_storage_plugin_fdb.grib import split_messages, variant
 from snakemake_storage_plugin_fdb.guard import IdentifierMismatch, NoGuard
 from snakemake_storage_plugin_fdb.query import NAME_MAX
@@ -452,7 +454,7 @@ def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
 def test_mtime_is_flush_time(seeded_provider, seeded_fdb):
     mtime = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167").mtime()
     assert isinstance(mtime, float)
-    assert int(seeded_fdb.flush_start) <= mtime <= seeded_fdb.flush_end
+    assert seeded_fdb.flush_start <= mtime <= seeded_fdb.flush_end
 
 
 @needs_raw
@@ -589,7 +591,7 @@ def test_store_roundtrip(make_provider, archive_mode):
     provider = make_provider(archive_mode=archive_mode)
     assert isinstance(provider.guard, NoGuard)
     data = _grib()
-    t_start = int(time.time())
+    t_start = fdb_time()
     obj = _store(provider, STORE_QUERY, data)
     assert obj.exists() is True
     assert obj.mtime() >= t_start
@@ -760,6 +762,33 @@ def test_store_identifier_verbatim_without_expansion(
     assert obj.exists() is True
     assert _stored_key(provider)["param"] == "167.128"
     assert "archived verbatim" in caplog.text
+
+
+@needs_raw
+def test_store_post_check_uses_fdb_clock(make_provider, monkeypatch):
+    # FDB's clock can lag int(time.time()) by a second (spec §2.2): with both the clock
+    # and the index timestamps at a past second, the store passes its post-check only
+    # if t_start is taken from fdb_time() (§7.7)
+    provider = make_provider(archive_mode="identifier")
+    stamp = 1_700_000_000  # below int(time.time()) for good
+    real_inspect = provider.backend.inspect
+    monkeypatch.setattr(backend_module, "_c_time", lambda _: stamp)
+    monkeypatch.setattr(
+        provider.backend,
+        "inspect",
+        lambda request: [replace(f, timestamp=stamp) for f in real_inspect(request)],
+    )
+    _store(provider, f"fdb://{EA2},step=0,param=167", _grib((0,)))
+
+
+def test_fdb_time_is_c_time(monkeypatch):
+    assert backend_module._c_time is not None  # libc time() loaded, no fallback
+    assert abs(fdb_time() - time.time()) < 2
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.9)
+    monkeypatch.setattr(backend_module, "_c_time", lambda _: 1_799_999_999)
+    assert fdb_time() == 1_799_999_999  # libc's second, not int(time.time())
+    monkeypatch.setattr(backend_module, "_c_time", None)  # no loadable libc
+    assert fdb_time() == 1_800_000_000
 
 
 @needs_raw

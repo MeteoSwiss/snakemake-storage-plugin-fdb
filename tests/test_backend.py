@@ -322,7 +322,7 @@ def test_inspect_2x2(seeded_fdb):
     }  # fmt: skip
     for f in fields:
         assert 200 <= f.length <= 300  # zeroed variants
-        assert int(seeded_fdb.flush_start) <= f.timestamp <= seeded_fdb.flush_end
+        assert seeded_fdb.flush_start <= f.timestamp <= seeded_fdb.flush_end
         assert abs(f.timestamp - seeded_fdb.flush_end) <= 1
         assert f.uri_path and Path(f.uri_path).is_file()
 

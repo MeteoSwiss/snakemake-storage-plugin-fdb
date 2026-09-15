@@ -18,6 +18,7 @@ SCRIPT = """
 import hashlib, json, logging, sys, time
 from pathlib import Path
 from snakemake_storage_plugin_fdb import StorageProvider, StorageProviderSettings
+from snakemake_storage_plugin_fdb.backend import fdb_time
 from snakemake_storage_plugin_fdb.grib import split_messages
 
 job = json.loads(sys.argv[1])
@@ -38,7 +39,7 @@ provider = StorageProvider(
     settings=StorageProviderSettings(**job["settings"]),
 )
 if job.get("archive"):
-    start = time.time()
+    start = fdb_time()
     for path in job["archive"]:
         provider.backend.archive(Path(path).read_bytes())
         out["archived"] += [m.mars for m in split_messages(path)]
@@ -134,7 +135,7 @@ def test_read_samples(site_fdb, read_site, site_env, metkit_home, configured_by)
         data = path.read_bytes()
         assert res["size"] == len(data)
         assert res["sha256"] == hashlib.sha256(data).hexdigest()  # byte-identical
-        assert int(start) <= res["mtime"] <= end
+        assert start <= res["mtime"] <= end
     assert results["t2m_pf_1to3"] == {"exists": False}
     assert results["tp_cf_no_timespan"] == {"exists": False}
 

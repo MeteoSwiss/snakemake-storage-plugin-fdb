@@ -9,11 +9,13 @@ this module changes the process environment; ``resolve_schema_path`` only reads 
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import math
 import os
 import re
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -54,6 +56,22 @@ class Field:
     length: int  # message length in bytes; 0 below schema level 3
     timestamp: int  # index flush time, POSIX seconds; 0 if unknown (spec §2.2)
     uri_path: str | None  # data file path for local toc stores
+
+
+try:  # libc time(): the clock FDB stamps indexes with (spec §2.2)
+    _c_time = ctypes.CDLL(None).time
+    _c_time.restype = ctypes.c_long
+    _c_time.argtypes = [ctypes.c_void_p]
+except (OSError, AttributeError, TypeError):  # TypeError: Windows (unsupported)
+    _c_time = None
+    logging.getLogger(__name__).debug("libc time() unavailable; using int(time.time())")
+
+
+def fdb_time() -> int:
+    """The current second on FDB's index clock, libc ``time()``: just after a second
+    boundary it can still give the previous second when ``int(time.time())`` already
+    gives the new one (spec §2.2). ``int(time.time())`` where libc cannot be loaded."""
+    return _c_time(None) if _c_time is not None else int(time.time())
 
 
 @dataclass(frozen=True)

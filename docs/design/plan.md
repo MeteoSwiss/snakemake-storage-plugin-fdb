@@ -446,6 +446,11 @@ Acceptance:
   t_start`, `size()` = sum of message lengths (= file size for unpadded input; smaller
   for NUL-padded GRIB1, spec §7.2), retrieve after deleting the local copy gives the same
   message keys; both archive modes (`test_store_roundtrip`);
+- the post-check takes `t_start` from `backend.fdb_time()`, FDB's own index clock, so
+  a field stamped with the second before `int(time.time())` counts as fresh (spec §2.2,
+  §7.7): a store passes with libc `time()` and the index timestamps both faked at a past
+  second (`test_store_post_check_uses_fdb_clock`); `fdb_time()` returns libc's second,
+  or `int(time.time())` without libc (`test_fdb_time_is_c_time`);
 - `template.grib` (`enda`, `number=0`) stores in identifier mode under
   `tests/data/schema` **and** under `.raw/schema` (number dropped); native mode under
   `.raw/schema` raises the mapped schema error (`test_store_template`);
@@ -712,7 +717,7 @@ Files (none under `src/`): `examples/meteoswiss/{README.md,realtime-varda.schema
 `tests/sites/meteoswiss/{test_conventions.py,test_read.py,test_workflow.py}` (existing
 since steps 2–9, extended; `test_workflow.py` switched to the shipped example),
 `tests/sites/meteoswiss/test_fetch_ogd_samples.py` (new), `docs/sites/meteoswiss.md`,
-`.gitignore` (`.fdb-mch/`). [done: <pending commit>]
+`.gitignore` (`.fdb-mch/`). [done: 601262e]
 
 `realtime-varda.schema`: evalml's `resources/fdb/realtime-varda.schema` (branch
 `enable_fdb`, last changed in `15cf43af69a1c5c90ab64be9deab76a94d371936`, blob
