@@ -187,8 +187,8 @@ requirements.md D-001.
 | `scripts/init_dev_fdb.py` | generic dev FDB creation and seeding (FR-DEV-001); no site flags |
 | `examples/ecmwf/` | generic two-rule workflow (`run:` rules, untagged provider) |
 | `examples/meteoswiss/` | site material: `realtime-varda.schema`, tagged `profile/config.yaml`, `Snakefile` (`shell` rule, glob), `grib_keys.py`, `setup.sh`, `make_metkit_home.py`, `fetch_ogd_samples.py` |
-| `tests/` | generic suite on `.raw/` samples; `tests/sites/meteoswiss/` site suite configured by `SMK_FDB_TEST_*` variables (§8.9) |
-| `.raw/` | committed ECMWF samples and pyfdb's test schema; `.raw/meteoswiss/` committed OGD samples (ADR-019) |
+| `tests/` | generic suite on the samples in `tests/data/grib/ecmwf/`; `tests/sites/meteoswiss/` site suite configured by `SMK_FDB_TEST_*` variables (§8.9) |
+| `tests/data/` | test schemas (plugin, pyfdb, ECMWF multi-rule); `grib/ecmwf/` committed ECMWF samples, `grib/meteoswiss/` committed OGD samples (ADR-019) |
 | `.github/workflows/ci.yml` | `lint`, `test`, `site-meteoswiss` (required), `pyfdb-latest` (canary) (ADR-026) |
 
 ## 6. Runtime view
@@ -457,12 +457,12 @@ expansion to `spelling_diffs`, so metkit expands once per object.
 
 ### 8.9 Testing concept
 
-- Generic tier (`tests/`): unit tests without FDB (`test_query.py`,
-  `test_key_order.py`, `test_settings.py`, `test_no_site_specifics.py`), eccodes tests
-  (`test_grib.py`), backend and plugin tests against temporary toc FDBs seeded from
-  `.raw/` and in-memory zeroed variants (`test_backend.py`, `test_plugin.py`, fixtures in
-  `conftest.py`), and end-to-end Snakemake runs (`test_workflow.py`). Tests needing
-  `.raw/` skip without it.
+- Generic tier (`tests/`): unit tests without FDB (`test_query.py`, `test_key_order.py`,
+  `test_settings.py`, `test_no_site_specifics.py`), eccodes tests (`test_grib.py`),
+  backend and plugin tests against temporary toc FDBs seeded from
+  `tests/data/grib/ecmwf/` and in-memory zeroed variants (`test_backend.py`,
+  `test_plugin.py`, fixtures in `conftest.py`), and end-to-end Snakemake runs
+  (`test_workflow.py`). Tests needing the ECMWF samples skip without them.
 - Interface conformance: `TestStorageRead` (`retrieve_only`, because the base test writes
   the text `test` before `store_object`) and `TestStorageWrite` (overwrites that text
   with GRIB for the query) derive from `FDBStorageBase(TestStorageBase)` with
@@ -566,19 +566,21 @@ design round, provided requirements, architecture and code are updated together.
 ### ADR-009 `archive_mode` defaults to `native`
 
 - Context: the earlier default `identifier` rested on storing `template.grib` under
-  `.raw/schema` and on MeteoSwiss GRIB assumed not to carry every schema key. The
-  MeteoSwiss assumption was disproven: native archives of all OGD samples under
-  `realtime-varda.schema` work (§13.10). Under `tests/data/ecmwf-fdb-tests.schema`
-  (ECMWF's multi-rule test schema, 56 keys), identifier mode treats every key mandatory
-  in any rule as required, and 24 keys cannot be determined for the ECMWF samples
-  (`country`, `dbase`, `rki`, `rty`, `ty`, `bcmodel`, `icmodel`, `fcmonth`, `dataset`,
-  `anoffset`, `georef`, `ident`, `instrument`, `stattype`, `obsgroup`, `reportype`,
-  `reference`, `refdate`, `diagnostic`, `fcperiod`, `offsetdate`, `offsettime`,
-  `leadtime`, `opttime`), while native archives of `synth11`, `steprange`, `template` and
-  `quantile` succeed [verified: schema analysis and native archive runs].
-- Decision (user): default `native`; `identifier` remains for single-rule schemas and GRIB
-  lacking a schema key (e.g. `template.grib` under `.raw/schema`, where native fails with
-  `Keywords not used: {number}`). Supersedes the identifier default.
+  `tests/data/pyfdb-tests.schema` and on MeteoSwiss GRIB assumed not to carry every
+  schema key. The MeteoSwiss assumption was disproven: native archives of all OGD
+  samples under `realtime-varda.schema` work (§13.10). Under
+  `tests/data/ecmwf-fdb-tests.schema` (ECMWF's multi-rule test schema, 56 keys),
+  identifier mode treats every key mandatory in any rule as required, and 24 keys cannot
+  be determined for the ECMWF samples (`country`, `dbase`, `rki`, `rty`, `ty`,
+  `bcmodel`, `icmodel`, `fcmonth`, `dataset`, `anoffset`, `georef`, `ident`,
+  `instrument`, `stattype`, `obsgroup`, `reportype`, `reference`, `refdate`,
+  `diagnostic`, `fcperiod`, `offsetdate`, `offsettime`, `leadtime`, `opttime`), while
+  native archives of `synth11`, `steprange`, `template` and `quantile` succeed
+  [verified: schema analysis and native archive runs].
+- Decision (user): default `native`; `identifier` remains for single-rule schemas and
+  GRIB lacking a schema key (e.g. `template.grib` under `tests/data/pyfdb-tests.schema`,
+  where native fails with `Keywords not used: {number}`). Supersedes the identifier
+  default.
 - Status: accepted (reversible).
 - Consequences: no rule matching in the plugin; identifier mode's multi-rule limitation
   documented (L-17); native mode is pyfdb's recommended path and MeteoSwiss's production
@@ -676,11 +678,17 @@ design round, provided requirements, architecture and code are updated together.
 ### ADR-019 Test data in git
 
 - Context: CI needs reproducible samples; OGD data expires after 24 h.
-- Decision (user, supersedes "not in git"): commit `.raw/` ECMWF samples and
-  `.raw/meteoswiss/` OGD samples as empty-data GRIB (constant field, `grid_simple`,
-  `bitsPerValue=0`, MARS keys unchanged); full-size originals in the git-ignored
-  `.local/raw-full/meteoswiss/`; `compare.grib` dropped (origin unknown). Tests still skip
-  cleanly when data is absent.
+- Decision (user, supersedes "not in git"): commit the ECMWF samples
+  (`tests/data/grib/ecmwf/`) and the OGD samples (`tests/data/grib/meteoswiss/`) as
+  empty-data GRIB (constant field, `grid_simple`, `bitsPerValue=0`, MARS keys
+  unchanged); full-size originals in the git-ignored `.local/samples-full/meteoswiss/`;
+  `compare.grib` dropped (origin unknown). Tests still skip cleanly when data is absent.
+- Update (user, 2026-09-15, reversible): the samples moved out of the hidden `.raw/`
+  directory into `tests/data/`, next to the test schemas: `.raw/*.grib` to
+  `tests/data/grib/ecmwf/`, `.raw/meteoswiss/` to `tests/data/grib/meteoswiss/`,
+  `.raw/schema` to `tests/data/pyfdb-tests.schema`. The local `.local/raw-full/` became
+  `.local/samples-full/` and the pytest marker `needs_raw` became `needs_samples`. File
+  contents are unchanged.
 - Status: accepted.
 - Consequences: no downloads in CI; the fetch script only refreshes samples.
 
@@ -688,11 +696,13 @@ design round, provided requirements, architecture and code are updated together.
 
 - Context: OGD data expires after 24 h, full-size fields are megabytes, and the
   committed samples must stay small and stable.
-- Decision: `fetch_ogd_samples.py` writes full-size files to `.local/raw-full/meteoswiss/`;
-  committed copies only with `--empty-data` (overwrite only with `--force`), keeping the
-  committed file names; tests read `date`/`time` from the file names.
+- Decision: `fetch_ogd_samples.py` writes full-size files to
+  `.local/samples-full/meteoswiss/`; committed copies only with `--empty-data`
+  (overwrite only with `--force`), keeping the committed file names; tests read
+  `date`/`time` from the file names.
 - Status: accepted (reversible).
-- Consequences: a plain run never touches `.raw/`; refreshing the samples is explicit.
+- Consequences: a plain run never touches the committed samples; refreshing the samples
+  is explicit.
 
 ### ADR-021 Default metkit home models
 
@@ -850,7 +860,9 @@ not kept; the behaviours that matter are covered by tests. Items are
 (timestamp only in repr, `inspect` with `to/by` and aliases, `retrieve.size()`, internal
 expansion, `class=zz` → `UserError`).
 
-### 13.2 ECMWF samples (`.raw/`)
+### 13.2 ECMWF samples
+
+Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests.schema`.
 
 | file | bytes | message | MARS keys |
 |---|---|---|---|
@@ -862,11 +874,11 @@ expansion, `class=zz` → `UserError`).
 - Provenance [verified: sha256 against `ecmwf/fdb` at `63672ea`, Apache-2.0]:
   `template.grib` = `tests/pyfdb/data/template.grib` (also `tests/data/`);
   `steprange.grib`, `quantile.grib` = `tests/fdb_e2e/data/`; `synth11.grib` =
-  `rust/crates/fdb/tests/fixtures/synth11.grib`; `.raw/schema` = `tests/data/schema`
-  (= `tests/pyfdb/data/schema`); `tests/data/ecmwf-fdb-tests.schema` =
-  `tests/fdb/etc/fdb/schema`. `compare.grib` (dropped) was not found there.
+  `rust/crates/fdb/tests/fixtures/synth11.grib`; `tests/data/pyfdb-tests.schema` = their
+  `tests/data/schema` (= `tests/pyfdb/data/schema`); `tests/data/ecmwf-fdb-tests.schema`
+  = `tests/fdb/etc/fdb/schema`. `compare.grib` (dropped) was not found there.
 - The GRIB1 files are NUL-padded to 120-byte records [verified: eccodes 2.47.3].
-- `.raw/schema` is `[ class, expver, stream, date, time, domain? [ type, levtype [ step, levelist?, param ]]]`.
+- `tests/data/pyfdb-tests.schema` is `[ class, expver, stream, date, time, domain? [ type, levtype [ step, levelist?, param ]]]`.
   `template.grib` and `quantile.grib` cannot be archived natively under it
   (`Keywords not used: {number}` / `{quantile}`); pyfdb's own tests pass only because
   their fixture rewrites `stream=oper`, which makes eccodes drop `number`.
@@ -1126,7 +1138,7 @@ definitions above; re-verified on pyfdb 5.21.4.23 by the site suite]
   https://opendatadocs.meteoswiss.ch/e-forecast-data/e2-e3-numerical-weather-forecasting-model
 - Sizes: one native-grid surface field ≈ 2.3 MB (CH1), ≈ 568 KB (CH2); the perturbed
   CH2 file has 20 members (11.4 MB).
-- Committed samples (`.raw/meteoswiss/`, constant-field copies 175/199/350 B):
+- Committed samples in `tests/data/grib/meteoswiss/` (constant-field, 175/199/350 B):
   `icon-ch2-eps_202609151200_step6_t_2m_ctrl.grib2` (1 message, 567 927 B full size),
   `..._tot_prec_ctrl.grib2` (1, 567 951 B), `..._t_2m_pert_m1-2.grib2` (members 1–2,
   1 135 854 B). A rerun of the fetcher gives identical full-size files; the constant-field

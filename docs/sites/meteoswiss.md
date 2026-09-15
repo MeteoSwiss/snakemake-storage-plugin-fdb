@@ -86,11 +86,10 @@ fdb://...,type=pf,number=1/2,step=6,param=500011           number only with type
 
 `examples/meteoswiss/fetch_ogd_samples.py` fetches ICON-CH2-EPS fields from the
 [MeteoSwiss Open Government Data STAC API](https://opendatadocs.meteoswiss.ch/e-forecast-data/e2-e3-numerical-weather-forecasting-model).
-Full-size files go to `.local/raw-full/meteoswiss/` (`--out DIR`); `--empty-data [DIR]`
-also writes the constant-field copies committed in `.raw/meteoswiss/` (overwrite with
-`--force`). OGD
-keeps data for 24 h after publication, so it fetches the newest forecast unless
-`--reference-datetime` is given.
+Full-size files go to `.local/samples-full/meteoswiss/` (`--out DIR`);
+`--empty-data [DIR]` also writes the constant-field copies committed in
+`tests/data/grib/meteoswiss/` (overwrite with `--force`). OGD keeps data for 24 h after
+publication, so it fetches the newest forecast unless `--reference-datetime` is given.
 
 ## Version warning
 

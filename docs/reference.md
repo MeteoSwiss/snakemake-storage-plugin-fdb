@@ -249,8 +249,8 @@ uv run python scripts/init_dev_fdb.py [--root DIR] [--schema PATH] [--seed [DIR]
 |---|---|---|
 | `--root DIR` | `.fdb` in the repository | writes `DIR/schema`, `DIR/root/` and `DIR/config.yaml` (local toc FDB, absolute paths) |
 | `--schema PATH` | `tests/data/schema` | schema to copy; missing file is an argument error |
-| `--seed [DIR]` | not seeded; `.raw` if given without DIR | natively archives every file directly in DIR whose content starts with `GRIB` (no subdirectories); a missing DIR is reported on stderr and skipped |
-| `--variants [FILE]` | none; `.raw/template.grib` if given without FILE | archives zeroed `stream=oper` variants of the message in FILE for steps 0/6/12 × params 167/165 (the inputs of `examples/ecmwf/`); missing FILE is an argument error |
+| `--seed [DIR]` | not seeded; `tests/data/grib/ecmwf` if given without DIR | natively archives every file directly in DIR whose content starts with `GRIB` (no subdirectories); a missing DIR is reported on stderr and skipped |
+| `--variants [FILE]` | none; `tests/data/grib/ecmwf/template.grib` if given without FILE | archives zeroed `stream=oper` variants of the message in FILE for steps 0/6/12 × params 167/165 (the inputs of `examples/ecmwf/`); missing FILE is an argument error |
 
 Defaults are relative to the repository, explicit arguments to the working directory.
 Data needing other eccodes definitions or a MARS language is seeded with

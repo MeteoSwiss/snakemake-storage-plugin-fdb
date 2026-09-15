@@ -19,11 +19,10 @@ from typing import Any, ClassVar  # noqa: E402
 import pytest  # noqa: E402
 import yaml  # noqa: E402
 
-REPO = Path(__file__).resolve().parents[1]
-RAW = REPO / ".raw"
 DATA = Path(__file__).resolve().parent / "data"
+SAMPLES = DATA / "grib" / "ecmwf"
 TEST_SCHEMA = DATA / "schema"
-RAW_FILES = ("template.grib", "steprange.grib", "quantile.grib", "synth11.grib")
+SAMPLE_FILES = ("template.grib", "steprange.grib", "quantile.grib", "synth11.grib")
 VARIANT_STEPS = (0, 6, 12)
 VARIANT_PARAMS = (167, 165)
 
@@ -61,20 +60,20 @@ class SeededFDB:
 
 @pytest.fixture(scope="session")
 def seeded_fdb(tmp_path_factory) -> SeededFDB:
-    """Session FDB under ``tests/data/schema``: the four ``.raw`` files archived
+    """Session FDB under ``tests/data/schema``: the four ECMWF sample files archived
     natively plus zeroed ``class=ea,stream=oper`` variants of ``template.grib`` for
     ``step`` 0/6/12 x ``param`` 167/165 (about 12 KB in total).
     """
-    if not (RAW / "template.grib").exists():
-        pytest.skip("no .raw/ ECMWF samples")
+    if not (SAMPLES / "template.grib").exists():
+        pytest.skip("no ECMWF samples")
     from snakemake_storage_plugin_fdb.backend import Backend, fdb_time
     from snakemake_storage_plugin_fdb.grib import variant
 
     config = fdb_config(tmp_path_factory.mktemp("seeded-fdb"))
     backend = Backend(config)
-    for name in RAW_FILES:
-        backend.archive((RAW / name).read_bytes())
-    template = (RAW / "template.grib").read_bytes()
+    for name in SAMPLE_FILES:
+        backend.archive((SAMPLES / name).read_bytes())
+    template = (SAMPLES / "template.grib").read_bytes()
     for step in VARIANT_STEPS:
         for param in VARIANT_PARAMS:
             backend.archive(variant(template, stream="oper", step=step, paramId=param))

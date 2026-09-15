@@ -1,6 +1,6 @@
 # CI (docs/contributing.md, ADR-026 in docs/design/architecture.md). Required: lint,
 # test, site-meteoswiss. pyfdb-latest is a non-blocking canary. Tests use the committed
-# samples in .raw/; nothing else is fetched except packages and the site definitions
+# samples in tests/data/grib/; nothing else is fetched except packages and the site definitions
 # (setup.sh).
 name: CI
 
@@ -81,7 +81,7 @@ jobs:
     env:
       # A missing prerequisite fails instead of skipping (architecture.md §8.9).
       SMK_FDB_TEST_REQUIRE_SITES: "1"
-      SMK_FDB_TEST_MCH_SAMPLES: "${{ github.workspace }}/.raw/meteoswiss"
+      SMK_FDB_TEST_MCH_SAMPLES: "${{ github.workspace }}/tests/data/grib/meteoswiss"
       SMK_FDB_TEST_ECCODES_DEFINITIONS: "${{ github.workspace }}/.local/eccodes-cosmo-mars/definitions:${{ github.workspace }}/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions"
       SMK_FDB_TEST_METKIT_HOME: "${{ github.workspace }}/.local/metkit-home"
     steps:

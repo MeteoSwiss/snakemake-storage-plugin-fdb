@@ -120,9 +120,8 @@ src/snakemake_storage_plugin_fdb/
 scripts/init_dev_fdb.py  creates and seeds a local development FDB
 examples/ecmwf/          generic example workflow
 examples/meteoswiss/     MeteoSwiss schema, profile, workflow and setup scripts
-tests/                   generic test suite; tests/data/ holds the test schemas
+tests/                   generic test suite; tests/data/ holds test schemas and GRIB samples
 tests/sites/meteoswiss/  MeteoSwiss site test suite
-.raw/                    committed GRIB samples (ECMWF, MeteoSwiss)
 docs/                    user guide, reference, contributing, site and design documents
 .github/workflows/ci.yml CI: lint, tests, site suite, pyfdb canary
 ```

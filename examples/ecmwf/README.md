@@ -19,11 +19,11 @@ cd examples/ecmwf
 uv run snakemake --storage-fdb-config ../../.fdb/config.yaml -c1
 ```
 
-`init_dev_fdb.py` writes `.fdb/{config.yaml,schema,root/}` (schema
-`tests/data/schema`); `--seed` archives the `.raw/` ECMWF samples and `--variants`
-the `stream=oper` variants of `.raw/template.grib` that this workflow reads (steps
-0/6/12, params 167/165). See `scripts/init_dev_fdb.py --help` for `--root`, `--schema`,
-`--seed DIR` and `--variants FILE`.
+`init_dev_fdb.py` writes `.fdb/{config.yaml,schema,root/}` (schema `tests/data/schema`);
+`--seed` archives the ECMWF samples in `tests/data/grib/ecmwf/` and `--variants` the
+`stream=oper` variants of `template.grib` that this workflow reads (steps 0/6/12, params
+167/165). See `scripts/init_dev_fdb.py --help` for `--root`, `--schema`, `--seed DIR`
+and `--variants FILE`.
 
 What to expect:
 

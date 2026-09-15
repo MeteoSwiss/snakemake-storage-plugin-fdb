@@ -1,7 +1,7 @@
 """``examples/meteoswiss/fetch_ogd_samples.py`` (FR-DEV-002).
 
 Neither test needs anything in the default run: the offline test needs the git-ignored
-full-size originals in ``.local/raw-full/meteoswiss/``, the live test needs network
+full-size originals in ``.local/samples-full/meteoswiss/``, the live test needs network
 access and ``SMK_FDB_TEST_OGD_LIVE=1``. Both skip otherwise, also with
 ``SMK_FDB_TEST_REQUIRE_SITES=1``. The live test writes only into pytest's temporary
 directory:
@@ -22,8 +22,8 @@ pytestmark = pytest.mark.site_meteoswiss
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "examples" / "meteoswiss" / "fetch_ogd_samples.py"
-FULL = REPO / ".local" / "raw-full" / "meteoswiss"
-COMMITTED = REPO / ".raw" / "meteoswiss"
+FULL = REPO / ".local" / "samples-full" / "meteoswiss"
+COMMITTED = REPO / "tests" / "data" / "grib" / "meteoswiss"
 KEYS_LINE = re.compile(r"^(?P<path>\S+) \[(?P<i>\d+)\] (?P<size>\d+) B: (?P<keys>.*)$")
 
 # the script's own empty-data step, applied to every full-size file in argv[1]

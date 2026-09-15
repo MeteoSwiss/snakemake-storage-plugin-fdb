@@ -12,7 +12,6 @@ from snakemake_storage_plugin_fdb.query import (
     parse,
 )
 
-REPO = Path(__file__).resolve().parents[1]
 DATA = Path(__file__).resolve().parent / "data"
 
 SCHEMA_TWO_RULES = """
@@ -129,9 +128,8 @@ def test_from_schema_user_keys():
     )
 
 
-@pytest.mark.skipif(not (REPO / ".raw/schema").exists(), reason="no .raw/schema")
-def test_from_raw_schema():
-    order = KeyOrder.from_schema((REPO / ".raw/schema").read_text())
+def test_from_pyfdb_schema():
+    order = KeyOrder.from_schema((DATA / "pyfdb-tests.schema").read_text())
     assert order.keys == (
         "class",
         "expver",

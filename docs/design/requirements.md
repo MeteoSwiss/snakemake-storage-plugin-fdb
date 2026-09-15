@@ -200,7 +200,7 @@ rule keys is an error.
 - Rationale: mirrors how fdb5's schema parser reads the file (architecture.md §8.1).
 - Verification: test `tests/test_key_order.py::test_from_schema_first_appearance`,
   `::test_from_schema_skips_hash_comments`, `::test_from_ecmwf_fdb_test_schema`,
-  `::test_from_schema_user_keys`, `::test_from_raw_schema`,
+  `::test_from_schema_user_keys`, `::test_from_pyfdb_schema`,
   `::test_from_schema_without_rules`, `tests/test_backend.py::test_parse_schema_test_schema`,
   `::test_parse_schema_decorations`.
 
@@ -625,7 +625,8 @@ nothing was archived`. Message keys absent from the schema are dropped. A query 
 message does not carry labels the message unchecked (e.g. `quantile=1:10`).
 
 - Rationale: stores GRIB that lacks a schema key (e.g. `template.grib` under
-  `.raw/schema`); limited to schemas whose rules share one key set (§5, L-17).
+  `tests/data/pyfdb-tests.schema`); limited to schemas whose rules share one key set
+  (§5, L-17).
 - Verification: test `tests/test_plugin.py::test_store_template`,
   `::test_store_default_native_under_multi_rule_schema`,
   `::test_store_identifier_key_absent_from_message_takes_query_value`,
@@ -909,13 +910,15 @@ environment and no site-related plugin settings.
 writes `<root>/schema`, `<root>/root/` and `<root>/config.yaml` (absolute paths), seeds
 every GRIB file directly in DIR natively, and archives zeroed `stream=oper` variants of
 FILE for steps 0/6/12 × params 167/165. Defaults: `--root .fdb`,
-`--schema tests/data/schema`, `--seed .raw`, `--variants .raw/template.grib`, relative
-to the repository; explicit arguments are relative to the working directory. A missing
-seed directory is reported and skipped; a missing variants file or schema is an argument
-error. It has no site flags.
+`--schema tests/data/schema`, `--seed tests/data/grib/ecmwf`,
+`--variants tests/data/grib/ecmwf/template.grib`, relative to the repository; explicit
+arguments are relative to the working directory. A missing seed directory is reported
+and skipped; a missing variants file or schema is an argument error. It has no site
+flags.
 
 - Rationale: a small local FDB for examples, manual testing and site setups.
-- Verification: test `tests/test_workflow.py::test_init_dev_fdb_seeds_raw_and_variants`,
+- Verification: test
+  `tests/test_workflow.py::test_init_dev_fdb_seeds_samples_and_variants`,
   `tests/sites/meteoswiss/test_workflow.py::test_workflow_init_dev_fdb_site_command`.
 
 #### FR-DEV-002 Site material outside the package
@@ -1065,7 +1068,8 @@ setting values and paths. The plugin never calls FDB `wipe` or `purge` (FR-REMOV
 #### NFR-LIC-001 Licensing and provenance
 
 The project is BSD-3-Clause (copyright MeteoSwiss). Third-party content keeps its
-provenance: `.raw/` ECMWF samples and `tests/data/ecmwf-fdb-tests.schema` come from
+provenance: the ECMWF samples in `tests/data/grib/ecmwf/`,
+`tests/data/pyfdb-tests.schema` and `tests/data/ecmwf-fdb-tests.schema` come from
 `ecmwf/fdb` (Apache-2.0); `examples/meteoswiss/realtime-varda.schema` carries its
 provenance header and evalml's BSD-3-Clause license; COSMO definitions are installed by
 the user, never copied into the repository.

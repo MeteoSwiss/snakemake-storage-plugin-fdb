@@ -37,11 +37,12 @@ from snakemake_storage_plugin_fdb.grib import split_messages, variant
 from snakemake_storage_plugin_fdb.guard import IdentifierMismatch, NoGuard
 from snakemake_storage_plugin_fdb.query import NAME_MAX
 
-REPO = Path(__file__).resolve().parents[1]
-RAW = REPO / ".raw"
-TEST_SCHEMA = Path(__file__).resolve().parent / "data" / "schema"
-ECMWF_SCHEMA = TEST_SCHEMA.with_name("ecmwf-fdb-tests.schema")  # multi-rule
-SYNTH11_QUERY = (  # .raw/synth11.grib as is (architecture.md §13.2)
+DATA = Path(__file__).resolve().parent / "data"
+SAMPLES = DATA / "grib" / "ecmwf"
+TEST_SCHEMA = DATA / "schema"
+ECMWF_SCHEMA = DATA / "ecmwf-fdb-tests.schema"  # multi-rule
+PYFDB_SCHEMA = DATA / "pyfdb-tests.schema"
+SYNTH11_QUERY = (  # synth11.grib sample as is (architecture.md §13.2)
     "fdb://class=od,expver=0001,stream=oper,date=20230508,time=1200,domain=g,"
     "type=fc,levtype=sfc,step=1,param=151130"
 )
@@ -53,13 +54,13 @@ EA = (
 )
 EA2 = EA.replace("expver=0001", "expver=0002")  # not seeded; written by store tests
 
-_raw_present = pytest.mark.skipif(
-    not (REPO / ".raw" / "template.grib").exists(), reason="no .raw/ ECMWF samples"
+_samples_present = pytest.mark.skipif(
+    not (SAMPLES / "template.grib").exists(), reason="no ECMWF samples"
 )
 
 
-def needs_raw(obj):
-    return pytest.mark.needs_raw(_raw_present(obj))
+def needs_samples(obj):
+    return pytest.mark.needs_samples(_samples_present(obj))
 
 
 SCHEMA_ORDER = (
@@ -323,18 +324,18 @@ class FDBStorageBase(TestStorageBase):
 
 class TestStorageRead(FDBStorageBase):
     """Base tests on pre-archived fields (architecture.md §8.9). ``test_storage`` and
-    ``test_storage_not_existing`` read the seeded FDB and need ``.raw/``;
+    ``test_storage_not_existing`` read the seeded FDB and need the ECMWF samples;
     ``test_query_validation`` and ``test_example_queries`` run without data."""
 
     __test__ = True
     retrieve_only = True  # the base store sequence writes text (TestStorageWrite)
 
-    @needs_raw
+    @needs_samples
     def test_storage(self, tmp_path, seeded_fdb):
         self.config = seeded_fdb.config
         super().test_storage(tmp_path)
 
-    @needs_raw
+    @needs_samples
     def test_storage_not_existing(self, tmp_path, seeded_fdb):
         self.config = seeded_fdb.config
         super().test_storage_not_existing(tmp_path)
@@ -365,7 +366,7 @@ def _write_local(obj: StorageObject, data: bytes) -> None:
     obj.local_path().write_bytes(data)
 
 
-@needs_raw
+@needs_samples
 def test_exists_size_checksum_complete(seeded_provider, seeded_fdb):
     obj = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167/165")
     assert obj.exists() is True
@@ -377,7 +378,7 @@ def test_exists_size_checksum_complete(seeded_provider, seeded_fdb):
     assert obj.cleanup() is None
 
 
-@needs_raw
+@needs_samples
 def test_exists_partial_retrieve_names_missing(seeded_provider):
     obj = seeded_provider().object(f"fdb://{EA},step=0/6/12/18,param=167")
     assert obj.exists() is False
@@ -392,7 +393,7 @@ def test_exists_partial_retrieve_names_missing(seeded_provider):
     assert not obj.local_path().with_name(obj.local_path().name + ".part").exists()
 
 
-@needs_raw
+@needs_samples
 def test_exists_missing_optional_key_and_mtime_not_found(seeded_provider):
     # the seeded fields carry domain=g; inspect needs it named (FR-READ-001)
     obj = seeded_provider().object(
@@ -409,7 +410,7 @@ def test_exists_missing_optional_key_and_mtime_not_found(seeded_provider):
         obj.retrieve_object()
 
 
-@needs_raw
+@needs_samples
 def test_exists_invalid_request_raises(seeded_provider):
     obj = seeded_provider().object(
         f"fdb://{EA.replace('class=ea', 'class=zz')},param=167"
@@ -418,7 +419,7 @@ def test_exists_invalid_request_raises(seeded_provider):
         obj.exists()
 
 
-@needs_raw
+@needs_samples
 def test_exists_wildcard_query_rejected(seeded_provider):
     obj = seeded_provider().object(f"fdb://{EA},step={{step}},param=167")
     with pytest.raises(WorkflowError, match="unresolved wildcards"):
@@ -442,7 +443,7 @@ def _fail_once(monkeypatch, provider: StorageProvider, method: str) -> list:
     return calls
 
 
-@needs_raw
+@needs_samples
 def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
     provider = seeded_provider()
     calls = _fail_once(monkeypatch, provider, "inspect")
@@ -450,14 +451,14 @@ def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
     assert len(calls) == 2
 
 
-@needs_raw
+@needs_samples
 def test_mtime_is_flush_time(seeded_provider, seeded_fdb):
     mtime = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167").mtime()
     assert isinstance(mtime, float)
     assert seeded_fdb.flush_start <= mtime <= seeded_fdb.flush_end
 
 
-@needs_raw
+@needs_samples
 def test_mtime_timestamp_fallback_os_stat(seeded_provider, monkeypatch, caplog):
     obj = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167")
     paths = {f.uri_path for f in obj._fields()}
@@ -472,7 +473,7 @@ def test_mtime_timestamp_fallback_os_stat(seeded_provider, monkeypatch, caplog):
     assert len(_warnings(caplog)) == 1
 
 
-@needs_raw
+@needs_samples
 def test_retrieve_request_order_and_size(seeded_provider):
     obj = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167/165")
     _write_local(obj, b"stale")
@@ -484,7 +485,7 @@ def test_retrieve_request_order_and_size(seeded_provider):
     assert not local.with_name(local.name + ".part").exists()
 
 
-@needs_raw
+@needs_samples
 def test_inventory_fills_cache_with_one_inspect(seeded_provider, monkeypatch):
     provider = seeded_provider()
     real, calls = provider.backend.inspect, []
@@ -511,7 +512,7 @@ def test_inventory_fills_cache_with_one_inspect(seeded_provider, monkeypatch):
     assert missing.cache_key() not in cache.size
 
 
-@needs_raw
+@needs_samples
 def test_canonical_spelling_warns_once(seeded_provider, caplog):
     provider = seeded_provider()
     query = f"fdb://{EA},step=0,param=2t"
@@ -526,7 +527,7 @@ def test_canonical_spelling_warns_once(seeded_provider, caplog):
     assert obj.local_suffix().endswith("/param=2t.grib")  # local path unchanged
 
 
-@needs_raw
+@needs_samples
 def test_canonical_spelling_error_raises(seeded_provider):
     obj = seeded_provider(canonical_spelling="error").object(
         f"fdb://{EA},step=0,param=2t"
@@ -536,7 +537,7 @@ def test_canonical_spelling_error_raises(seeded_provider):
             obj.exists()
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize(
     "setting, fields",
     [("ignore", "step=0,param=2t"), ("warn", "step=0/to/12/by/6,param=167")],
@@ -560,7 +561,7 @@ TEMPLATE_QUERY = (
 
 
 def _grib(steps=(0, 6, 12), params=(167,), zero_values=True) -> bytes:
-    template = (RAW / "template.grib").read_bytes()
+    template = (SAMPLES / "template.grib").read_bytes()
     return b"".join(
         variant(template, zero_values, stream="oper", expver="0002", step=s, paramId=p)
         for s in steps
@@ -585,7 +586,7 @@ def _stored_key(provider: StorageProvider) -> dict[str, str]:
     return field.key
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
 def test_store_roundtrip(make_provider, archive_mode):
     provider = make_provider(archive_mode=archive_mode)
@@ -603,19 +604,19 @@ def test_store_roundtrip(make_provider, archive_mode):
     assert keys == [("0", "167"), ("6", "167"), ("12", "167")]
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize(
     "schema, archive_mode, error",
     [
         (TEST_SCHEMA, "identifier", None),
-        (RAW / "schema", "identifier", None),  # number is not a schema key: dropped
-        (RAW / "schema", "native", "GRIB keys do not match the FDB schema"),
+        (PYFDB_SCHEMA, "identifier", None),  # number is not a schema key: dropped
+        (PYFDB_SCHEMA, "native", "GRIB keys do not match the FDB schema"),
     ],
-    ids=["test-schema-identifier", "raw-schema-identifier", "raw-schema-native"],
+    ids=["test-schema-identifier", "pyfdb-schema-identifier", "pyfdb-schema-native"],
 )
 def test_store_template(make_provider, schema, archive_mode, error):
     provider = make_provider(schema=schema, archive_mode=archive_mode)
-    data = (RAW / "template.grib").read_bytes()
+    data = (SAMPLES / "template.grib").read_bytes()
     if error:
         with pytest.raises(WorkflowError, match=error):
             _store(provider, TEMPLATE_QUERY, data)
@@ -629,7 +630,7 @@ def test_store_template(make_provider, schema, archive_mode, error):
     assert ("number" in field.key) == (schema == TEST_SCHEMA)
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
 @pytest.mark.parametrize(
     "case",
@@ -659,7 +660,7 @@ def test_store_strict_rejects(make_provider, archive_mode, case):
         assert _in_fdb(provider, STORE_QUERY) == 0
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
 def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
     provider = make_provider(archive_mode=archive_mode, store_check="warn")
@@ -676,12 +677,12 @@ def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
         _store(provider, f"fdb://{EA2},step=12/18/24,param=167", _grib((0, 18)))
 
 
-@needs_raw
+@needs_samples
 def test_store_default_native_under_multi_rule_schema(make_provider):
     """Native is the default (ADR-009): identifier mode needs a value for every key
     that is mandatory in any rule of a multi-rule schema."""
     provider = make_provider(schema=ECMWF_SCHEMA)
-    data = (RAW / "synth11.grib").read_bytes()
+    data = (SAMPLES / "synth11.grib").read_bytes()
     obj = _store(provider, SYNTH11_QUERY, data)
     assert obj.exists() is True
     obj.local_path().unlink()
@@ -696,7 +697,7 @@ def test_store_default_native_under_multi_rule_schema(make_provider):
         _store(identifier, SYNTH11_QUERY, data)
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize(
     "fields, messages, error",  # message 1 matches, message 2 contradicts the query
     [
@@ -724,7 +725,7 @@ def test_store_identifier_single_value_mismatch(make_provider, fields, messages,
     assert _in_fdb(provider, query) == 0
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize(
     "key, given, canonical",
     [
@@ -751,7 +752,7 @@ def test_store_identifier_archives_canonical_spelling(
     assert (message.param_id, message.mars["time"]) == ("167", "0000")
 
 
-@needs_raw
+@needs_samples
 def test_store_identifier_verbatim_without_expansion(
     make_provider, monkeypatch, caplog
 ):
@@ -764,7 +765,7 @@ def test_store_identifier_verbatim_without_expansion(
     assert "archived verbatim" in caplog.text
 
 
-@needs_raw
+@needs_samples
 def test_store_post_check_uses_fdb_clock(make_provider, monkeypatch):
     # FDB's clock can lag int(time.time()) by a second (architecture.md §8.7): with
     # both the clock and the index timestamps at a past second, the store passes its
@@ -791,7 +792,7 @@ def test_fdb_time_is_c_time(monkeypatch):
     assert fdb_time() == 1_800_000_000
 
 
-@needs_raw
+@needs_samples
 def test_store_identifier_key_absent_from_message_takes_query_value(make_provider):
     # the variants carry no quantile (an optional key of tests/data/schema)
     provider = make_provider(archive_mode="identifier")
@@ -801,13 +802,13 @@ def test_store_identifier_key_absent_from_message_takes_query_value(make_provide
     assert _stored_key(provider)["quantile"] == "1:10"
 
 
-@needs_raw
+@needs_samples
 def test_store_wildcard_query_rejected(make_provider):
     with pytest.raises(WorkflowError, match="unresolved wildcards"):
         _store(make_provider(), f"fdb://{EA2},step={{step}},param=167", _grib((0,)))
 
 
-@needs_raw
+@needs_samples
 def test_store_partial_archive_failure_says_fields_stay(make_provider, monkeypatch):
     provider = make_provider(archive_mode="identifier")  # one archive call per message
     real, calls = provider.backend.archive, []
@@ -840,7 +841,7 @@ class RecordingGuard:
             raise IdentifierMismatch(self.calls, "step", identifier["step"], "7")
 
 
-@needs_raw
+@needs_samples
 def test_store_guard_sees_every_message_before_archive(make_provider, monkeypatch):
     provider = make_provider(archive_mode="identifier")  # the guard runs only there
     events: list = []
@@ -866,7 +867,7 @@ def test_store_guard_sees_every_message_before_archive(make_provider, monkeypatc
     assert obj.exists() is True
 
 
-@needs_raw
+@needs_samples
 def test_store_guard_mismatch_leaves_fdb_unchanged(make_provider, monkeypatch):
     provider = make_provider(archive_mode="identifier")
     provider.guard = RecordingGuard([], fail_on=2)
@@ -880,7 +881,7 @@ def test_store_guard_mismatch_leaves_fdb_unchanged(make_provider, monkeypatch):
     assert _in_fdb(provider, STORE_QUERY) == 0
 
 
-@needs_raw
+@needs_samples
 def test_store_masking_rerun(make_provider):
     provider = make_provider()
     query = f"fdb://{EA2},step=0,param=167"
@@ -898,7 +899,7 @@ def test_store_masking_rerun(make_provider):
     assert len(provider.backend.list(request, include_masked=True)) == 2
 
 
-@needs_raw
+@needs_samples
 def test_store_threads(make_provider):
     provider = make_provider()
     steps = (0, 6, 12, 18)
@@ -912,7 +913,7 @@ def test_store_threads(make_provider):
     assert _in_fdb(provider, f"fdb://{EA2},step=0/6/12/18,param=167") == 4
 
 
-@needs_raw
+@needs_samples
 class TestStorageWrite(FDBStorageBase):
     """The base store sequence on an empty FDB: store, delete the local copy, exists,
     mtime, size, checksum, inventory, retrieve, remove (a no-op with a warning,
@@ -938,7 +939,7 @@ class TestStorageWrite(FDBStorageBase):
         return STORE_QUERY  # the FDB is empty
 
 
-@needs_raw
+@needs_samples
 def test_managed_wrappers_without_rate_limiter(make_provider):
     # the managed_* coroutines Snakemake calls pass through the no-op rate limiter
     # and return what the plain methods return (values: test_store_roundtrip etc.)
@@ -987,7 +988,7 @@ def _glob(obj: StorageObject) -> dict[str, list[str]]:
     return glob_wildcards(flag(obj.query, "storage_object", obj))._asdict()
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize("step", ["{step}", "{step,\\d+}"], ids=["plain", "constraint"])
 def test_glob_step_candidates_match_pattern(seeded_provider, step):
     obj = seeded_provider().object(f"fdb://param=167,{EA},step={step}")
@@ -997,7 +998,7 @@ def test_glob_step_candidates_match_pattern(seeded_provider, step):
     assert _glob(obj)["step"] == ["0", "12", "6"]
 
 
-@needs_raw
+@needs_samples
 def test_glob_keys_absent_from_pattern_collapse(seeded_provider):
     # param and stream are wildcards for list (architecture.md §13.4): 6 oper variants
     # and the enda template give three candidates
@@ -1009,7 +1010,7 @@ def test_glob_keys_absent_from_pattern_collapse(seeded_provider):
     ]
 
 
-@needs_raw
+@needs_samples
 def test_glob_skips_fields_without_the_wildcard_key(seeded_provider):
     # only the enda template carries number; the oper variants lack it
     obj = seeded_provider().object("fdb://class=ea,step=0,param=167,number={n}")
@@ -1017,7 +1018,7 @@ def test_glob_skips_fields_without_the_wildcard_key(seeded_provider):
     assert _glob(obj) == {"n": ["0"]}
 
 
-@needs_raw
+@needs_samples
 def test_glob_wildcard_inside_value_and_constant_list(seeded_provider):
     pattern = EA.replace("date=20200101", "date={year}0101")
     obj = seeded_provider().object(f"fdb://{pattern},step=0/6,param={{p}}")
@@ -1025,7 +1026,7 @@ def test_glob_wildcard_inside_value_and_constant_list(seeded_provider):
     assert _glob(obj) == {"year": ["2020", "2020"], "p": ["165", "167"]}
 
 
-@needs_raw
+@needs_samples
 @pytest.mark.parametrize(
     "settings, query, missing",
     [
@@ -1043,20 +1044,20 @@ def test_glob_required_keys_enforced(seeded_provider, settings, query, missing):
         obj.list_candidate_matches()
 
 
-@needs_raw
+@needs_samples
 def test_glob_required_keys_empty_allows_any_pattern(seeded_provider):
     obj = seeded_provider(glob_required_keys="").object("fdb://class={c},stream=enda")
     assert obj.list_candidate_matches() == ["fdb://class=ea,stream=enda"]
 
 
-@needs_raw
+@needs_samples
 def test_glob_invalid_value(seeded_provider):
     obj = seeded_provider().object("fdb://class=zz,step={s}")
     with pytest.raises(WorkflowError, match="Invalid MARS request"):
         obj.list_candidate_matches()
 
 
-@needs_raw
+@needs_samples
 def test_glob_retries_transient_list_error(seeded_provider, monkeypatch):
     provider = seeded_provider()
     calls = _fail_once(monkeypatch, provider, "list")

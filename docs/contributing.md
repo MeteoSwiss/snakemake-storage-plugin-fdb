@@ -26,10 +26,10 @@ uv run pytest tests/test_plugin.py -q -k glob      # a subset
 uv run coverage run -m pytest -q -rs && uv run coverage report --include='src/*'
 ```
 
-Tests that need the ECMWF samples in `.raw/` skip without them. Test FDBs are created in
-pytest's temporary directories. The end-to-end tests (`tests/test_workflow.py`) run
-`snakemake` in subprocesses with a clean environment and write each stage's output to a
-log file under pytest's temporary directory.
+Tests that need the ECMWF samples in `tests/data/grib/ecmwf/` skip without them. Test
+FDBs are created in pytest's temporary directories. The end-to-end tests
+(`tests/test_workflow.py`) run `snakemake` in subprocesses with a clean environment and
+write each stage's output to a log file under pytest's temporary directory.
 
 ### Site suite
 
@@ -45,7 +45,7 @@ uv run python examples/meteoswiss/make_metkit_home.py    # .local/metkit-home
 Then run the suite with the prerequisites in `SMK_FDB_TEST_*` variables:
 
 ```bash
-export SMK_FDB_TEST_MCH_SAMPLES=$PWD/.raw/meteoswiss \
+export SMK_FDB_TEST_MCH_SAMPLES=$PWD/tests/data/grib/meteoswiss \
     SMK_FDB_TEST_ECCODES_DEFINITIONS=$PWD/.local/eccodes-cosmo-mars/definitions:$PWD/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions \
     SMK_FDB_TEST_METKIT_HOME=$PWD/.local/metkit-home
 SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs
@@ -53,7 +53,7 @@ SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteos
 
 | variable | meaning |
 |---|---|
-| `SMK_FDB_TEST_MCH_SAMPLES` | directory with the OGD `*.grib2` samples (`.raw/meteoswiss`) |
+| `SMK_FDB_TEST_MCH_SAMPLES` | directory with the OGD `*.grib2` samples (`tests/data/grib/meteoswiss`) |
 | `SMK_FDB_TEST_ECCODES_DEFINITIONS` | colon list of definitions directories, cosmo-mars first (`/MEMFS/...` entries allowed) |
 | `SMK_FDB_TEST_METKIT_HOME` | directory with `share/metkit/language.yaml` defining the models |
 | `SMK_FDB_TEST_MCH_SCHEMA` | FDB schema; default `examples/meteoswiss/realtime-varda.schema` |
@@ -67,9 +67,9 @@ libraries load.
 
 `test_fetch_ogd_samples.py` has two tests that skip even with
 `SMK_FDB_TEST_REQUIRE_SITES=1`: `test_empty_data_reproduces_committed_samples` needs the
-git-ignored full-size originals in `.local/raw-full/meteoswiss/`, and `test_fetch_live`
-needs `SMK_FDB_TEST_OGD_LIVE=1` and network access (it writes only into pytest's
-temporary directory):
+git-ignored full-size originals in `.local/samples-full/meteoswiss/`, and
+`test_fetch_live` needs `SMK_FDB_TEST_OGD_LIVE=1` and network access (it writes only
+into pytest's temporary directory):
 
 ```bash
 SMK_FDB_TEST_OGD_LIVE=1 uv run pytest tests/sites/meteoswiss/test_fetch_ogd_samples.py -q -rs
@@ -152,16 +152,18 @@ generic settings or environment variables.
 
 ## Test data
 
-- `.raw/` holds the committed ECMWF samples (`template.grib`, `steprange.grib`,
-  `quantile.grib`, `synth11.grib`) and pyfdb's test schema `.raw/schema`;
-  `.raw/meteoswiss/` holds the MeteoSwiss OGD samples as empty-data GRIB (constant field,
-  `grid_simple`, `bitsPerValue=0`, MARS keys unchanged, 175–350 B each).
-- **Never modify `.raw/` by hand.** Derived variants are created in memory at test time
-  (`grib.variant`); `tests/data/` holds the plugin's own test schemas.
+- `tests/data/grib/ecmwf/` holds the committed ECMWF samples (`template.grib`,
+  `steprange.grib`, `quantile.grib`, `synth11.grib`); `tests/data/grib/meteoswiss/`
+  holds the MeteoSwiss OGD samples as empty-data GRIB (constant field, `grid_simple`,
+  `bitsPerValue=0`, MARS keys unchanged, 175–350 B each).
+- `tests/data/` also holds the test schemas: the plugin's own `schema`, pyfdb's
+  `pyfdb-tests.schema` and ECMWF's multi-rule `ecmwf-fdb-tests.schema`.
+- **Never modify the samples or the copied schemas by hand.** Derived variants are
+  created in memory at test time (`grib.variant`).
 - New samples must be small (use empty-data or zeroed copies) and have a known license
   and provenance.
 - Dev FDBs go into the git-ignored `.fdb/` and `.fdb-mch/`; full-size OGD originals into
-  the git-ignored `.local/raw-full/meteoswiss/`.
+  the git-ignored `.local/samples-full/meteoswiss/`.
 
 ### Refreshing samples
 
@@ -174,14 +176,14 @@ ECCODES_DEFINITION_PATH=$DEFS ECCODES_VERSION_CHECK_OFF=1 \
     uv run python examples/meteoswiss/fetch_ogd_samples.py --empty-data --force
 ```
 
-Remove the old files from `.raw/meteoswiss/` afterwards, then run the site suite. Without
-`--empty-data` the script only writes full-size files to `.local/raw-full/meteoswiss/`;
-`--empty-data DIR` writes the copies elsewhere, which is the way to try it without
-touching the committed samples.
+Remove the old files from `tests/data/grib/meteoswiss/` afterwards, then run the site
+suite. Without `--empty-data` the script only writes full-size files to
+`.local/samples-full/meteoswiss/`; `--empty-data DIR` writes the copies elsewhere, which
+is the way to try it without touching the committed samples.
 
 ECMWF samples come unchanged from [`ecmwf/fdb`](https://github.com/ecmwf/fdb) at commit
 `63672ea` (Apache-2.0); the source path of each file is in
-[architecture §13.2](design/architecture.md#132-ecmwf-samples-raw). There is no script
+[architecture §13.2](design/architecture.md#132-ecmwf-samples). There is no script
 (requirements.md D-008): copy the files from that commit and compare checksums.
 
 ## Deferred work

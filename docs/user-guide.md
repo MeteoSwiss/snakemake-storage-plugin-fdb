@@ -329,11 +329,11 @@ MARS language, schema, profile and query conventions.
 ## A local development FDB
 
 The [README quick start](../README.md#quick-start) creates a development FDB in a
-checkout and runs the example workflow against it.
-`scripts/init_dev_fdb.py` creates `.fdb/` (configuration, schema `tests/data/schema`,
-database root), archives the ECMWF sample files from `.raw/` (`--seed`) and small
-variants of `.raw/template.grib` (`--variants`). `--root`, `--schema`, `--seed DIR` and
-`--variants FILE` choose other locations; see the
+checkout and runs the example workflow against it. `scripts/init_dev_fdb.py` creates
+`.fdb/` (configuration, schema `tests/data/schema`, database root), archives the ECMWF
+sample files from `tests/data/grib/ecmwf/` (`--seed`) and small variants of
+`tests/data/grib/ecmwf/template.grib` (`--variants`). `--root`, `--schema`, `--seed DIR`
+and `--variants FILE` choose other locations; see the
 [reference](reference.md#scriptsinit_dev_fdbpy). The configuration uses absolute paths,
 so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any directory.
 [`examples/ecmwf/README.md`](../examples/ecmwf/README.md) explains the example workflow.

@@ -22,18 +22,18 @@ from snakemake_storage_plugin_fdb.backend import (
 from snakemake_storage_plugin_fdb.grib import GribError, split_messages, variant
 from snakemake_storage_plugin_fdb.query import KeyOrder, QueryError, parse
 
-REPO = Path(__file__).resolve().parents[1]
-RAW = REPO / ".raw"
 DATA = Path(__file__).resolve().parent / "data"
+SAMPLES = DATA / "grib" / "ecmwf"
 TEST_SCHEMA = DATA / "schema"
+PYFDB_SCHEMA = DATA / "pyfdb-tests.schema"
 
-_raw_present = pytest.mark.skipif(
-    not (RAW / "template.grib").exists(), reason="no .raw/ ECMWF samples"
+_samples_present = pytest.mark.skipif(
+    not (SAMPLES / "template.grib").exists(), reason="no ECMWF samples"
 )
 
 
-def needs_raw(func):
-    return pytest.mark.needs_raw(_raw_present(func))
+def needs_samples(func):
+    return pytest.mark.needs_samples(_samples_present(func))
 
 
 # class=ea,stream=oper variants seeded by conftest.seeded_fdb
@@ -135,9 +135,9 @@ def test_parse_schema_decorations():
     assert info.defaults == {"number": "0"}
 
 
-@needs_raw
-def test_parse_schema_raw():
-    info = parse_schema((RAW / "schema").read_text())
+@needs_samples
+def test_parse_schema_pyfdb():
+    info = parse_schema(PYFDB_SCHEMA.read_text())
     assert info.optional == {"domain", "levelist"}
     assert info.keys[:6] == ("class", "expver", "stream", "date", "time", "domain")
 
@@ -313,7 +313,7 @@ def test_timestamp_of():
 # --- against a temporary FDB --------------------------------------------------------
 
 
-@needs_raw
+@needs_samples
 def test_inspect_2x2(seeded_fdb):
     fields = seeded_fdb.backend.inspect(REQ_2X2)
     assert len(fields) == 4
@@ -327,7 +327,7 @@ def test_inspect_2x2(seeded_fdb):
         assert f.uri_path and Path(f.uri_path).is_file()
 
 
-@needs_raw
+@needs_samples
 def test_inspect_aliases_and_missing(seeded_fdb):
     backend = seeded_fdb.backend
     aliases = {
@@ -343,7 +343,7 @@ def test_inspect_aliases_and_missing(seeded_fdb):
     assert backend.inspect({**REQ_2X2, "expver": "0002"}) == []
 
 
-@needs_raw
+@needs_samples
 def test_invalid_request(seeded_fdb):
     with pytest.raises(RuntimeError) as e:
         seeded_fdb.backend.inspect({**REQ_2X2, "class": "zz"})
@@ -353,19 +353,19 @@ def test_invalid_request(seeded_fdb):
     assert "cannot expand 'zz'" in str(mapped)
 
 
-@needs_raw
+@needs_samples
 def test_list_levels(seeded_fdb):
     backend = seeded_fdb.backend
     fields = backend.list({"class": "ea", "stream": "oper"})
     assert len(fields) == 6
     assert all(f.length > 0 and f.timestamp > 0 and f.uri_path for f in fields)
-    assert len(backend.list({})) == 10  # 4 raw files + 6 variants
+    assert len(backend.list({})) == 10  # 4 sample files + 6 variants
     (db,) = backend.list({"class": "ea", "stream": "oper"}, level=1)
     assert db.key["stream"] == "oper" and "step" not in db.key
     assert (db.length, db.timestamp, db.uri_path) == (0, 0, None)
 
 
-@needs_raw
+@needs_samples
 def test_retrieve_to(seeded_fdb, tmp_path):
     backend = seeded_fdb.backend
     total = sum(f.length for f in backend.inspect(REQ_2X2))
@@ -384,7 +384,7 @@ def test_retrieve_to(seeded_fdb, tmp_path):
     assert dest.read_bytes() == messages[0].data
 
 
-@needs_raw
+@needs_samples
 def test_retrieve_to_errors_leave_no_part(seeded_fdb, tmp_path):
     backend = seeded_fdb.backend
     dest = tmp_path / "x.grib"
@@ -401,14 +401,14 @@ def test_retrieve_to_errors_leave_no_part(seeded_fdb, tmp_path):
     assert dest.read_bytes() == b"old" and not part.exists()
 
 
-@needs_raw
+@needs_samples
 def test_retrieve_to_nothing_found(seeded_fdb, tmp_path):
     dest = tmp_path / "none.grib"
     assert seeded_fdb.backend.retrieve_to({**REQ_2X2, "expver": "0002"}, dest) == 0
     assert dest.read_bytes() == b""
 
 
-@needs_raw
+@needs_samples
 def test_expand(seeded_fdb):
     request = {"param": "2t/165", "step": "0/to/12/by/6", "date": "2020-01-01"}
     assert seeded_fdb.backend.expand(request) == {
@@ -421,7 +421,7 @@ def test_expand(seeded_fdb):
         seeded_fdb.backend.expand({"class": "zz"})
 
 
-@needs_raw
+@needs_samples
 def test_expected_count(seeded_fdb):
     backend = seeded_fdb.backend
     assert backend.expected_count(REQ_2X2) == 4
@@ -429,7 +429,7 @@ def test_expected_count(seeded_fdb):
     assert backend.expected_count({"param": "2t/167", "step": "0/to/12/by/6"}) == 3
 
 
-@needs_raw
+@needs_samples
 def test_expansion_fallback(seeded_fdb, monkeypatch, caplog):
     backend = seeded_fdb.backend
     monkeypatch.setitem(sys.modules, "pyfdb._internal", None)  # import fails
@@ -440,7 +440,7 @@ def test_expansion_fallback(seeded_fdb, monkeypatch, caplog):
     assert "skipped" in caplog.text
 
 
-@needs_raw
+@needs_samples
 def test_spelling_diffs(seeded_fdb):
     backend = seeded_fdb.backend
     parsed = parse("fdb://param=2t,class=EA,step=0/to/6/by/6")
@@ -460,10 +460,10 @@ def test_spelling_diffs(seeded_fdb):
     ]  # fmt: skip
 
 
-@needs_raw
+@needs_samples
 def test_archive_identifier_and_masking(empty_fdb):
     backend = empty_fdb()
-    template = (RAW / "template.grib").read_bytes()
+    template = (SAMPLES / "template.grib").read_bytes()
     message = variant(template, stream="oper", step=1)
     identifier = {**EA_OPER, "step": "1", "param": "167"}
     backend.archive(message, identifier)
@@ -476,16 +476,17 @@ def test_archive_identifier_and_masking(empty_fdb):
     assert len(backend.list(identifier, include_masked=True)) == 2
 
 
-@needs_raw
+@needs_samples
 def test_archive_native_errors_map(empty_fdb, tmp_path):
-    raw_schema = empty_fdb(RAW / "schema")
+    pyfdb_schema = empty_fdb(PYFDB_SCHEMA)
+    template = (SAMPLES / "template.grib").read_bytes()
     with pytest.raises(RuntimeError) as e:
-        raw_schema.archive((RAW / "template.grib").read_bytes())  # number not in schema
+        pyfdb_schema.archive(template)  # number not in schema
     mapped = map_error(e.value, "fdb://q", tmp_path / "t.grib")
     assert "GRIB keys do not match the FDB schema" in str(mapped)
     assert "Keywords not used: {number}" in str(mapped)
     with pytest.raises(RuntimeError) as e:
-        raw_schema.archive(b"test")
+        pyfdb_schema.archive(b"test")
     assert str(map_error(e.value, "fdb://q", "t.grib")) == "t.grib is not GRIB"
 
 
@@ -498,7 +499,7 @@ def _toc_config(root: Path, schema: Path) -> dict:
     }
 
 
-@needs_raw
+@needs_samples
 def test_config_errors_at_first_use(tmp_path):
     (tmp_path / "db").mkdir()
     backend = Backend(_toc_config(tmp_path / "db", tmp_path / "missing-schema"))
@@ -514,7 +515,7 @@ def test_config_errors_at_first_use(tmp_path):
     assert "No writable roots available" in str(map_error(e.value, "fdb://q"))
 
 
-@needs_raw
+@needs_samples
 def test_config_forms(seeded_fdb, tmp_path):
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.safe_dump(seeded_fdb.config))
@@ -539,11 +540,11 @@ def test_handle_per_thread():
     assert backend.handle() is backend.handle()
 
 
-@needs_raw
+@needs_samples
 def test_reads_see_archives_after_an_earlier_read(empty_fdb):
     # a handle that has read a database keeps its catalogue (architecture.md §13.5)
     backend = empty_fdb()
-    template = (RAW / "template.grib").read_bytes()
+    template = (SAMPLES / "template.grib").read_bytes()
     identifier = {**EA_OPER, "step": "0", "param": "167"}
     old = variant(template, stream="oper", step=0, paramId=167)
     new = variant(template, False, stream="oper", step=0, paramId=167)

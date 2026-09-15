@@ -9,13 +9,13 @@ passed from any working directory (``--storage-fdb-config <root>/config.yaml``).
 Defaults are relative to the repository: ``--root .fdb``,
 ``--schema tests/data/schema``.
 
-``--seed [DIR]`` (default ``.raw``) archives every GRIB file directly in DIR (files
-starting with ``GRIB``, no subdirectories) natively; FDB derives the keys. A missing
-DIR is reported and skipped. ``--variants [FILE]`` (default ``.raw/template.grib``)
-archives zeroed ``stream=oper`` variants of the GRIB message in FILE for steps 0/6/12
-and params 167/165: the fields ``examples/ecmwf/`` reads. Data needing other eccodes
-definitions or MARS language is seeded with ``ECCODES_DEFINITION_PATH``/``METKIT_HOME``
-set in the environment.
+``--seed [DIR]`` (default ``tests/data/grib/ecmwf``) archives every GRIB file directly
+in DIR (files starting with ``GRIB``, no subdirectories) natively; FDB derives the
+keys. A missing DIR is reported and skipped. ``--variants [FILE]`` (default
+``tests/data/grib/ecmwf/template.grib``) archives zeroed ``stream=oper`` variants of
+the GRIB message in FILE for steps 0/6/12 and params 167/165: the fields
+``examples/ecmwf/`` reads. Data needing other eccodes definitions or MARS language is
+seeded with ``ECCODES_DEFINITION_PATH``/``METKIT_HOME`` set in the environment.
 """
 
 import argparse
@@ -99,19 +99,20 @@ def main(argv: list[str] | None = None) -> int:
         "--seed",
         type=Path,
         nargs="?",
-        const=REPO / ".raw",
+        const=REPO / "tests" / "data" / "grib" / "ecmwf",
         default=None,
         metavar="DIR",
-        help="archive every GRIB file in DIR (default .raw)",
+        help="archive every GRIB file in DIR (default tests/data/grib/ecmwf)",
     )
     parser.add_argument(
         "--variants",
         type=Path,
         nargs="?",
-        const=REPO / ".raw" / "template.grib",
+        const=REPO / "tests" / "data" / "grib" / "ecmwf" / "template.grib",
         default=None,
         metavar="FILE",
-        help="archive stream=oper variants of FILE (default .raw/template.grib), "
+        help="archive stream=oper variants of FILE "
+        "(default tests/data/grib/ecmwf/template.grib), "
         "steps 0/6/12 x params 167/165: the inputs of examples/ecmwf/",
     )
     args = parser.parse_args(argv)

@@ -34,7 +34,7 @@ testpaths = ["tests"]
 # Test modules may share a basename across suites (tests/ and tests/sites/*/).
 addopts = ["--import-mode=importlib"]
 markers = [
-  "needs_raw: needs .raw/ ECMWF samples",
+  "needs_samples: needs the ECMWF samples in tests/data/grib/ecmwf/",
   "site_meteoswiss: MeteoSwiss site suite (env-configured; required in CI)",
 ]
 

@@ -16,9 +16,10 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 EXAMPLE = REPO / "examples" / "ecmwf"
 INIT_DEV_FDB = REPO / "scripts" / "init_dev_fdb.py"
+SAMPLES = REPO / "tests" / "data" / "grib" / "ecmwf"
 
 pytestmark = pytest.mark.skipif(
-    not (REPO / ".raw" / "template.grib").exists(), reason="no .raw/ ECMWF samples"
+    not (SAMPLES / "template.grib").exists(), reason="no ECMWF samples"
 )
 
 OUTPUT_REQUEST = {
@@ -109,12 +110,12 @@ def workflow(tmp_path_factory, run_logged) -> dict:
     return out
 
 
-def test_init_dev_fdb_seeds_raw_and_variants(workflow):
+def test_init_dev_fdb_seeds_samples_and_variants(workflow):
     log = workflow["init"].ok()
     root = workflow["tmp"] / ".fdb"
     assert (root / "schema").read_bytes() == (REPO / "tests/data/schema").read_bytes()
     assert (root / "root").is_dir()
-    assert "10 messages archived" in log  # 4 .raw files + 6 template variants
+    assert "10 messages archived" in log  # 4 ECMWF samples + 6 template variants
 
 
 def test_workflow_run_stores_and_cleans_local_copies(workflow):

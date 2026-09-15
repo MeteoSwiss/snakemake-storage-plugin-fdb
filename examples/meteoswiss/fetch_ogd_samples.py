@@ -7,10 +7,11 @@
 
 Downloads the control T_2M and TOT_PREC fields and the perturbed T_2M file (reduced to
 ``--members`` by ``perturbationNumber``) of one forecast and writes them full-size to
-``--out`` (default ``.local/raw-full/meteoswiss``, git-ignored). With ``--empty-data``
-it also writes copies whose data section is a constant field (``grid_simple``,
-``bitsPerValue=0``, a few hundred bytes) to DIR (default ``.raw/meteoswiss``, the
-committed samples), after checking that their MARS keys equal the full-size messages';
+``--out`` (default ``.local/samples-full/meteoswiss``, git-ignored). With
+``--empty-data`` it also writes copies whose data section is a constant field
+(``grid_simple``, ``bitsPerValue=0``, a few hundred bytes) to DIR (default
+``tests/data/grib/meteoswiss``, the committed samples), after checking that their MARS
+keys equal the full-size messages';
 existing copies are only overwritten with ``--force``. File names:
 ``<model>_<YYYYMMDDHHMM>_step<h>_<variable>_<ctrl|pert_mA-B>.grib2``.
 
@@ -229,17 +230,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--out",
         type=Path,
-        default=REPO / ".local" / "raw-full" / "meteoswiss",
-        help="directory for the full-size files (default .local/raw-full/meteoswiss)",
+        default=REPO / ".local" / "samples-full" / "meteoswiss",
+        help="directory for the full-size files "
+        "(default .local/samples-full/meteoswiss)",
     )
     parser.add_argument(
         "--empty-data",
         type=Path,
         nargs="?",
-        const=REPO / ".raw" / "meteoswiss",
+        const=REPO / "tests" / "data" / "grib" / "meteoswiss",
         default=None,
         metavar="DIR",
-        help="also write constant-field copies to DIR (default .raw/meteoswiss)",
+        help="also write constant-field copies to DIR "
+        "(default tests/data/grib/meteoswiss)",
     )
     parser.add_argument(
         "--force", action="store_true", help="overwrite existing constant-field copies"

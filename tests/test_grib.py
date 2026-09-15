@@ -14,22 +14,22 @@ from snakemake_storage_plugin_fdb.grib import (
     variant,
 )
 
-REPO = Path(__file__).resolve().parents[1]
-RAW = REPO / ".raw"
-RAW_OGD = RAW / "meteoswiss"
-PERT = RAW_OGD / "icon-ch2-eps_202609151200_step6_t_2m_pert_m1-2.grib2"
+DATA = Path(__file__).resolve().parent / "data"
+SAMPLES = DATA / "grib" / "ecmwf"
+OGD_SAMPLES = DATA / "grib" / "meteoswiss"
+PERT = OGD_SAMPLES / "icon-ch2-eps_202609151200_step6_t_2m_pert_m1-2.grib2"
 
-_raw_present = pytest.mark.skipif(
-    not (RAW / "template.grib").exists(), reason="no .raw/ ECMWF samples"
+_samples_present = pytest.mark.skipif(
+    not (SAMPLES / "template.grib").exists(), reason="no ECMWF samples"
 )
 
 
-def needs_raw(func):
-    return pytest.mark.needs_raw(_raw_present(func))
+def needs_samples(func):
+    return pytest.mark.needs_samples(_samples_present(func))
 
 
 # architecture.md §13.2: MARS namespace keys and paramId of the ECMWF samples
-RAW_SAMPLES = {
+ECMWF_SAMPLES = {
     "template.grib": (
         10800,
         10732,
@@ -130,29 +130,29 @@ def test_import_does_not_load_eccodes():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-@needs_raw
-@pytest.mark.parametrize("name", sorted(RAW_SAMPLES))
-def test_raw_samples(name):
-    file_size, length, mars, param_id = RAW_SAMPLES[name]
-    raw = (RAW / name).read_bytes()
+@needs_samples
+@pytest.mark.parametrize("name", sorted(ECMWF_SAMPLES))
+def test_ecmwf_samples(name):
+    file_size, length, mars, param_id = ECMWF_SAMPLES[name]
+    raw = (SAMPLES / name).read_bytes()
     assert len(raw) == file_size
-    (msg,) = split_messages(RAW / name)
+    (msg,) = split_messages(SAMPLES / name)
     assert msg == GribMessage(0, length, raw[:length], mars, param_id)
     assert msg.data.endswith(b"7777")
     assert mars_keys(msg.data) == (mars, param_id)
 
 
-@needs_raw
-def test_raw_padding_is_nul():
+@needs_samples
+def test_template_padding_is_nul():
     """GRIB1 samples are NUL-padded to 120-byte records after ``7777``."""
-    raw = (RAW / "template.grib").read_bytes()
+    raw = (SAMPLES / "template.grib").read_bytes()
     assert len(raw) % 120 == 0
     assert set(raw[10732:]) == {0}
 
 
-@needs_raw
+@needs_samples
 def test_two_padded_files_concatenated(tmp_path):
-    raw = (RAW / "template.grib").read_bytes()
+    raw = (SAMPLES / "template.grib").read_bytes()
     msgs = split_messages(_write(tmp_path, raw + raw))
     assert [(m.offset, m.length) for m in msgs] == [(0, 10732), (10800, 10732)]
     assert msgs[0].data == msgs[1].data == raw[:10732]
@@ -174,9 +174,9 @@ def test_nul_padding_between_and_after_messages(tmp_path, grib2):
     assert [(m.offset, m.length) for m in msgs] == [(0, n), (n + 7, n)]
 
 
-@needs_raw
+@needs_samples
 def test_trailing_garbage(tmp_path):
-    raw = (RAW / "template.grib").read_bytes()
+    raw = (SAMPLES / "template.grib").read_bytes()
     with pytest.raises(GribError, match="trailing non-GRIB bytes at offset 10800"):
         split_messages(_write(tmp_path, raw + b"GARBAGE"))
 
@@ -207,7 +207,7 @@ def test_split_missing_file(tmp_path):
         split_messages(tmp_path / "missing.grib")
 
 
-@pytest.mark.skipif(not PERT.exists(), reason="no .raw/meteoswiss samples")
+@pytest.mark.skipif(not PERT.exists(), reason="no MeteoSwiss samples")
 def test_multi_message_file_offsets():
     """Generic splitting of a 2-message GRIB2 file (no site definitions needed)."""
     raw = PERT.read_bytes()
@@ -244,9 +244,9 @@ def test_grib2_sample_with_centre_215(grib2):
     assert param_id.isdigit()
 
 
-@needs_raw
+@needs_samples
 def test_variant_zeroed():
-    raw = (RAW / "template.grib").read_bytes()
+    raw = (SAMPLES / "template.grib").read_bytes()
     small = variant(raw, stream="oper", step=6, date=20200102)
     assert 200 <= len(small) <= 300  # ~236 bytes (NFR-PERF-004)
     mars, param_id = mars_keys(small)
@@ -256,9 +256,9 @@ def test_variant_zeroed():
     assert param_id == "167"
 
 
-@needs_raw
+@needs_samples
 def test_variant_keeps_values_and_accepts_reserved_names():
-    raw = (RAW / "template.grib").read_bytes()
+    raw = (SAMPLES / "template.grib").read_bytes()
     full = variant(raw, zero_values=False, **{"class": "od", "paramId": 165})
     assert len(full) == 10732
     mars, param_id = mars_keys(full)

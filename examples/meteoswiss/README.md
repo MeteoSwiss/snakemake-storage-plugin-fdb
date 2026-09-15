@@ -50,11 +50,11 @@ site environment so that eccodes decodes the samples with the COSMO definitions:
 ```bash
 DEFS=$PWD/.local/eccodes-cosmo-mars/definitions:$PWD/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions
 ECCODES_DEFINITION_PATH=$DEFS METKIT_HOME=$PWD/.local/metkit-home ECCODES_VERSION_CHECK_OFF=1 \
-    uv run python scripts/init_dev_fdb.py --root .fdb-mch --schema examples/meteoswiss/realtime-varda.schema --seed .raw/meteoswiss
+    uv run python scripts/init_dev_fdb.py --root .fdb-mch --schema examples/meteoswiss/realtime-varda.schema --seed tests/data/grib/meteoswiss
 ```
 
 It writes `.fdb-mch/{config.yaml,schema,root/}` and archives the 4 messages of the
-committed samples in `.raw/meteoswiss/`.
+committed samples in `tests/data/grib/meteoswiss/`.
 
 ## Run
 
@@ -87,10 +87,10 @@ accumulations).
 
 ## Samples
 
-`.raw/meteoswiss/` holds three ICON-CH2-EPS files (control T_2M, control TOT_PREC,
-perturbed T_2M members 1–2) as constant-field copies of 175–350 bytes with the original
-MARS keys. `fetch_ogd_samples.py` downloads full-size files to the git-ignored
-`.local/raw-full/meteoswiss/`; `--out DIR` and `--empty-data DIR` choose other
+`tests/data/grib/meteoswiss/` holds three ICON-CH2-EPS files (control T_2M, control
+TOT_PREC, perturbed T_2M members 1–2) as constant-field copies of 175–350 bytes with the
+original MARS keys. `fetch_ogd_samples.py` downloads full-size files to the git-ignored
+`.local/samples-full/meteoswiss/`; `--out DIR` and `--empty-data DIR` choose other
 directories, `--reference-datetime`, `--horizon` and `--members` other fields. How to
 refresh the committed copies is in
 [`docs/contributing.md`](../../docs/contributing.md#refreshing-samples).
