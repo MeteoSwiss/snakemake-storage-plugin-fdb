@@ -1,4 +1,4 @@
-# snakemake-storage-plugin-fdb — Implementation plan (revision 2)
+# snakemake-storage-plugin-fdb — Implementation plan (revision 4)
 
 Companion to `spec.md`. Steps are ordered, small and independently testable; each lists
 the files it touches, acceptance criteria and the commands to run. Commands assume the
@@ -58,7 +58,7 @@ tests/
     test_backend.py       backend against a temp FDB
     test_plugin.py        TestStorageBase subclass + store/remove/glob tests
     test_workflow.py      end-to-end snakemake run on example/
-    data/schema           extended pyfdb test schema (committed, 300 B)
+    data/schema           extended pyfdb test schema (committed, 212 B)
     sites/meteoswiss/     required site suite, configured via SMK_FDB_TEST_* env vars (conftest.py, test_read/write/glob/workflow/conventions.py)
 example/Snakefile, example/config.yaml               generic ECMWF-style example
 examples/meteoswiss/                                  everything MeteoSwiss, outside the package:
@@ -68,7 +68,8 @@ examples/meteoswiss/                                  everything MeteoSwiss, out
     make_metkit_home.py (language.yaml recipe)
 docs/sites/meteoswiss.md
 scripts/init_dev_fdb.py            creates and seeds .fdb/ (generic)
-scripts/fetch_ecmwf_samples.py     downloads .raw/ files from ecmwf/fdb at a pinned commit
+scripts/fetch_ecmwf_samples.py     optional, not part of any step: re-downloads the committed .raw/ ECMWF files
+                                   from ecmwf/fdb at a pinned commit (provenance in spec §2.1)
 .github/workflows/ci.yml, release-please.yml, conventional-prs.yml
 ```
 
@@ -328,7 +329,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 - `tests/test_no_site_specifics.py`: walks `src/` and fails on
   `re.search(r"mch|meteoswiss|cosmo|icon-ch", text, re.I)` in any file.
 - `guard.py`: `IdentifierGuard` protocol, `IdentifierMismatch` exception, `NoGuard`,
-  `StrictGuard` whose `__init__` raises `NotImplementedError("reserved")`, and
+  `StrictGuard` whose `__init__` raises
+  `NotImplementedError("identifier_check=strict is reserved")`, and
   `make_guard(settings) -> IdentifierGuard` (returns `NoGuard()` for `none`).
 - `StorageProvider.__post_init__`: settings validation (reject `identifier_check` other
   than `none` with the spec's message), env export (`ECKIT_EXCEPTION_IS_SILENT`
@@ -540,7 +542,7 @@ Files: `scripts/init_dev_fdb.py`, `example/Snakefile`, `example/config.yaml`,
 `example/README.md`, `tests/test_workflow.py` (`needs_raw`).
 
 `scripts/init_dev_fdb.py [--root .fdb] [--seed] [--mch]`: writes `.fdb/schema`
-(copy of `tests/data/schema`, or `tests/data/mch/realtime-varda.schema` with `--mch`),
+(copy of `tests/data/schema`, or `examples/meteoswiss/realtime-varda.schema` with `--mch`),
 `.fdb/root/`, `.fdb/config.yaml`; `--seed` archives `.raw/*.grib` plus derived
 variants when `.raw/` exists.
 
@@ -621,7 +623,9 @@ works; `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m sit
 ## Step 10 — MeteoSwiss site material (outside the package) and required site suite
 
 Files (none under `src/`): `examples/meteoswiss/{README.md,realtime-varda.schema,profile/config.yaml,Snakefile,setup.sh,make_metkit_home.py,fetch_ogd_samples.py}`,
-`tests/sites/meteoswiss/{conftest.py,test_meteoswiss.py}`, `docs/sites/meteoswiss.md`.
+`tests/sites/meteoswiss/{conftest.py,test_read.py,test_write.py}` (existing since steps
+2–6, extended; `test_glob.py` and `test_workflow.py` come from steps 7 and 9),
+`docs/sites/meteoswiss.md`.
 
 `setup.sh [--dest .local]`: `git clone --depth 1 --branch varda-ext
 https://github.com/MeteoSwiss/eccodes-cosmo-mars.git $DEST/eccodes-cosmo-mars` (evalml
@@ -671,9 +675,10 @@ After writing, the script prints `grib_ls -n mars`-equivalent key dumps via ecco
 so the user can eyeball `class/stream/type/model/step/number/timespan`.
 
 Expected: 3 files, 4 messages, ≈ 2.27 MB for CH2 (`t_2m` ctrl 567 927 B, `tot_prec`
-ctrl 567 951 B, perturbed members 1–2 1 135 854 B); CH1 would be ≈ 4× larger. Not
-committed; git-ignored. The full perturbed CH2 file is 11.4 MB (20 members) and is
-never kept.
+ctrl 567 951 B, perturbed members 1–2 1 135 854 B); CH1 would be ≈ 4× larger. The
+full-size files are kept in the git-ignored `.local/raw-full/meteoswiss/`; the committed
+`.raw/meteoswiss/` samples are their empty-data copies (175–350 B, see the header). The
+full perturbed CH2 file is 11.4 MB (20 members) and is never kept.
 
 Acceptance for the script: run twice in a row → identical file set (same reference
 time within the 24 h window); run with an expired `--reference-datetime` → clear error
@@ -695,17 +700,24 @@ part of the default `pytest` run — it skips only when prerequisites are missin
   `METKIT_HOME` with no plugin settings at all (proves goal 7's "works via generic
   means"); nothing in `src/` refers to this suite;
 - fixture: temp FDB with the schema from the env var; provider settings built from the
-  env vars; the fixture reads `date`/`time` from the sample messages (the OGD reference
-  time changes with every fetch) and builds queries with them;
+  env vars; the fixture takes `date`/`time` from the sample file names
+  (`mch_query_base`; `test_conventions.py` checks them against the messages — the OGD
+  reference time changes with every fetch) and builds queries with them;
+- (Several items below already exist under other names from steps 5/6:
+  `test_write_ctrl[native|identifier]`, `test_write_members`, `test_read_samples`
+  (members `1/to/3`, TOT_PREC without `timespan`), `test_read_model_requires_metkit_home`.
+  This step adds the remaining ones; the sizes below are those of the full-size
+  originals, tests compare against the sample file's actual size.)
 - `test_native_archive_and_read`: default `archive_mode` (`native`), store the ctrl T_2M file via
   `fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=<d>,time=<t>,type=cf,levtype=sfc,step=6,param=500011`
-  → `exists()`, `mtime` 10-digit float, `size()==567927`, retrieve round trip
-  byte-identical, listed keys have `domain=''`, `number=''`, `timespan=none`,
-  `model=icon-ch2-eps` [all verified in spec §2.9];
+  → `exists()`, `mtime` 10-digit float, `size()` = file size (567 927 B full-size),
+  retrieve round trip byte-identical, listed keys have `domain=''`, `number=''`,
+  `timespan=none`, `model=icon-ch2-eps` [all verified in spec §2.9];
 - `test_identifier_archive`: same with `archive_mode="identifier"` set explicitly
   (single-rule varda schema);
 - `test_members`: the 2-message perturbed file via `...,type=pf,number=1/2,step=6,param=500011`
-  → 2 fields, `size()==1135854`; `number=1/to/3` → `exists()` False (member 3 absent);
+  → 2 fields, `size()` = file size (1 135 854 B full-size); `number=1/to/3` →
+  `exists()` False (member 3 absent);
 - `test_accumulation_needs_timespan`: `param=500041` without `timespan=fs` → `exists()`
   False; with it → True;
 - `test_number_context`: `type=cf` with `number=0` → invalid-request error;
@@ -888,7 +900,7 @@ inverted.
 | 8 conformance | 5–7 | `uv run coverage run -m pytest -rs` |
 | 9 e2e | 8 | `uv run pytest tests/test_workflow.py` |
 | 10 MeteoSwiss site suite (required) | 8 | `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -rs` |
-| 11 CI (data provisioning open) | 8 | green run |
+| 11 CI | 8 | green run |
 | 12 docs | 9, 10 | review |
 | 13 identifier guard (post-v1) | 6 | `uv run pytest tests/test_guard.py` |
 | 14 upstream | 5 | PR links |

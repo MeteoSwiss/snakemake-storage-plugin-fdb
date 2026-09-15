@@ -19,7 +19,7 @@ s3/http/fs plugins, `poetry-snakemake-plugin`, `MeteoSwiss/eccodes-cosmo-mars`
 Revision 2 changes: MeteoSwiss conventions replaced by what `eccodes-cosmo-mars` and
 `evalml` actually do (§2.8, §9.2); canonicalisation policy per user decision (§3.2,
 §7.12); identifier guard hook and reserved setting (§4, §7.7); test data is no longer
-assumed to be in git (§9).
+assumed to be in git (§9; superseded since: the test data is committed, see §9).
 
 Revision 3 changes: MeteoSwiss samples come from the MeteoSwiss Open Government Data
 (OGD) STAC API, not from the `/store_new` archive (§2.9, §9.2); real ICON-CH2-EPS
@@ -45,8 +45,8 @@ compared (§2.4, §4, §7.7 decisions, §8, §12).
    (`/` value lists, `to`/`by` ranges). It maps to exactly one local file holding all
    matching GRIB messages.
 3. FDB location configurable per provider instance (settings, incl. tagged settings),
-   falling back to FDB's own environment variables. Dev/test FDBs live under `.fdb/` in
-   the workspace and stay small.
+   falling back to FDB's own environment variables. Dev FDBs live under `.fdb/` in the
+   workspace (test FDBs under pytest's temporary directories) and stay small.
 4. Correct Snakemake semantics for `exists`, `mtime`, `size`, retrieve, store, remove,
    inventory and `glob_wildcards`, given FDB's constraints (immutable, masked
    overwrites, no per-field deletion).
@@ -119,7 +119,7 @@ the test suite).
   FDB raises `Keywords not used: {number}` / `{quantile}`. pyfdb's own tests only
   succeed because their fixture rewrites `stream=oper`, which makes eccodes drop
   `number` from the MARS namespace. A schema with `number?` and `quantile?` in the datum
-  rule archives all five files (proposed `tests/data/schema`, §9.1).
+  rule archives all four remaining files (`tests/data/schema`, §9.1).
 - FDB canonicalises `param`: `167.128`→`167`, `166.128`→`166`, `70.131`→`131070`,
   `130.151`→`151130`.
 - **File size ≠ message length for the GRIB1 samples** [verified: eccodes 2.47.3,
@@ -394,7 +394,9 @@ re-verified on pyfdb 5.21.4.23 by the site test suite.]
   https://opendatadocs.meteoswiss.ch/e-forecast-data/e2-e3-numerical-weather-forecasting-model?download-options=restapi#download-options
 - **Sizes.** One native-grid surface field: CH1 ≈ 2.3 MB, CH2 ≈ 568 KB. The perturbed
   file holds all members (CH2: 20 messages, 11.4 MB).
-- **Samples saved** in `.raw/meteoswiss/` (not committed, ≈ 2.27 MB, CH2 only):
+- **Samples saved** in `.raw/meteoswiss/` (CH2 only; committed as empty-data copies of
+  175–350 B, §9; the full-size originals, ≈ 2.27 MB with the sizes below, live in the
+  git-ignored `.local/raw-full/meteoswiss/`):
   `icon-ch2-eps_202609151200_step6_t_2m_ctrl.grib2` (1 msg, 567 927 B),
   `icon-ch2-eps_202609151200_step6_tot_prec_ctrl.grib2` (1 msg, 567 951 B),
   `icon-ch2-eps_202609151200_step6_t_2m_pert_m1-2.grib2` (2 msgs, members 1 and 2,
@@ -1242,14 +1244,14 @@ plugin code does not know about them. `tests/test_no_site_specifics.py` fails if
 
 - Location: `.raw/*.grib` and `.raw/schema`, committed. Provenance in §2.1 allows a
   fetch script from `ecmwf/fdb` at a pinned commit for the four files (all Apache-2.0).
-  `compare.grib` is dropped (decided); references to "five files" below mean four.
+  `compare.grib` is dropped (decided).
 - `.raw/schema` stays the untouched pyfdb copy. The plugin's test schema
-  `tests/data/schema` (a 300-byte text file, committed) is
+  `tests/data/schema` (a 212-byte text file, committed) is
   ```
   param: Param; step: Step; date: Date; levelist: Double; expver: Expver; time: Time; number: Integer;
   [ class, expver, stream, date, time, domain? [ type, levtype [ step, quantile?, number?, levelist?, param ]] ]
   ```
-  [verified: archives all five `.raw` files in native mode].
+  [verified: archives all four `.raw` files in native mode].
 - Derived variants are created **in memory** at test time from `template.grib` with
   eccodes (`stream=oper`, `step`, `paramId`, `date` changes), never written to `.raw/`.
   Zeroed-value copies are ~236 bytes, so a fixture with dozens of fields is a few KB.
@@ -1267,8 +1269,9 @@ samples and the `examples/meteoswiss/` material directly, so the examples are
 guaranteed to work (the e2e test runs `examples/meteoswiss/Snakefile` with
 `examples/meteoswiss/profile/config.yaml`).
 
-- Samples: the three CH2 files listed in §2.9 (≈ 2.27 MB, `.raw/meteoswiss/`,
-  git-ignored, not committed). CH2 is used instead of CH1 to keep size low (CH1 surface
+- Samples: the three CH2 files listed in §2.9 (`.raw/meteoswiss/`, committed as
+  empty-data copies; the ≈ 2.27 MB full-size originals are in the git-ignored
+  `.local/raw-full/meteoswiss/`). CH2 is used instead of CH1 to keep size low (CH1 surface
   field ≈ 2.3 MB vs CH2 ≈ 568 KB); the two products share definitions, schema and key
   conventions (only `model` differs: `icon-ch1-eps` / `icon-ch2-eps`).
 - `examples/meteoswiss/fetch_ogd_samples.py` (plan step 10) reproduces them: Python
@@ -1276,11 +1279,13 @@ guaranteed to work (the e2e test runs `examples/meteoswiss/Snakefile` with
   latest reference time (or `--reference-datetime`), `GET`s the pre-signed asset URL,
   subsets the perturbed file to members 1–2 by `perturbationNumber`, writes to
   `.raw/meteoswiss/`. Because OGD data is retained for only 24 h, the script always
-  produces a *recent* reference time; the file names carry it, and the tests read
-  `date`/`time` from the GRIB messages instead of hard-coding them.
+  produces a *recent* reference time; the file names carry it, and the tests take
+  `date`/`time` from the file name (`mch_query_base` fixture), which
+  `test_conventions.py` checks against the MARS keys of the messages, instead of
+  hard-coding them.
 - The constant-field size trick (`grib_set -d 0`, §2.6 in revision 1) is no longer
-  needed for fetching but remains available to shrink fixtures if they are ever
-  committed (a zeroed CH2 field would be a few hundred bytes).
+  needed for fetching; it is how the committed samples were shrunk (a zeroed CH2 field
+  is a few hundred bytes).
 - `examples/meteoswiss/realtime-varda.schema`: verbatim copy of evalml's schema (§2.8,
   3 KB) [verified]. Not under `tests/data/` and never referenced by package code.
 - `examples/meteoswiss/make_metkit_home.py [--models icon-ch1-eps,icon-ch2-eps,varda-single,varda-single-g]`:
@@ -1307,17 +1312,17 @@ guaranteed to work (the e2e test runs `examples/meteoswiss/Snakefile` with
   only. In CI the definitions, schema and metkit home are set up by a workflow step
   (clone `eccodes-cosmo-mars`, install `eccodes-cosmo-resources-python`, run
   `examples/meteoswiss/make_metkit_home.py`, export the `SMK_FDB_TEST_*` variables) and
-  `SMK_FDB_TEST_REQUIRE_SITES=1` turns any remaining skip into a failure. The only
-  open item is the sample data (24 h OGD retention; plan step 11). A synthetic variant runs
+  `SMK_FDB_TEST_REQUIRE_SITES=1` turns any remaining skip into a failure. Sample data
+  is not an open item any more: CI uses the committed `.raw/meteoswiss/` samples (plan
+  step 11). A synthetic variant runs
   **without** the samples but still needs the definitions: it uses the constant-field
   technique (a GRIB2 message built from eccodes' `GRIB2` sample with `centre=215`, GPI
   142, PDT 1, `T_2M`) if that decodes to the same MARS keys — to be confirmed in plan
   step 10; if it does not, the synthetic variant is dropped and the suite stays
   sample-gated.
-- CI: the 24 h OGD retention makes the API unsuitable for reproducible CI fixtures;
-  see plan step 11 open item (cache artifact, release asset, or a small committed
-  fixture later). Everything else the suite needs (definitions, schema, language) is
-  provisioned in CI.
+- CI: the 24 h OGD retention makes the API unsuitable for reproducible CI fixtures, so
+  CI uses the committed empty-data samples (decided; plan step 11). Everything else the
+  suite needs (definitions, schema, language) is provisioned in CI.
 
 ### 9.3 Unit tests (no FDB)
 
@@ -1337,7 +1342,7 @@ fallback; unknown keys alphabetical.
 ### 9.4 Integration tests (temporary toc FDB per test session; skipped without `.raw/`)
 
 Fixtures build an FDB in `tmp_path_factory` with `tests/data/schema` and archive the
-five `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
+four `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
 `conftest.py` before importing the plugin.
 
 - `TestStorageRead(TestStorageBase)` with `retrieve_only = True`, `files_only = True`,
@@ -1360,8 +1365,9 @@ five `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
   `time=0`/`00`: listed as `param=167`/`time=0000`, found and retrieved by the canonical
   query), `test_store_identifier_verbatim_without_expansion`, `test_store_identifier_key_absent_from_message_takes_query_value`; the
   guard and partial-archive tests set `archive_mode=identifier` explicitly; site suite
-  `tests/sites/meteoswiss/test_write.py::test_write_identifier_param_mismatch`. Glob: `test_glob` (step 7). Also `test_timestamp_fallback`,
-  `test_config_forms`, `test_error_mapping`, `test_canonical_spelling` (`param=2t` vs
+  `tests/sites/meteoswiss/test_write.py::test_write_identifier_param_mismatch`. Glob: `test_glob` (step 7). Also `test_mtime_timestamp_fallback_os_stat`,
+  `tests/test_backend.py::test_config_forms` and `::test_map_error_table`,
+  `test_canonical_spelling_warns_once`/`_error_raises`/`_silent` (`param=2t` vs
   `167` → warning text; `error` policy raises; ranges exempt).
 
 ### 9.5 End-to-end
