@@ -1,0 +1,9 @@
+.local/
+.fdb/
+.venv/
+__pycache__/
+.snakemake/
+*.part
+dist/
+CLAUDE.local.md
+WORK.md
