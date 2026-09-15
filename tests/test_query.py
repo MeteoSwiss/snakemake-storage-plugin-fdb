@@ -13,6 +13,7 @@ from snakemake_storage_plugin_fdb.query import (
     KeyOrder,
     ParsedQuery,
     QueryError,
+    comparable,
     normalize,
     parse,
     validate,
@@ -255,6 +256,21 @@ def test_list_wildcard_value_does_not_commute():
     pattern = parse(q).local_suffix()
     w = {"step": "0/6"}
     assert parse(apply_wildcards(q, w)).local_suffix() != apply_wildcards(pattern, w)
+
+
+@pytest.mark.parametrize(
+    "key, value, expected",
+    [
+        ("step", "06", 6),
+        ("type", "CF", "cf"),
+        ("param", "167.128", 167),
+        ("param", "70.131", 131070),
+        ("param", "2t", None),
+        ("step", "10m", "10m"),
+    ],
+)
+def test_comparable(key, value, expected):
+    assert comparable(key, value) == expected
 
 
 def test_no_fdb_libraries_imported():

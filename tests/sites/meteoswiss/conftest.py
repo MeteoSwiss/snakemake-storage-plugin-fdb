@@ -4,13 +4,18 @@ Each missing prerequisite is its own skip reason; with ``SMK_FDB_TEST_REQUIRE_SI
 it is a failure instead. Nothing in ``src/`` knows about this suite.
 """
 
+import json
 import os
+import re
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 REQUIRE = os.environ.get("SMK_FDB_TEST_REQUIRE_SITES") == "1"
+SITE_ENV = ("ECCODES_DEFINITION_PATH", "METKIT_HOME")
 MEMFS = "/MEMFS/"  # in-memory definitions bundled with the eccodes wheels
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_SCHEMA = REPO / "examples" / "meteoswiss" / "realtime-varda.schema"
@@ -21,6 +26,54 @@ def _missing(reason: str):
     if REQUIRE:
         pytest.fail(f"site prerequisite missing: {reason}", pytrace=False)
     pytest.skip(reason)
+
+
+@pytest.fixture(scope="session")
+def run_site() -> Callable[..., dict]:
+    """Runner: ``run(script, job, tmp, env=None)`` executes ``script`` in a subprocess
+    with the JSON ``job`` (plus ``local_prefix`` under ``tmp``) as ``sys.argv[1]`` and
+    returns the JSON of its last stdout line. The site variables of this process are
+    dropped; ``env`` adds variables for the subprocess."""
+
+    def run(script: str, job: dict, tmp: Path, env: dict[str, str] | None = None):
+        proc_env = {k: v for k, v in os.environ.items() if k not in SITE_ENV}
+        proc_env.update(env or {})
+        job = {"local_prefix": str(tmp / "local"), **job}
+        proc = subprocess.run(
+            [sys.executable, "-c", script, json.dumps(job)],
+            env=proc_env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            pytest.fail(f"site subprocess failed:\n{proc.stderr}", pytrace=False)
+        return json.loads(proc.stdout.splitlines()[-1])
+
+    return run
+
+
+@pytest.fixture(scope="session")
+def mch_fdb_config(fdb_config_file, mch_schema) -> Callable[[Path], Path]:
+    """Factory: empty toc FDB under ``root`` with the site schema; its config file."""
+    return lambda root: fdb_config_file(root, mch_schema)
+
+
+@pytest.fixture(scope="session")
+def mch_query_base() -> Callable[[Path], str]:
+    """Constant query keys of the step-6 fields in a sample file
+    (``class=od,...,date=<d>,time=<t>,levtype=sfc,step=6``); date and time come from
+    the file name, which ``test_conventions`` checks against the MARS keys."""
+
+    def base(path: Path) -> str:
+        stamp = re.search(r"_(\d{8})(\d{4})_step6_", path.name)
+        assert stamp, path.name
+        return (
+            "class=od,expver=0001,stream=enfo,model=icon-ch2-eps,"
+            f"date={stamp.group(1)},time={stamp.group(2)},levtype=sfc,step=6"
+        )
+
+    return base
 
 
 @pytest.fixture(scope="session")

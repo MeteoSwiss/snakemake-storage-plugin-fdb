@@ -1,7 +1,7 @@
 """pyfdb access layer: config and schema resolution, per-thread handles, inspect, list,
 retrieve, archive, timestamps, request expansion and error mapping (spec §2, §5, §6).
 
-``pyfdb`` is imported lazily (first ``Backend.handle()`` or ``Backend.expand()``), never
+``pyfdb`` is imported lazily (first FDB handle or ``Backend.expand()``), never
 at module import, so the provider can export environment variables (spec §4.1) before
 FDB, metkit and eccodes load. The config and schema helpers are pure Python. Nothing in
 this module changes the process environment; ``resolve_schema_path`` only reads it.
@@ -24,7 +24,7 @@ import yaml
 from snakemake_interface_common.exceptions import WorkflowError
 
 from .grib import GribError
-from .query import KeyOrder, ParsedQuery
+from .query import INT_RE, KeyOrder, ParsedQuery
 
 if TYPE_CHECKING:
     import pyfdb
@@ -38,7 +38,6 @@ _TIMESTAMP_RE = re.compile(r"timestamp=(\d+)\s*$")
 _EXPANDED_LINE_RE = re.compile(r"^\t?(\w+)=(.*)$")
 _SCHEMA_COMMENT_RE = re.compile(r"#[^\n]*")
 _SCHEMA_KEY_RE = re.compile(r"\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*)", re.S)
-_INT_RE = re.compile(r"-?\d+")
 _USER_ERROR_PREFIX = re.compile(r"^(?:(?:UserError|Serious bug):\s*)+")
 
 # Substrings of pyfdb RuntimeError messages (spec §6, verified on pyfdb 5.21.4.23)
@@ -225,7 +224,7 @@ def _expand_items(items: list[str]) -> list[str]:
 
 
 def _range(start: str, stop: str, by: str) -> list[str] | None:
-    if not all(_INT_RE.fullmatch(v) for v in (start, stop, by)) or int(by) == 0:
+    if not all(INT_RE.fullmatch(v) for v in (start, stop, by)) or int(by) == 0:
         return None
     step = int(by)
     first, last = _as_date(start), _as_date(stop)
@@ -295,7 +294,8 @@ def map_error(
 
 
 class Backend:
-    """pyfdb access for one provider, with one ``pyfdb.FDB`` per thread (spec §5).
+    """pyfdb access for one provider: one archiving ``pyfdb.FDB`` per thread and a
+    fresh handle per read (spec §5).
 
     Methods propagate pyfdb's ``RuntimeError``s unchanged; callers convert them with
     ``map_error`` so the message can name the query and local file.
@@ -314,18 +314,31 @@ class Backend:
         self.schema_info = schema_info
         self._local = threading.local()
 
+    def _open(self) -> pyfdb.FDB:
+        """A new ``pyfdb.FDB``; pyfdb is imported here, after the environment is set."""
+        import pyfdb
+
+        return pyfdb.FDB(self.config, self.user_config)
+
     def handle(self) -> pyfdb.FDB:
-        """This thread's FDB handle, created on first use (pyfdb is imported here)."""
+        """This thread's archiving handle, opened on first use; reads never use it."""
         fdb = getattr(self._local, "fdb", None)
         if fdb is None:
-            import pyfdb
-
-            fdb = self._local.fdb = pyfdb.FDB(self.config, self.user_config)
+            fdb = self._local.fdb = self._open()
         return fdb
+
+    def reader(self) -> pyfdb.FDB:
+        """A new handle for one read.
+
+        A handle that has read a database keeps that catalogue: fields archived later,
+        by any handle, stay invisible to its ``inspect``/``list``/``retrieve`` (spec
+        §2.4). Opening a handle is cheap, so every read gets a fresh one.
+        """
+        return self._open()
 
     def inspect(self, request: Mapping[str, str]) -> list[Field]:
         """Fields ``retrieve(request)`` would return; missing ones are omitted."""
-        return [self._field(el) for el in self.handle().inspect(dict(request))]
+        return [self._field(el) for el in self.reader().inspect(dict(request))]
 
     def list(
         self,
@@ -334,7 +347,7 @@ class Backend:
         include_masked: bool = False,
     ) -> list[Field]:
         """``fdb.list``: omitted keys are wildcards (spec §2.3)."""
-        elements = self.handle().list(
+        elements = self.reader().list(
             dict(selection), include_masked=include_masked, level=level
         )
         return [self._field(el) for el in elements]
@@ -355,7 +368,8 @@ class Backend:
         dest.parent.mkdir(parents=True, exist_ok=True)
         written = 0
         try:
-            handle = self.handle().retrieve(dict(request))
+            fdb = self.reader()  # referenced while the data handle is read
+            handle = fdb.retrieve(dict(request))
             with handle, open(part, "wb") as f:
                 view = memoryview(bytearray(CHUNK))
                 while (n := handle.readinto(view)) > 0:

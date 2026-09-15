@@ -38,6 +38,18 @@ def fdb_config(root: Path, schema: Path = TEST_SCHEMA) -> dict[str, Any]:
     }
 
 
+@pytest.fixture(scope="session")
+def fdb_config_file() -> Callable[..., Path]:
+    """Factory: ``fdb_config(root, schema)`` written to ``root/config.yaml``."""
+
+    def write(root: Path, schema: Path = TEST_SCHEMA) -> Path:
+        config = root / "config.yaml"
+        config.write_text(yaml.safe_dump(fdb_config(root, schema)))
+        return config
+
+    return write
+
+
 @dataclass
 class SeededFDB:
     config: dict[str, Any]
@@ -97,6 +109,7 @@ def clean_env(monkeypatch) -> pytest.MonkeyPatch:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(plugin, "_APPLIED", {})
     monkeypatch.setattr(plugin, "_SPELLING_WARNED", set())
+    monkeypatch.setattr(plugin, "_REMOVE_WARNED", set())
     return monkeypatch
 
 

@@ -33,8 +33,12 @@ GENERIC_ORDER = [
     "param",
 ]
 
+INT_RE = re.compile(r"-?\d+")  # integer MARS values (steps, numbers, to/by bounds)
+ECMWF_PARAM_TABLE = 128  # table whose paramIds carry no table prefix
+
 _KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _ICHAR_RE = re.compile(r"[A-Za-z0-9.\-:_]")
+_PARAM_TABLE_RE = re.compile(r"(\d+)\.(\d+)")  # e.g. 167.128, 70.131
 # eckit::StreamParser (used by fdb5 SchemaParser) skips "#" to end of line anywhere.
 _SCHEMA_COMMENT_RE = re.compile(r"#[^\n]*")
 
@@ -96,6 +100,18 @@ def _replace_literal(value: str, old: str, new: str) -> str:
     return "".join(
         text if is_wc else text.replace(old, new) for is_wc, text in _pieces(value)
     )
+
+
+def comparable(key: str, value: str) -> int | str | None:
+    """Light normalisation of a MARS value for comparisons (spec §7.7): integers
+    compare numerically, ``param`` as a paramId (``N.T`` -> ``N`` for table 128, else
+    ``T*1000+N``; ``None`` for other spellings), everything else case-insensitively."""
+    if key == "param" and (m := _PARAM_TABLE_RE.fullmatch(value)):
+        number, table = int(m.group(1)), int(m.group(2))
+        return number if table == ECMWF_PARAM_TABLE else table * 1000 + number
+    if INT_RE.fullmatch(value):
+        return int(value)
+    return None if key == "param" else value.lower()
 
 
 @dataclass(frozen=True)

@@ -9,18 +9,10 @@ either the ``eccodes_definitions``/``metkit_home`` settings or the plain
 """
 
 import hashlib
-import json
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
-import yaml
 
 pytestmark = pytest.mark.site_meteoswiss
-
-SITE_ENV = ("ECCODES_DEFINITION_PATH", "METKIT_HOME")
 
 SCRIPT = """
 import hashlib, json, logging, sys, time
@@ -64,44 +56,21 @@ SAMPLES = {
 }
 
 
-def _run(job: dict, tmp: Path, env: dict[str, str] | None = None) -> dict:
-    proc_env = {k: v for k, v in os.environ.items() if k not in SITE_ENV}
-    proc_env.update(env or {})
-    job = {"local_prefix": str(tmp / "local"), **job}
-    proc = subprocess.run(
-        [sys.executable, "-c", SCRIPT, json.dumps(job)],
-        env=proc_env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"site subprocess failed:\n{proc.stderr}", pytrace=False)
-    return json.loads(proc.stdout.splitlines()[-1])
-
-
 @pytest.fixture(scope="module")
 def site_fdb(
-    tmp_path_factory, mch_sample, mch_schema, eccodes_definitions, metkit_home
+    tmp_path_factory,
+    run_site,
+    mch_fdb_config,
+    mch_sample,
+    mch_query_base,
+    eccodes_definitions,
+    metkit_home,
 ):
     """Temp FDB (config file) with the four sample fields archived natively, and
     the queries addressing them (``t2m_pf_1to3`` and ``tp_cf_no_timespan`` match
     nothing: member 3 is absent, accumulations need ``timespan=fs``)."""
     tmp = tmp_path_factory.mktemp("mch-fdb")
-    (tmp / "db").mkdir()
-    config = tmp / "config.yaml"
-    config.write_text(
-        yaml.safe_dump(
-            {
-                "type": "local",
-                "engine": "toc",
-                "schema": str(mch_schema),
-                "spaces": [
-                    {"handler": "Default", "roots": [{"path": str(tmp / "db")}]}
-                ],
-            }
-        )
-    )
+    config = mch_fdb_config(tmp)
     files = {name: mch_sample(pattern) for name, pattern in SAMPLES.items()}
     settings = {
         "config": str(config),
@@ -109,13 +78,10 @@ def site_fdb(
         "eccodes_definitions": eccodes_definitions,
         "metkit_home": str(metkit_home),
     }
-    out = _run({"settings": settings, "archive": [str(p) for p in files.values()]}, tmp)
+    job = {"settings": settings, "archive": [str(p) for p in files.values()]}
+    out = run_site(SCRIPT, job, tmp)
     assert len(out["archived"]) == 4
-    first = out["archived"][0]
-    base = (
-        "fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,"
-        f"date={first['date']},time={first['time']},levtype=sfc,step=6"
-    )
+    base = "fdb://" + mch_query_base(files["t2m_cf"])
     return {
         "config": str(config),
         "files": files,
@@ -132,7 +98,7 @@ def site_fdb(
 
 @pytest.mark.parametrize("configured_by", ["settings", "env"])
 def test_read_samples(
-    site_fdb, eccodes_definitions, metkit_home, tmp_path, configured_by
+    site_fdb, run_site, eccodes_definitions, metkit_home, tmp_path, configured_by
 ):
     if configured_by == "settings":
         settings = {
@@ -148,7 +114,7 @@ def test_read_samples(
             "METKIT_HOME": str(metkit_home),
         }
     job = {"settings": settings, "queries": site_fdb["queries"]}
-    results = _run(job, tmp_path, env)["results"]
+    results = run_site(SCRIPT, job, tmp_path, env)["results"]
     start, end = site_fdb["flush"]
     for name, path in site_fdb["files"].items():
         res = results[name]
@@ -161,7 +127,9 @@ def test_read_samples(
     assert results["tp_cf_no_timespan"] == {"exists": False}
 
 
-def test_read_model_requires_metkit_home(site_fdb, eccodes_definitions, tmp_path):
+def test_read_model_requires_metkit_home(
+    site_fdb, run_site, eccodes_definitions, tmp_path
+):
     settings = {
         "config": site_fdb["config"],
         "eccodes_definitions": eccodes_definitions,
@@ -170,7 +138,7 @@ def test_read_model_requires_metkit_home(site_fdb, eccodes_definitions, tmp_path
         "settings": settings,
         "queries": {"t2m_cf": site_fdb["queries"]["t2m_cf"]},
     }
-    error = _run(job, tmp_path)["results"]["t2m_cf"].get("error", "")
+    error = run_site(SCRIPT, job, tmp_path)["results"]["t2m_cf"].get("error", "")
     assert error.startswith("WorkflowError: Invalid MARS request"), error
     assert "icon-ch2-eps" in error
     assert "metkit_home" in error  # the mapped hint

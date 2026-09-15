@@ -6,10 +6,12 @@ Importing this module loads no FDB/eccodes native library: ``is_valid_query`` an
 (spec §4.1, §5).
 """
 
+import contextlib
 import itertools
 import os
 import re
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,8 +46,17 @@ from .backend import (
     resolve_config,
 )
 from .backend import resolve_schema_path as _resolve_schema_path
-from .guard import IDENTIFIER_CHECKS, make_guard
-from .query import NAME_MAX, KeyOrder, ParsedQuery, QueryError, normalize, parse
+from .grib import GribError, GribMessage, split_messages
+from .guard import IDENTIFIER_CHECKS, IdentifierMismatch, make_guard
+from .query import (
+    NAME_MAX,
+    KeyOrder,
+    ParsedQuery,
+    QueryError,
+    comparable,
+    normalize,
+    parse,
+)
 from .query import validate as _validate_query
 
 ARCHIVE_MODES = ("identifier", "native")
@@ -61,10 +72,22 @@ _ENV_LOCK = threading.Lock()
 # Values this process's providers applied from eccodes_definitions / metkit_home,
 # to warn when two providers disagree (one process environment, spec §4.1).
 _APPLIED: dict[str, str] = {}
-# Queries already warned about non-canonical spelling (once per process, spec §7.12).
+# Queries already warned about (once per process): non-canonical spelling (spec
+# §7.12) and remove_policy=warn (spec §7.8).
 _SPELLING_WARNED: set[str] = set()
-_SPELLING_LOCK = threading.Lock()
+_REMOVE_WARNED: set[str] = set()
+_WARNED_LOCK = threading.Lock()
 MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
+STAY_NOTE = "they stay in FDB until the next successful store masks them"
+
+
+def _first_time(registry: set[str], query: str) -> bool:
+    """Record ``query`` in ``registry``; whether it was not there yet."""
+    with _WARNED_LOCK:
+        if query in registry:
+            return False
+        registry.add(query)
+        return True
 
 
 def _retry_fdb_io(func):
@@ -463,10 +486,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def _mapping_errors(
         self, local: str | os.PathLike[str] | None = None
     ) -> Iterator[None]:
-        """Raise known pyfdb failures as the ``WorkflowError`` of spec §6."""
+        """Raise known pyfdb and GRIB failures as the ``WorkflowError`` of spec §6."""
         try:
             yield
-        except RuntimeError as e:
+        except (RuntimeError, GribError) as e:
             mapped = map_error(e, self.query, local)
             if mapped is None:
                 raise
@@ -512,11 +535,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         )
         if policy == "error":
             raise WorkflowError(message)
-        with _SPELLING_LOCK:
-            if self.query in _SPELLING_WARNED:
-                return
-            _SPELLING_WARNED.add(self.query)
-        self.provider.logger.warning(message)
+        if _first_time(_SPELLING_WARNED, self.query):
+            self.provider.logger.warning(message)
 
     @_retry_fdb_io
     def _inspect(self, request: Mapping[str, str]) -> list[Field]:
@@ -545,9 +565,12 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return sum(f.length for f in fields)
 
     def _mtime_of(self, fields: list[Field]) -> float:
-        """Latest index timestamp; ``os.stat`` of the data file if it is 0 (§7.4)."""
-        times = [float(f.timestamp) or self._stat_mtime(f.uri_path) for f in fields]
-        return max(times)
+        """Latest field time (spec §7.4)."""
+        return max(self._field_time(f) for f in fields)
+
+    def _field_time(self, field: Field) -> float:
+        """Index timestamp; ``os.stat`` of the data file if it is 0 (spec §7.4)."""
+        return float(field.timestamp) or self._stat_mtime(field.uri_path)
 
     def _stat_mtime(self, uri_path: str | None) -> float:
         if uri_path:
@@ -610,7 +633,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return None
 
     def cleanup(self) -> None:
-        """Nothing to clean: handles are per thread and flushed after every store."""
+        """Nothing to clean: archiving handles are per thread and flushed after every
+        store; reads use a fresh handle each."""
 
     def exists(self) -> bool:
         """All fields the query expands to are in FDB (spec §7.1)."""
@@ -640,10 +664,164 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     # --- write path (plan step 6) --------------------------------------------------
 
     def store_object(self) -> None:
-        raise NotImplementedError
+        """Archive the local GRIB file under the query (spec §7.7); never retried.
+
+        Everything that can be checked from the file (GRIB structure, field count,
+        identifiers, duplicates, guard) is checked before the first ``archive()``;
+        a post-check ``inspect`` then requires every message to be reachable by the
+        query with a timestamp from this store.
+        """
+        expected = self._expected()  # wildcards, invalid request, spelling check
+        local = self.local_path()
+        with self._mapping_errors(local):
+            messages = split_messages(local)
+        n = len(messages)
+        counts = f"{local} has {n} fields, the query expands to {expected}"
+        if n > expected or (n < expected and self.provider.store_check == "strict"):
+            raise WorkflowError(f"{self.query}: {counts}; nothing was archived")
+        if n < expected:
+            self.provider.logger.warning(
+                f"FDB storage: {self.query}: {counts} (store_check=warn)"
+            )
+
+        if self.provider.archive_mode == "identifier":
+            keyed = self._identifiers(messages, local)
+            batch = list(zip((msg.data for msg in messages), keyed, strict=True))
+        else:  # native: FDB derives the keys, the guard is not consulted
+            keyed = [msg.mars for msg in messages]
+            batch = [(b"".join(msg.data for msg in messages), None)]
+        first_index: dict[tuple[tuple[str, str], ...], int] = {}
+        for i, key in enumerate(keyed, 1):
+            first = first_index.setdefault(tuple(sorted(key.items())), i)
+            if first != i:
+                raise WorkflowError(
+                    f"{self.query}: {local} holds duplicate fields (messages {first} "
+                    f"and {i}); nothing was archived"
+                )
+
+        t_start = int(time.time())
+        self._archive(batch, local)
+        fresh = [f for f in self._fields() if self._field_time(f) >= t_start]
+        if len(fresh) < n:
+            raise WorkflowError(
+                f"{self.query}: {counts}; {n - len(fresh)} landed outside the query "
+                f"or are duplicates ({STAY_NOTE})"
+            )
+
+    def _identifiers(
+        self, messages: list[GribMessage], local: Path
+    ) -> list[dict[str, str]]:
+        """FDB identifiers of ``messages`` (numbered from 1), each pre-checked against
+        the query's value lists and passed to the guard (spec §7.7)."""
+        parsed = self.parsed
+        single = parsed.single_valued()
+        allowed = self._allowed_values()
+        info = self.provider.schema_info
+        identifiers = []
+        for index, message in enumerate(messages, 1):
+            values = {**message.mars, "param": message.param_id}
+            self._precheck(index, values, allowed, local)
+            if info is None:  # no schema knowledge: query keys and message keys
+                keys = self.provider.key_order.sorted({*parsed.keys(), *values})
+                optional = removed = frozenset()
+            else:
+                keys, optional, removed = info.keys, info.optional, info.removed
+            identifier: dict[str, str] = {}
+            for key in keys:
+                if key in removed:
+                    continue
+                if key in single:
+                    identifier[key] = single[key]
+                elif key in values:
+                    identifier[key] = values[key]
+                elif key not in optional:
+                    raise WorkflowError(
+                        f"{self.query}: cannot determine {key} for message {index} of "
+                        f"{local}; nothing was archived"
+                    )
+            try:
+                self.provider.guard.check(message, identifier, parsed)
+            except IdentifierMismatch as e:
+                raise WorkflowError(
+                    f"{self.query}: identifier check failed for {local}: {e}; nothing "
+                    "was archived"
+                ) from e
+            identifiers.append(identifier)
+        return identifiers
+
+    def _allowed_values(self) -> dict[str, list[int | str]]:
+        """Pre-check lists: the comparable items of every query key with several
+        literal values; keys with ``to``/``by`` or an incomparable item are skipped."""
+        parsed = self.parsed
+        allowed = {}
+        for key in parsed.keys():
+            items = parsed.items(key)
+            if len(items) < 2 or parsed.has_range(key):
+                continue
+            comparables = [comparable(key, item) for item in items]
+            if None not in comparables:
+                allowed[key] = comparables
+        return allowed
+
+    def _precheck(
+        self,
+        index: int,
+        values: Mapping[str, str],
+        allowed: Mapping[str, list[int | str]],
+        local: Path,
+    ) -> None:
+        """Message values of the keys in ``allowed`` must be one of the listed ones."""
+        for key, items in allowed.items():
+            if key not in values:
+                continue
+            given = comparable(key, values[key])
+            if given is None:
+                continue
+            if isinstance(given, int) and not all(isinstance(a, int) for a in items):
+                continue  # non-numeric alias of a numeric value
+            if given not in items:
+                raise WorkflowError(
+                    f"{self.query}: message {index} of {local} has {key}="
+                    f"{values[key]}, not one of {self.parsed.value(key)}; nothing was "
+                    "archived"
+                )
+
+    def _archive(
+        self, batch: list[tuple[bytes, dict[str, str] | None]], local: Path
+    ) -> None:
+        """Archive and flush once; a failure after an ``archive()`` succeeded says
+        that those fields stay in FDB (spec §7.7)."""
+        backend = self.provider.backend
+        archived = 0
+        try:
+            with self._mapping_errors(local):
+                for data, identifier in batch:
+                    backend.archive(data, identifier)
+                    archived += 1
+                backend.flush()
+        except Exception as e:
+            if not archived:
+                raise
+            with contextlib.suppress(Exception):
+                backend.flush()
+            raise WorkflowError(
+                f"{e} ({archived} of {len(batch)} archive calls succeeded before the "
+                f"failure; {STAY_NOTE})"
+            ) from e
 
     def remove(self) -> None:
-        raise NotImplementedError
+        """Never deletes: FDB has no per-field deletion (spec §7.8)."""
+        policy = self.provider.remove_policy
+        if policy == "ignore":
+            return
+        message = (
+            f"FDB cannot delete individual fields; existing fields for {self.query} "
+            "will be masked by the next archive. Use `fdb purge` to reclaim space."
+        )
+        if policy == "error":
+            raise WorkflowError(f"remove_policy=error: {message}")
+        if _first_time(_REMOVE_WARNED, self.query):
+            self.provider.logger.warning(message)
 
     # --- glob (plan step 7) --------------------------------------------------------
 

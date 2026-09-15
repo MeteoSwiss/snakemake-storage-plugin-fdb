@@ -1,6 +1,7 @@
-"""Provider and storage object (provider part: plan step 4, read path: plan step 5).
+"""Provider and storage object (provider: plan step 4, read path: step 5, write
+path: step 6).
 
-Write and glob tests are added in plan steps 6-7.
+Glob tests are added in plan step 7.
 """
 
 import asyncio
@@ -10,6 +11,8 @@ import logging
 import os
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -24,10 +27,12 @@ from snakemake_storage_plugin_fdb import (
     StorageProviderSettings,
 )
 from snakemake_storage_plugin_fdb.backend import Backend, Field, map_error
-from snakemake_storage_plugin_fdb.grib import split_messages
+from snakemake_storage_plugin_fdb.grib import split_messages, variant
+from snakemake_storage_plugin_fdb.guard import IdentifierMismatch, NoGuard
 from snakemake_storage_plugin_fdb.query import NAME_MAX
 
 REPO = Path(__file__).resolve().parents[1]
+RAW = REPO / ".raw"
 TEST_SCHEMA = Path(__file__).resolve().parent / "data" / "schema"
 BASE = "class=od,expver=0001,stream=oper,date=20240101,time=0000,type=fc,levtype=sfc"
 # class=ea,stream=oper variants of template.grib seeded by conftest.seeded_fdb
@@ -35,6 +40,7 @@ EA = (
     "class=ea,expver=0001,stream=oper,date=20200101,time=0000,domain=g,type=an,"
     "levtype=sfc"
 )
+EA2 = EA.replace("expver=0001", "expver=0002")  # not seeded; written by store tests
 
 _raw_present = pytest.mark.skipif(
     not (REPO / ".raw" / "template.grib").exists(), reason="no .raw/ ECMWF samples"
@@ -295,7 +301,7 @@ class TestStorageRead(TestStorageBase):
         return f"fdb://{EA},step=0/6/12,param=167"
 
     def get_query_not_existing(self, tmp_path) -> str:
-        return f"fdb://{EA.replace('expver=0001', 'expver=0002')},step=0/6/12,param=167"
+        return f"fdb://{EA2},step=0/6/12,param=167"
 
 
 @pytest.fixture
@@ -486,3 +492,258 @@ def test_canonical_spelling_silent(seeded_provider, caplog, setting, fields):
     obj = seeded_provider(canonical_spelling=setting).object(f"fdb://{EA},{fields}")
     assert obj.exists() is True
     assert not _warnings(caplog)
+
+
+# --- write path (plan step 6) ---------------------------------------------------------
+
+# expver=0002 variants of template.grib built per test (class=ea, stream=oper)
+STORE_QUERY = f"fdb://{EA2},step=0/6/12,param=167"
+# template.grib as is (stream=enda, number=0; NUL-padded GRIB1, spec §2.1)
+TEMPLATE_QUERY = (
+    "fdb://class=ea,expver=0001,stream=enda,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0,number=0,param=167"
+)
+
+
+def _grib(steps=(0, 6, 12), params=(167,), zero_values=True) -> bytes:
+    template = (RAW / "template.grib").read_bytes()
+    return b"".join(
+        variant(template, zero_values, stream="oper", expver="0002", step=s, paramId=p)
+        for s in steps
+        for p in params
+    )
+
+
+def _store(provider: StorageProvider, query: str, data: bytes) -> StorageObject:
+    obj = provider.object(query)
+    obj.local_path().parent.mkdir(parents=True, exist_ok=True)
+    obj.local_path().write_bytes(data)
+    obj.store_object()
+    return obj
+
+
+def _in_fdb(provider: StorageProvider, query: str) -> int:
+    return len(provider.backend.inspect(provider.object(query).parsed.to_request()))
+
+
+@needs_raw
+@pytest.mark.parametrize("archive_mode", ["identifier", "native"])
+def test_store_roundtrip(make_provider, archive_mode):
+    provider = make_provider(archive_mode=archive_mode)
+    assert isinstance(provider.guard, NoGuard)
+    data = _grib()
+    t_start = int(time.time())
+    obj = _store(provider, STORE_QUERY, data)
+    assert obj.exists() is True
+    assert obj.mtime() >= t_start
+    lengths = [m.length for m in split_messages(obj.local_path())]
+    assert obj.size() == sum(lengths) == len(data)  # unpadded messages
+    obj.local_path().unlink()
+    obj.retrieve_object()
+    keys = [(m.mars["step"], m.param_id) for m in split_messages(obj.local_path())]
+    assert keys == [("0", "167"), ("6", "167"), ("12", "167")]
+
+
+@needs_raw
+@pytest.mark.parametrize(
+    "schema, archive_mode, error",
+    [
+        (TEST_SCHEMA, "identifier", None),
+        (RAW / "schema", "identifier", None),  # number is not a schema key: dropped
+        (RAW / "schema", "native", "GRIB keys do not match the FDB schema"),
+    ],
+    ids=["test-schema-identifier", "raw-schema-identifier", "raw-schema-native"],
+)
+def test_store_template(make_provider, schema, archive_mode, error):
+    provider = make_provider(schema=schema, archive_mode=archive_mode)
+    data = (RAW / "template.grib").read_bytes()
+    if error:
+        with pytest.raises(WorkflowError, match=error):
+            _store(provider, TEMPLATE_QUERY, data)
+        assert _in_fdb(provider, TEMPLATE_QUERY) == 0
+        return
+    obj = _store(provider, TEMPLATE_QUERY, data)
+    assert obj.exists() is True
+    (message,) = split_messages(obj.local_path())
+    assert obj.size() == message.length < len(data)  # NUL padding not stored (§7.2)
+    (field,) = provider.backend.list({"class": "ea", "stream": "enda"})
+    assert ("number" in field.key) == (schema == TEST_SCHEMA)
+
+
+@needs_raw
+@pytest.mark.parametrize("archive_mode", ["identifier", "native"])
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "foreign", "duplicate", "trailing-garbage", "text"],
+)
+def test_store_strict_rejects(make_provider, archive_mode, case):
+    provider = make_provider(archive_mode=archive_mode)
+    native_foreign = case == "foreign" and archive_mode == "native"
+    data, error = {
+        "missing": (_grib((0, 6)), "has 2 fields, the query expands to 3; nothing"),
+        "foreign": (
+            _grib((0, 6, 18)),
+            "1 landed outside the query or are duplicates"
+            if native_foreign
+            else "message 3 of .* has step=18, not one of 0/6/12; nothing",
+        ),
+        "duplicate": (_grib((0, 6, 6)), r"duplicate fields \(messages 2 and 3\)"),
+        "trailing-garbage": (_grib() + b"GARBAGE", "trailing non-GRIB bytes"),
+        "text": (b"test", "is not GRIB"),
+    }[case]
+    with pytest.raises(WorkflowError, match=error) as e:
+        _store(provider, STORE_QUERY, data)
+    if native_foreign:  # archived before the post-check; the message says so
+        assert "stay in FDB" in str(e.value)
+        assert _in_fdb(provider, STORE_QUERY) == 2
+    else:
+        assert _in_fdb(provider, STORE_QUERY) == 0
+
+
+@needs_raw
+@pytest.mark.parametrize("archive_mode", ["identifier", "native"])
+def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
+    provider = make_provider(archive_mode=archive_mode, store_check="warn")
+    obj = _store(provider, STORE_QUERY, _grib((0, 6)))
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "has 2 fields, the query expands to 3 (store_check=warn)" in warnings[0]
+    assert obj.exists() is False
+    assert _in_fdb(provider, STORE_QUERY) == 2
+    # foreign fields still fail (steps without earlier fields: the post-check has
+    # one-second resolution, spec §7.7)
+    error = "outside the query" if archive_mode == "native" else "has step=0"
+    with pytest.raises(WorkflowError, match=error):
+        _store(provider, f"fdb://{EA2},step=12/18/24,param=167", _grib((0, 18)))
+
+
+@needs_raw
+def test_store_wildcard_query_rejected(make_provider):
+    with pytest.raises(WorkflowError, match="unresolved wildcards"):
+        _store(make_provider(), f"fdb://{EA2},step={{step}},param=167", _grib((0,)))
+
+
+@needs_raw
+def test_store_partial_archive_failure_says_fields_stay(make_provider, monkeypatch):
+    provider = make_provider()
+    real, calls = provider.backend.archive, []
+
+    def failing(data, identifier=None):
+        calls.append(identifier)
+        if len(calls) == 2:
+            raise RuntimeError("disk full")
+        real(data, identifier)
+
+    monkeypatch.setattr(provider.backend, "archive", failing)
+    with pytest.raises(
+        WorkflowError, match=r"disk full \(1 of 3 archive calls succeeded.*stay in FDB"
+    ):
+        _store(provider, STORE_QUERY, _grib())
+    assert len(calls) == 2  # not retried
+    assert _in_fdb(provider, STORE_QUERY) == 1  # flushed; masked by the next store
+
+
+class RecordingGuard:
+    """Records guard calls into a shared event list; optionally fails on one."""
+
+    def __init__(self, events: list, fail_on: int | None = None):
+        self.events, self.fail_on, self.calls = events, fail_on, 0
+
+    def check(self, message, identifier, query):
+        self.calls += 1
+        self.events.append(("check", message.mars["step"], dict(identifier)))
+        if self.calls == self.fail_on:
+            raise IdentifierMismatch(self.calls, "step", identifier["step"], "7")
+
+
+@needs_raw
+def test_store_guard_sees_every_message_before_archive(make_provider, monkeypatch):
+    provider = make_provider()
+    events: list = []
+    provider.guard = RecordingGuard(events)
+    real = provider.backend.archive
+
+    def archive(data, identifier=None):
+        events.append(("archive", identifier["step"], None))
+        real(data, identifier)
+
+    monkeypatch.setattr(provider.backend, "archive", archive)
+    obj = _store(provider, STORE_QUERY, _grib())
+    assert [(kind, step) for kind, step, _ in events] == [
+        ("check", "0"), ("check", "6"), ("check", "12"),
+        ("archive", "0"), ("archive", "6"), ("archive", "12"),
+    ]  # fmt: skip
+    identifier = events[1][2]
+    assert identifier == {
+        "class": "ea", "expver": "0002", "stream": "oper", "date": "20200101",
+        "time": "0000", "domain": "g", "type": "an", "levtype": "sfc",
+        "step": "6", "param": "167",
+    }  # fmt: skip
+    assert obj.exists() is True
+
+
+@needs_raw
+def test_store_guard_mismatch_leaves_fdb_unchanged(make_provider, monkeypatch):
+    provider = make_provider()
+    provider.guard = RecordingGuard([], fail_on=2)
+    archived = []
+    monkeypatch.setattr(provider.backend, "archive", lambda *a: archived.append(a))
+    with pytest.raises(
+        WorkflowError, match="identifier check failed.*message 2: identifier step=6"
+    ):
+        _store(provider, STORE_QUERY, _grib())
+    assert not archived
+    assert _in_fdb(provider, STORE_QUERY) == 0
+
+
+@needs_raw
+def test_store_masking_rerun(make_provider):
+    provider = make_provider()
+    query = f"fdb://{EA2},step=0,param=167"
+    first = _store(provider, query, _grib((0,)))
+    mtime = first.mtime()
+    time.sleep(max(0.0, mtime + 1.05 - time.time()))  # next index flush second
+    new = _grib((0,), zero_values=False)
+    second = _store(provider, query, new)
+    assert second.mtime() > mtime
+    second.local_path().unlink()
+    second.retrieve_object()
+    assert second.local_path().read_bytes() == new
+    request = second.parsed.to_request()
+    assert len(provider.backend.list(request)) == 1
+    assert len(provider.backend.list(request, include_masked=True)) == 2
+
+
+@needs_raw
+def test_store_threads(make_provider):
+    provider = make_provider()
+    steps = (0, 6, 12, 18)
+
+    def store(step: int) -> bool:
+        query = f"fdb://{EA2},step={step},param=167"
+        return _store(provider, query, _grib((step,))).exists()
+
+    with ThreadPoolExecutor(max_workers=len(steps)) as pool:
+        assert list(pool.map(store, steps)) == [True] * len(steps)
+    assert _in_fdb(provider, f"fdb://{EA2},step=0/6/12/18,param=167") == 4
+
+
+@pytest.mark.parametrize("policy", ["warn", "ignore", "error"])
+def test_remove_policy(make_provider, caplog, policy):
+    provider = make_provider(remove_policy=policy)
+    query = f"fdb://{EA2},step=0,param=167"
+    obj = provider.object(query)
+    if policy == "error":
+        with pytest.raises(WorkflowError, match="remove_policy=error: FDB cannot"):
+            obj.remove()
+        return
+    obj.remove()
+    provider.object(query).remove()  # warned once per query
+    warnings = _warnings(caplog)
+    if policy == "ignore":
+        assert not warnings
+        return
+    assert warnings == [
+        f"FDB cannot delete individual fields; existing fields for {query} will be "
+        "masked by the next archive. Use `fdb purge` to reclaim space."
+    ]

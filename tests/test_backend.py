@@ -537,3 +537,20 @@ def test_handle_per_thread():
         t.join()
     assert len(handles) == 2 and handles[0] is not handles[1]
     assert backend.handle() is backend.handle()
+
+
+@needs_raw
+def test_reads_see_archives_after_an_earlier_read(empty_fdb):
+    # a pyfdb handle that has read a database keeps its catalogue (spec §2.4)
+    backend = empty_fdb()
+    template = (RAW / "template.grib").read_bytes()
+    identifier = {**EA_OPER, "step": "0", "param": "167"}
+    old = variant(template, stream="oper", step=0, paramId=167)
+    new = variant(template, False, stream="oper", step=0, paramId=167)
+    backend.archive(old, identifier)
+    backend.flush()
+    assert [f.length for f in backend.inspect(identifier)] == [len(old)]
+    backend.archive(new, identifier)
+    backend.flush()
+    assert [f.length for f in backend.inspect(identifier)] == [len(new)]
+    assert len(backend.list(identifier, include_masked=True)) == 2
