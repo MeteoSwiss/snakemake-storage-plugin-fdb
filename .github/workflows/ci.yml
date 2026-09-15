@@ -23,8 +23,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      # setup-uv publishes no floating major tag since v8: pin the release.
-      - uses: astral-sh/setup-uv@v10.1.0
+      # The MeteoSwiss organisation allowlist permits setup-uv @v2 and @v6 only.
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           python-version: "3.12"
@@ -47,7 +47,7 @@ jobs:
         python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.1.0
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
@@ -64,7 +64,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.1.0
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           python-version: "3.12"
@@ -86,7 +86,7 @@ jobs:
       SMK_FDB_TEST_METKIT_HOME: "${{ github.workspace }}/.local/metkit-home"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.1.0
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           python-version: "3.12"

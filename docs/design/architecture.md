@@ -761,8 +761,10 @@ design round, provided requirements, architecture and code are updated together.
   non-blocking `pyfdb-latest` canary. `.local` is not cached, because `setup.sh` tracks
   the `varda-ext` tip. `ECCODES_VERSION_CHECK_OFF` and `ECKIT_EXCEPTION_IS_SILENT` are
   not set job-wide, so the site workflow sees only what the profile's `env` passes.
-  `setup-uv` is pinned to a release (`v10.1.0`), because it publishes no floating major
-  tag since v8. Jobs and triggers: [`contributing.md`](../contributing.md#ci).
+  `setup-uv` uses the floating `v6` tag, because the MeteoSwiss GitHub organisation's
+  action allowlist permits only `astral-sh/setup-uv@v2` and `@v6` (checked 2026-09-16;
+  GitHub-owned actions such as `actions/checkout@v7` are allowed). Jobs and triggers:
+  [`contributing.md`](../contributing.md#ci).
 - Status: accepted.
 - Consequences: a change on the `varda-ext` branch can break CI without a commit here
   (R-10).

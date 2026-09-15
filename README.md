@@ -49,7 +49,7 @@ either from a checkout or from the repository:
 
 ```bash
 uv pip install /path/to/snakemake-storage-plugin-fdb
-uv pip install "git+ssh://git@github.com/frazane/snakemake-storage-plugin-fdb.git"
+uv pip install "git+https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb.git"
 ```
 
 `snakemake --help` then lists the `--storage-fdb-*` options.
