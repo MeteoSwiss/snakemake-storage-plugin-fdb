@@ -1,0 +1,2 @@
+# Workflow configuration of the ECMWF-style example (read by the Snakefile).
+dates: ["20200101"]

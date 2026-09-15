@@ -299,7 +299,15 @@ the test suite).
   issue found; an issue draft exists but is not posted yet]: spawned jobs re-emit tagged
   values as `f"{tag}:{value}"` with a single colon (`spawn_jobs.py`
   `_get_storage_provider_setting_items.fmt_value`), which the job process parses as
-  the untagged value `tag:value`.
+  the untagged value `tag:value`. [verified end to end: plan step 9, snakemake 9.27.0,
+  local executor] `examples/ecmwf/Snakefile` with `storage ecm:` and
+  `--storage-fdb-config ecm::../../.fdb/config.yaml -c1` fails in the spawned `run:` job
+  with `FDB configuration error: 'ecm:../../.fdb/config.yaml' is neither an existing file
+  nor an inline YAML mapping`. The local executor spawns only `run:` rules (and shadow
+  jobs); `shell` rules run in the main process (`executors/local.py`
+  `run_single_job`), where tagged settings work. The e2e tests therefore pass settings
+  untagged to the `run:` example and use a `shell` rule with tagged settings for the
+  site workflow (§9.5).
 
 ### 2.8 MeteoSwiss conventions (`eccodes-cosmo-mars`, `evalml` `enable_fdb`)
 
@@ -442,6 +450,12 @@ re-verified on pyfdb 5.21.4.23 by the site test suite.]
   comparison. The plugin does nothing about it (site-specific, passes env through);
   documented in `docs/sites/meteoswiss.md`, set in the MeteoSwiss example profile and
   the `site-meteoswiss` CI job.
+  **Side effect on redirected stderr** [verified: plan step 9, eccodes 2.47.3 +
+  cosmo-mars + cosmo-resources 2.47.0.1]: decoding with these definitions opens
+  `/dev/stderr` as a file, which truncates a stderr redirected to a regular file
+  (earlier content becomes NUL bytes or is lost), also with
+  `ECCODES_VERSION_CHECK_OFF=1`. A decoding job in a workflow should send its stderr to
+  its own log, not to a shared log file.
 - **pyfdb 5.21.4.23 (the locked version) re-verified** [verified: plan step 3, scratch
   probes + `tests/test_backend.py`; same public/internal API as 5.21.4.21]:
   - every FDB/metkit failure reaches Python as a plain `RuntimeError`. metkit errors read
@@ -1292,8 +1306,9 @@ All MeteoSwiss material lives outside the package: `examples/meteoswiss/` (schem
 profile, Snakefile, `language.yaml` recipe, fetch script) and `docs/sites/meteoswiss.md`;
 tests under `tests/sites/meteoswiss/`. The suite uses the `.raw/meteoswiss/` OGD
 samples and the `examples/meteoswiss/` material directly, so the examples are
-guaranteed to work (the e2e test runs `examples/meteoswiss/Snakefile` with
-`examples/meteoswiss/profile/config.yaml`).
+guaranteed to work (from plan step 10 the e2e test runs `examples/meteoswiss/Snakefile`
+with `examples/meteoswiss/profile/config.yaml`; until then it writes the same Snakefile
+and profile itself, §9.5).
 
 - Samples: the three CH2 files listed in §2.9 (`.raw/meteoswiss/`, committed as
   empty-data copies; the ≈ 2.27 MB full-size originals are in the git-ignored
@@ -1450,13 +1465,44 @@ four `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
 
 ### 9.5 End-to-end
 
-`tests/test_workflow.py` runs `snakemake` as a subprocess on `examples/ecmwf/Snakefile` in a
-temporary copy of the workspace with `.fdb/` initialised by `scripts/init_dev_fdb.py`
-(config, schema, root, seeded from `.raw/` when present, otherwise skipped).
+`tests/test_workflow.py` runs `snakemake` as a subprocess (`python -m snakemake`, untagged
+`--storage-fdb-config ../../.fdb/config.yaml -c1`, default `native` archive mode) on a
+temporary copy of `examples/ecmwf/` next to a fresh `.fdb/` initialised by
+`scripts/init_dev_fdb.py --seed --variants` (skipped without `.raw/`). One module-scoped
+run sequence through the `run_logged` fixture (`tests/conftest.py`: provider variables of
+§4.1 dropped from the environment, one log file per stage under the temporary
+directory; shared with the site e2e): init; the example (exit 0, `Storing in
+storage: <query>`, the `done` rule's output names the local copy
+`.snakemake/storage/fdb/class=ea/expver=0002/.../step=0+6+12/param=167.grib` and lists
+steps 0/6/12 with `expver=0002`, the copy is gone after the run, the 3 fields are in
+FDB); a second run (`Nothing to be done`); a small `glob_wildcards` workflow over
+`step={step}` (steps 0/6/12, local copies kept with `--keep-storage-local-copies`);
+`--delete-all-output` (the §7.8 remove warning is logged, the local output is deleted,
+the fields stay). The example's two rules are `run:` rules, so the local executor spawns
+them (§3.3): untagged settings reach spawned jobs.
+
+Site e2e (`tests/sites/meteoswiss/test_workflow.py`, required): `scripts/init_dev_fdb.py
+--root .fdb-mch --schema <varda schema> --seed <samples dir>` with
+`ECCODES_DEFINITION_PATH`/`METKIT_HOME`/`ECCODES_VERSION_CHECK_OFF=1` (the documented
+MeteoSwiss command, 4 messages), then `snakemake --profile profile -c1 t2m/<date><time>.txt`
+without those variables on a Snakefile written by the test: tagged `storage mch:`,
+profile values `mch::` for `config`, `eccodes_definitions`, `metkit_home`, `env`, and one
+`shell` rule (`date`/`time` wildcards; the target comes from the sample name) retrieving
+the `type=cf` T_2M field (byte-identical copy; eccodes in the shell job, a `keys.py`
+next to the Snakefile, decodes `T_2M` through the exported definitions; local copy under
+`.snakemake/storage/mch/` removed); a second run is a no-op. A `shell` rule runs in the
+main process under the local executor; a `run:` rule would be spawned and lose the
+tagged settings (upstream issue, §2.7). The test is self-contained until
+`examples/meteoswiss/` exists (plan step 10).
 
 `scripts/init_dev_fdb.py` is generic: `--root DIR` (default `.fdb`), `--schema PATH`
-(default `tests/data/schema`), `--seed [DIR]` (archive every GRIB file in DIR, default
-`.raw`); no site flags. The MeteoSwiss dev FDB is a documented command in
+(default `tests/data/schema`), `--seed [DIR]` (natively archive every GRIB file directly
+in DIR, default `.raw`), `--variants [FILE]` (archive zeroed `stream=oper` variants of
+the message in FILE, default `.raw/template.grib`, for steps 0/6/12 × params 167/165,
+the inputs of `examples/ecmwf/`); defaults relative to the repository; the written
+`config.yaml` uses absolute paths; no site flags. Decided 2026-09-15 (reversible): the
+variants are an explicit flag, not a side effect of `--seed` keyed off the file name
+`template.grib`. The MeteoSwiss dev FDB is a documented command in
 `examples/meteoswiss/README.md`, run with the site env (definitions, `METKIT_HOME`,
 `ECCODES_VERSION_CHECK_OFF=1`):
 `uv run python scripts/init_dev_fdb.py --root .fdb-mch --schema examples/meteoswiss/realtime-varda.schema --seed .raw/meteoswiss`.
@@ -1582,3 +1628,7 @@ eccodes-version consideration and mentions no site in the package.
     (§7.7 decision).
 18. Identifier mode cannot relabel data whose GRIB contradicts a single-valued query
     key; fix the GRIB first (e.g. `grib_set`).
+19. Tagged settings (`TAG::VALUE`) do not reach spawned job processes (upstream
+    Snakemake issue, §2.7): `run:` rules under the local executor, and every job under
+    cluster/remote executors, see the untagged value `TAG:VALUE`. Until it is fixed,
+    use untagged settings for such workflows, or `shell` rules with the local executor.

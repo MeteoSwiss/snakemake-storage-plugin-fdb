@@ -1,0 +1,59 @@
+"""ECMWF-style example: copy 2 m temperature to a new experiment version in FDB.
+
+The FDB is chosen on the command line (see README.md):
+    snakemake --storage-fdb-config ../../.fdb/config.yaml -c1
+"""
+
+configfile: "config.yaml"
+
+
+storage:
+    provider="fdb"
+
+
+DATES = config["dates"]
+INPUT = (
+    "fdb://class=ea,expver=0001,stream=oper,date={date},time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+OUTPUT = (
+    "fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule all:
+    input:
+        expand("done/{date}.txt", date=DATES),
+
+
+rule shift_expver:
+    input:
+        storage.fdb(INPUT),
+    output:
+        storage.fdb(OUTPUT),
+    run:
+        import eccodes
+
+        with open(input[0], "rb") as fi, open(output[0], "wb") as fo:
+            while (h := eccodes.codes_grib_new_from_file(fi)) is not None:
+                eccodes.codes_set(h, "expver", "0002")
+                eccodes.codes_write(h, fo)
+                eccodes.codes_release(h)
+
+
+rule done:
+    input:
+        storage.fdb(OUTPUT),
+    output:
+        "done/{date}.txt",
+    run:
+        # grib_ls is not shipped with the eccodes wheels; list the keys with eccodes
+        import eccodes
+
+        keys = ("expver", "stream", "dataDate", "step", "paramId")
+        with open(input[0], "rb") as fi, open(output[0], "w") as fo:
+            print(input[0], file=fo)
+            while (h := eccodes.codes_grib_new_from_file(fi)) is not None:
+                print(*(eccodes.codes_get_string(h, k) for k in keys), file=fo)
+                eccodes.codes_release(h)

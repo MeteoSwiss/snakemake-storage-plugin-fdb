@@ -15,7 +15,6 @@ from pathlib import Path
 import pytest
 
 REQUIRE = os.environ.get("SMK_FDB_TEST_REQUIRE_SITES") == "1"
-SITE_ENV = ("ECCODES_DEFINITION_PATH", "METKIT_HOME")
 MEMFS = "/MEMFS/"  # in-memory definitions bundled with the eccodes wheels
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_SCHEMA = REPO / "examples" / "meteoswiss" / "realtime-varda.schema"
@@ -29,19 +28,17 @@ def _missing(reason: str):
 
 
 @pytest.fixture(scope="session")
-def run_site() -> Callable[..., dict]:
+def run_site(subprocess_env) -> Callable[..., dict]:
     """Runner: ``run(script, job, tmp, env=None)`` executes ``script`` in a subprocess
     with the JSON ``job`` (plus ``local_prefix`` under ``tmp``) as ``sys.argv[1]`` and
-    returns the JSON of its last stdout line. The site variables of this process are
-    dropped; ``env`` adds variables for the subprocess."""
+    returns the JSON of its last stdout line. The provider variables of this process
+    are dropped; ``env`` adds variables for the subprocess."""
 
     def run(script: str, job: dict, tmp: Path, env: dict[str, str] | None = None):
-        proc_env = {k: v for k, v in os.environ.items() if k not in SITE_ENV}
-        proc_env.update(env or {})
         job = {"local_prefix": str(tmp / "local"), **job}
         proc = subprocess.run(
             [sys.executable, "-c", script, json.dumps(job)],
-            env=proc_env,
+            env=subprocess_env(env),
             capture_output=True,
             text=True,
             timeout=300,
@@ -59,18 +56,30 @@ def mch_fdb_config(fdb_config_file, mch_schema) -> Callable[[Path], Path]:
     return lambda root: fdb_config_file(root, mch_schema)
 
 
+def _stamp(path: Path) -> tuple[str, str]:
+    """``(date, time)`` from a sample file name (``..._<YYYYMMDD><HHMM>_step6_...``),
+    which ``test_conventions`` checks against the MARS keys."""
+    stamp = re.search(r"_(\d{8})(\d{4})_step6_", path.name)
+    assert stamp, path.name
+    return stamp.group(1), stamp.group(2)
+
+
+@pytest.fixture(scope="session")
+def mch_stamp() -> Callable[[Path], tuple[str, str]]:
+    """``mch_stamp(path)``: the ``(date, time)`` of a sample file."""
+    return _stamp
+
+
 @pytest.fixture(scope="session")
 def mch_query_base() -> Callable[[Path], str]:
     """Constant query keys of the step-6 fields in a sample file
-    (``class=od,...,date=<d>,time=<t>,levtype=sfc,step=6``); date and time come from
-    the file name, which ``test_conventions`` checks against the MARS keys."""
+    (``class=od,...,date=<d>,time=<t>,levtype=sfc,step=6``)."""
 
     def base(path: Path) -> str:
-        stamp = re.search(r"_(\d{8})(\d{4})_step6_", path.name)
-        assert stamp, path.name
+        date, time = _stamp(path)
         return (
             "class=od,expver=0001,stream=enfo,model=icon-ch2-eps,"
-            f"date={stamp.group(1)},time={stamp.group(2)},levtype=sfc,step=6"
+            f"date={date},time={time},levtype=sfc,step=6"
         )
 
     return base

@@ -9,11 +9,12 @@ import os
 os.environ.setdefault("ECKIT_EXCEPTION_IS_SILENT", "1")
 
 import logging  # noqa: E402
+import subprocess  # noqa: E402
 import time  # noqa: E402
 from collections.abc import Callable  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Any  # noqa: E402
+from typing import Any, ClassVar  # noqa: E402
 
 import pytest  # noqa: E402
 import yaml  # noqa: E402
@@ -94,6 +95,67 @@ PROVIDER_ENV_VARS = (
     "FDB_HOME",
     "FDB_SCHEMA_FILE",
 )
+
+
+def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """This process's environment without the provider variables (the plugin and the
+    scripts default ``ECKIT_EXCEPTION_IS_SILENT`` themselves), plus ``env``."""
+    proc_env = {k: v for k, v in os.environ.items() if k not in PROVIDER_ENV_VARS}
+    proc_env.update(env or {})
+    return proc_env
+
+
+@pytest.fixture(scope="session")
+def subprocess_env() -> Callable[..., dict[str, str]]:
+    """``subprocess_env(env=None)``: a clean environment for a subprocess."""
+    return _subprocess_env
+
+
+@dataclass
+class Run:
+    """A finished, logged subprocess (``run_logged``)."""
+
+    NOTHING_TO_BE_DONE: ClassVar[str] = (
+        "Nothing to be done (all requested files are present and up to date)."
+    )
+    name: str
+    returncode: int
+    log: str
+
+    def ok(self) -> str:
+        """Assert exit 0; the log."""
+        assert self.returncode == 0, (
+            f"{self.name} exited {self.returncode}:\n{self.log}"
+        )
+        return self.log
+
+
+@pytest.fixture(scope="session")
+def run_logged() -> Callable[[Path], Callable[..., Run]]:
+    """Factory: ``run_logged(logs)`` gives ``run(name, cmd, cwd, env=None) -> Run``,
+    which runs ``cmd`` in ``cwd`` with the clean ``subprocess_env`` plus ``env`` and
+    both output streams in ``logs/<name>.log`` (kept for inspection, also on timeout).
+    """
+
+    def factory(logs: Path) -> Callable[..., Run]:
+        logs.mkdir(parents=True, exist_ok=True)
+
+        def run(name: str, cmd: list, cwd: Path, env: dict[str, str] | None = None):
+            log = logs / f"{name}.log"
+            with log.open("w") as f:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    env=_subprocess_env(env),
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    timeout=600,
+                )
+            return Run(name, proc.returncode, log.read_text())
+
+        return run
+
+    return factory
 
 
 @pytest.fixture

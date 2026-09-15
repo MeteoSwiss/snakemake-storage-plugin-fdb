@@ -51,7 +51,7 @@ src/snakemake_storage_plugin_fdb/
     grib.py               eccodes helpers (split messages, MARS keys, paramId)
     guard.py              IdentifierGuard protocol, NoGuard, StrictGuard stub (reserved)
 tests/
-    conftest.py           temp FDB fixtures, derived GRIB variants, env setup, skip markers
+    conftest.py           temp FDB fixtures, derived GRIB variants, env setup, skip markers, logged subprocess runner (e2e)
     test_query.py         unit tests (no FDB)
     test_key_order.py     schema-derived / setting / generic key order (no FDB)
     test_settings.py      settings validation (no FDB)
@@ -70,7 +70,7 @@ examples/meteoswiss/                                  everything MeteoSwiss, out
     setup.sh (clone eccodes-cosmo-mars, pip install eccodes-cosmo-resources-python into .local/),
     make_metkit_home.py (language.yaml recipe)
 docs/sites/meteoswiss.md
-scripts/init_dev_fdb.py            creates and seeds a dev FDB (generic: --root, --schema, --seed; no site flags)
+scripts/init_dev_fdb.py            creates and seeds a dev FDB (generic: --root, --schema, --seed, --variants; no site flags)
 scripts/fetch_ecmwf_samples.py     optional, not part of any step: re-downloads the committed .raw/ ECMWF files
                                    from ecmwf/fdb at a pinned commit (provenance in spec §2.1)
 .github/workflows/ci.yml, release-please.yml, conventional-prs.yml
@@ -580,16 +580,31 @@ Commands: `uv run pytest tests/test_plugin.py -q -rs -k "TestStorage or conforma
 ## Step 9 — Dev FDB and example workflow end-to-end
 
 Files: `scripts/init_dev_fdb.py`, `examples/ecmwf/Snakefile`, `examples/ecmwf/config.yaml`,
-`examples/ecmwf/README.md`, `tests/test_workflow.py` (`needs_raw`).
+`examples/ecmwf/README.md`, `tests/test_workflow.py` (skipped without `.raw/`),
+`tests/conftest.py` (`subprocess_env` and `run_logged` fixtures: clean environment and
+logged subprocess runner shared by both e2e tests), `tests/sites/meteoswiss/conftest.py`
+(`run_site` uses `subprocess_env`; `mch_stamp` fixture), `tests/sites/meteoswiss/test_workflow.py`,
+`pyproject.toml` (`addopts = ["--import-mode=importlib"]`, so both suites may have a
+`test_workflow.py` without `__init__.py` files). [done: <pending commit>]
 
 Decided 2026-09-15 (reversible): the generic example lives in `examples/ecmwf/`, next to
 `examples/meteoswiss/` (one examples directory instead of a separate top-level one).
 
-`scripts/init_dev_fdb.py [--root DIR] [--schema PATH] [--seed [DIR]]`: writes
-`<root>/schema` (copy of `--schema`, default `tests/data/schema`), `<root>/root/`,
-`<root>/config.yaml` (default root `.fdb`); `--seed` archives every GRIB file in DIR
-(default `.raw`) plus, for the default ECMWF data, the derived variants, when DIR exists.
-No site flags.
+`scripts/init_dev_fdb.py [--root DIR] [--schema PATH] [--seed [DIR]] [--variants [FILE]]`:
+writes `<root>/schema` (copy of `--schema`, default `tests/data/schema`), `<root>/root/`,
+`<root>/config.yaml` (default root `.fdb`; absolute paths, so the config works from any
+working directory); defaults are relative to the repository, explicit arguments to the
+working directory. `--seed` natively archives every GRIB file (content starting with
+`GRIB`) directly in DIR (default `.raw`; subdirectories such as `.raw/meteoswiss/` are
+not entered); a missing DIR is reported on stderr and not seeded (exit 0). `--variants`
+archives the zeroed `stream=oper` variants of the message in FILE (default
+`.raw/template.grib`; a missing FILE is an argument error) for steps 0/6/12 × params
+167/165, the fields `examples/ecmwf/` reads. No site flags.
+
+Decided 2026-09-15 (reversible): the variants are an explicit `--variants [FILE]` flag,
+not a side effect of `--seed` on a directory holding a file named `template.grib` (a
+generic script should not key its behaviour off a file name). The example's one-liner is
+`init_dev_fdb.py --seed --variants`.
 
 Decided 2026-09-15 (reversible): `init_dev_fdb.py` stays generic; the former MeteoSwiss
 site flag is replaced by `--root`/`--schema`/`--seed [DIR]`. The MeteoSwiss dev FDB is a
@@ -598,22 +613,27 @@ documented command in `examples/meteoswiss/README.md`, run with the site env
 `uv run python scripts/init_dev_fdb.py --root .fdb-mch --schema examples/meteoswiss/realtime-varda.schema --seed .raw/meteoswiss`.
 Nothing site-specific goes in `scripts/` (documentation rule, not grep-enforced).
 
-`examples/ecmwf/Snakefile` (ECMWF flavour):
+`examples/ecmwf/Snakefile` (ECMWF flavour; `examples/ecmwf/config.yaml` holds
+`dates: ["20200101"]`):
 
 ```python
+configfile: "config.yaml"
+
 storage:
     provider="fdb"
 
-DATES = ["20200101"]
+DATES = config["dates"]
+INPUT = ("fdb://class=ea,expver=0001,stream=oper,date={date},time=0000,domain=g,"
+         "type=an,levtype=sfc,step=0/6/12,param=167")
+OUTPUT = ("fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,"
+          "type=an,levtype=sfc,step=0/6/12,param=167")
 
 rule all:
     input: expand("done/{date}.txt", date=DATES)
 
 rule shift_expver:
-    input:
-        storage.fdb("fdb://class=ea,expver=0001,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
-    output:
-        storage.fdb("fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
+    input: storage.fdb(INPUT)
+    output: storage.fdb(OUTPUT)
     run:
         import eccodes
         with open(input[0], "rb") as fi, open(output[0], "wb") as fo:
@@ -621,10 +641,16 @@ rule shift_expver:
                 eccodes.codes_set(h, "expver", "0002"); eccodes.codes_write(h, fo); eccodes.codes_release(h)
 
 rule done:
-    input: storage.fdb("fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
+    input: storage.fdb(OUTPUT)
     output: "done/{date}.txt"
-    shell: "grib_ls {input} > {output}"
+    run:
+        # grib_ls is not shipped with the eccodes wheels: write the local file name,
+        # then expver/stream/dataDate/step/paramId of each message, with eccodes
+        ...
 ```
+
+Both rules are `run:` rules, which the local executor spawns (spec §3.3), so the example
+takes the FDB as an untagged setting.
 
 `examples/meteoswiss/Snakefile` (site example, documentation + site-suite e2e when
 data is present; all values user-supplied via `examples/meteoswiss/profile/config.yaml`):
@@ -632,6 +658,10 @@ data is present; all values user-supplied via `examples/meteoswiss/profile/confi
 ```python
 storage mch:
     provider="fdb"      # config, eccodes_definitions, metkit_home come from the profile (tag "mch")
+
+wildcard_constraints:   # t2m/{date}{time}.txt is ambiguous without them
+    date=r"\d{8}",
+    time=r"\d{4}",
 
 rule t2m_control:
     input:
@@ -649,29 +679,57 @@ storage-fdb-metkit-home: ["mch::.local/metkit-home"]
 storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]   # silence the COSMO definitions' version banner (spec §2.9)
 ```
 
-Run: `uv run python scripts/init_dev_fdb.py --seed && cd examples/ecmwf && uv run snakemake
+Step 10 notes from step 9: `grib_ls` is not installed by the eccodes wheels (use eccodes
+from Python in a `shell` command, or document the CLI as a prerequisite); keep
+`t2m_control` a `shell` rule, since a `run:` rule is spawned by the local executor and
+loses the tagged profile settings (spec §2.7, verified end to end in step 9).
+
+Run: `uv run python scripts/init_dev_fdb.py --seed --variants && cd examples/ecmwf && uv run snakemake
 --storage-fdb-config ../../.fdb/config.yaml -c1`.
 
-`tests/test_workflow.py` copies `examples/ecmwf/` and a fresh `.fdb/` into `tmp_path`, runs the
-command via `subprocess` (default `native` archive mode; neither example sets a mode),
-asserts: exit 0; local file
-`.snakemake/storage/fdb/class=ea/expver=0002/.../step=0+6+12/param=167.grib` created
-then removed; the field is in FDB; second run "Nothing to be done"; `--delete-all-output`
-logs the remove warning and leaves the field; a tiny `glob_wildcards` Snakefile returns
-steps 0/6/12.
+`tests/test_workflow.py` creates a fresh `.fdb/` with `init_dev_fdb.py --root <tmp>/.fdb
+--seed --variants` next to a copy of `examples/ecmwf/` in a temporary directory, runs the
+command via `subprocess` (`python -m snakemake`; default `native` archive mode; neither
+example sets a mode; the `run_logged` fixture of `tests/conftest.py` drops the provider
+variables of spec §4.1 from the test process's environment and writes each stage's
+output to `<tmp>/logs/<stage>.log`), once per module, and asserts: init seeds 10 messages
+(`test_init_dev_fdb_seeds_raw_and_variants`); exit 0, `Storing in storage: <query>`, the
+`done` output names the local file
+`.snakemake/storage/fdb/class=ea/expver=0002/.../step=0+6+12/param=167.grib` and lists
+steps 0/6/12 with `expver=0002`, the file is gone after the run
+(`test_workflow_run_stores_and_cleans_local_copies`); the 3 fields are in FDB
+(`test_workflow_output_fields_in_fdb`); second run "Nothing to be done"
+(`test_workflow_second_run_nothing_to_be_done`); a tiny `glob_wildcards` Snakefile
+returns steps 0/6/12 and, with `--keep-storage-local-copies`, keeps the 3 retrieved
+files (`test_workflow_glob_wildcards_steps`); `--delete-all-output` logs the remove
+warning, deletes `done/`, and leaves the fields
+(`test_workflow_delete_all_output_leaves_fields`).
 
-**Site suite (required):** `tests/sites/meteoswiss/test_workflow.py` initialises
-`.fdb-mch/` with `examples/meteoswiss/realtime-varda.schema` (same result as the
-`init_dev_fdb.py` command in `examples/meteoswiss/README.md`), archives the OGD samples,
-copies `examples/meteoswiss/` into `tmp_path`, rewrites `date`/`time` in the Snakefile
-from the samples, and runs
-`snakemake --profile examples/meteoswiss/profile -c1` with `ECCODES_DEFINITION_PATH`
-and `METKIT_HOME` exported from the `SMK_FDB_TEST_*` variables: the `t2m_control` rule
-retrieves the field, the output is produced, a second run is a no-op. This guarantees
-that `examples/meteoswiss/` (profile, schema, Snakefile, language recipe) works.
+**Site suite (required):** `tests/sites/meteoswiss/test_workflow.py` runs
+`init_dev_fdb.py --root .fdb-mch --schema <SMK_FDB_TEST_MCH_SCHEMA> --seed <SMK_FDB_TEST_MCH_SAMPLES>`
+with `ECCODES_DEFINITION_PATH`/`METKIT_HOME` from the `SMK_FDB_TEST_*` variables and
+`ECCODES_VERSION_CHECK_OFF=1` (the documented MeteoSwiss command; 4 messages,
+`test_workflow_init_dev_fdb_site_command`). Until step 10 ships `examples/meteoswiss/`,
+the test writes the Snakefile above (no `rule all`; `date`/`time` stay wildcards and the
+target `t2m/<date><time>.txt` is built from the sample name, `mch_stamp` fixture; the
+shell command copies the input and lists `shortName`/`step` with a `keys.py` written
+next to the Snakefile instead of `grib_ls`, stderr to the rule log because the COSMO
+definitions truncate a redirected stderr, spec §2.9) and a `profile/config.yaml` with
+the `mch::` values of the profile above (definitions and metkit home from the env vars)
+into a temporary directory, and runs `snakemake --profile profile -c1 t2m/<date><time>.txt`
+**without** `ECCODES_DEFINITION_PATH`/`METKIT_HOME`, so the site reaches FDB only through the tagged
+settings: exit 0, the log shows the normalised query retrieved, the output is
+byte-identical to the sample, the shell job decodes `T_2M 6`, the local copy under
+`.snakemake/storage/mch/` is removed (`test_workflow_retrieves_control_field`); a second
+run is a no-op (`test_workflow_second_run_is_a_no_op`). Step 10 switches the test to
+copy `examples/meteoswiss/` (Snakefile, profile, schema), so that the shipped example
+is what runs.
 
 Acceptance: `uv run pytest tests/test_workflow.py -q` green with data; manual run
 works; `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k workflow -q` green.
+
+Commands: `uv run pytest tests/test_workflow.py -q`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k workflow -q`.
 
 ## Step 10 — MeteoSwiss site material (outside the package) and required site suite
 
