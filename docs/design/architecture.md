@@ -824,7 +824,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-12 | eckit `SeriousBug` backtraces are printed regardless of environment settings (L-7). | Accepted. |
 | R-13 | `fdb_time()` uses `ctypes.CDLL(None)`, Linux/glibc-specific. | Fallback to `int(time.time())`. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
-| TD-2 | No `docs/intro.md`/`docs/further.md` for the Snakemake plugin catalogue; no ECMWF sample fetch script. | D-010, D-008. |
+| TD-2 | No ECMWF sample fetch script. | D-008. |
 
 ## 12. Glossary
 

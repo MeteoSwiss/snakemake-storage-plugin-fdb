@@ -122,7 +122,8 @@ change. When code and documents disagree, resolve it, don't leave it.
 
 - Refer to requirement IDs (`FR-STORE-004`) or document sections
   (`architecture.md §8.3`) in comments and docstrings.
-- New requirements get the next free ID; removed IDs are not reused.
+- IDs (requirements, ADRs, limitations, deferred items) never change: don't renumber,
+  don't reuse; gaps are fine. New entries get the next free number.
 - New decisions get an ADR entry with context, decision, status, consequences and date;
   mark reversible ones.
 - Label facts about external projects `[verified: how]` or `[assumed]`.
@@ -139,7 +140,6 @@ heading exists.
 
 - Commits on `main` use [Conventional Commits](https://www.conventionalcommits.org/)
   (`feat: ...`, `fix: ...`, `docs: ...`, `ci: ...`); the body may have several lines.
-- No `Co-authored-by` trailers.
 
 ## Site neutrality
 

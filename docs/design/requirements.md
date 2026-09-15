@@ -75,8 +75,10 @@ diagram.
 
 ### 1.6 Conventions
 
-- Requirement IDs (`FR-<AREA>-NNN`, `NFR-<AREA>-NNN`) are stable. Removed IDs are not
-  reused; new requirements get the next free number.
+- IDs (`FR-<AREA>-NNN`, `NFR-<AREA>-NNN`, `L-*`, `D-*`, and `ADR-*`/`R-*`/`TD-*` in the
+  architecture) never change: they are not renumbered or reused, and gaps are fine. New
+  entries get the next free number (decided 2026-09-15: least effort for developers,
+  references never go stale).
 - Evidence labels: **[verified: how]** means checked by reading the named source or by
   running it; **[assumed]** means not verified. Verified external facts are collected in
   [`architecture.md`](architecture.md) §13.
@@ -1168,6 +1170,8 @@ MeteoSwiss site suite run in CI and are required. Details are in
 - Relabelling GRIB whose metadata contradicts the query.
 - Site-specific mechanisms inside the package (definitions aliases, bundled schemas or
   language patches, site extras).
+- Snakemake plugin catalogue pages (`docs/intro.md`, `docs/further.md`): not included
+  (decided 2026-09-15); the plugin's documentation lives in `README.md` and `docs/`.
 
 ### 6.2 Deferred work
 
@@ -1182,4 +1186,4 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-007 | Test remote FDB backends | See NFR-COMPAT-003. |
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
 | D-009 | qubed | Not useful for v1; revisit for compressed summaries of large FDB listings (architecture.md §13.12). |
-| D-010 | Snakemake plugin catalogue pages | `docs/intro.md` and `docs/further.md` when the plugin is published. |
+| D-010 | Withdrawn | Snakemake plugin catalogue pages will not be included (decided 2026-09-15); see §6.1. |
