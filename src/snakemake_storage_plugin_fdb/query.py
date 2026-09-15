@@ -212,6 +212,25 @@ class ParsedQuery:
         """Request for ``inspect``/``retrieve``; lists stay raw ``a/b`` strings."""
         return dict(self.pairs)
 
+    def _components(self) -> list[tuple[str, str, str]]:
+        """``(key, value, unhashed path component)`` per pair."""
+        last = len(self.pairs) - 1
+        return [
+            (k, v, f"{k}={_replace_literal(v, '/', '+')}{SUFFIX if i == last else ''}")
+            for i, (k, v) in enumerate(self.pairs)
+        ]
+
+    def oversized_components(self) -> list[tuple[str, int]]:
+        """``(key, bytes)`` of path components longer than ``NAME_MAX`` bytes.
+
+        These are the components ``local_suffix`` hashes (or rejects, with a wildcard).
+        """
+        return [
+            (k, len(comp.encode()))
+            for k, _, comp in self._components()
+            if len(comp.encode()) > NAME_MAX
+        ]
+
     def local_suffix(self) -> str:
         """``key=value/.../key=value.grib`` with ``/`` in values replaced by ``+``.
 
@@ -219,10 +238,8 @@ class ParsedQuery:
         ``key=~<sha256(value)[:24]>``; a long component with a wildcard is an error.
         """
         parts = []
-        last = len(self.pairs) - 1
-        for i, (k, v) in enumerate(self.pairs):
-            ext = SUFFIX if i == last else ""
-            comp = f"{k}={_replace_literal(v, '/', '+')}{ext}"
+        for k, v, comp in self._components():
+            ext = SUFFIX if k == self.pairs[-1][0] else ""  # keys are unique
             if len(comp.encode()) > NAME_MAX:
                 if WILDCARD_REGEX.search(v):
                     raise QueryError(

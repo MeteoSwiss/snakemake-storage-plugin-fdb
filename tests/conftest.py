@@ -8,6 +8,7 @@ import os
 
 os.environ.setdefault("ECKIT_EXCEPTION_IS_SILENT", "1")
 
+import logging  # noqa: E402
 import time  # noqa: E402
 from collections.abc import Callable  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
@@ -15,6 +16,7 @@ from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
 import pytest  # noqa: E402
+import yaml  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 RAW = REPO / ".raw"
@@ -66,6 +68,56 @@ def seeded_fdb(tmp_path_factory) -> SeededFDB:
     start = time.time()
     backend.flush()
     return SeededFDB(config, backend, start, time.time())
+
+
+# Variables the provider reads or exports (spec §4.1); restored after each test.
+PROVIDER_ENV_VARS = (
+    "ECCODES_DEFINITION_PATH",
+    "METKIT_HOME",
+    "ECKIT_EXCEPTION_IS_SILENT",
+    "FDB_CONFIG",
+    "FDB5_CONFIG",
+    "FDB_CONFIG_FILE",
+    "FDB5_CONFIG_FILE",
+    "FDB_HOME",
+    "FDB_SCHEMA_FILE",
+)
+
+
+@pytest.fixture
+def clean_env(monkeypatch) -> pytest.MonkeyPatch:
+    """Unset the provider's environment variables; monkeypatch restores them.
+
+    Also resets the plugin's record of applied settings, so tests do not see each
+    other's "different settings in one process" warnings.
+    """
+    import snakemake_storage_plugin_fdb as plugin
+
+    for name in PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(plugin, "_APPLIED", {})
+    return monkeypatch
+
+
+@pytest.fixture
+def make_provider(tmp_path, clean_env) -> Callable[..., Any]:
+    """Factory for a ``StorageProvider`` in a clean environment.
+
+    Without an explicit ``config`` it gets an inline YAML config for a temp FDB under
+    ``schema``; pass ``config=None`` to use FDB's environment fallback.
+    """
+    from snakemake_storage_plugin_fdb import StorageProvider, StorageProviderSettings
+
+    def make(schema: Path = TEST_SCHEMA, **settings: Any) -> StorageProvider:
+        if "config" not in settings:
+            settings["config"] = yaml.safe_dump(fdb_config(tmp_path / "fdb", schema))
+        return StorageProvider(
+            local_prefix=tmp_path / "local",
+            logger=logging.getLogger("fdb-test"),
+            settings=StorageProviderSettings(**settings),
+        )
+
+    return make
 
 
 @pytest.fixture
