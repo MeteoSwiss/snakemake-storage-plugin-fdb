@@ -85,7 +85,7 @@ Files: `pyproject.toml`, `README.md`, `LICENSE` (BSD-3-Clause), `src/snakemake_s
 `*.part`, `.local/`, `.fdb/`, `.venv/`, `__pycache__/`, `dist/`, the coverage output
 `.coverage`, `htmlcov/` (step 8), and the personal work-tracking files
 `CLAUDE.local.md`, `WORK.md`; not `.raw/`, which is committed),
-`uv.lock` (committed), `[tool.ruff]`. [done: 9ec2639]
+`uv.lock` (committed), `[tool.ruff]`. [done: 09c3c53]
 
 ```toml
 [project]
@@ -137,7 +137,7 @@ Commands: `uv sync`, `uv run ruff check . && uv run ruff format --check .`,
 
 Files: `src/snakemake_storage_plugin_fdb/query.py`, `tests/test_query.py`,
 `tests/test_key_order.py`, `tests/data/ecmwf-fdb-tests.schema` (ecmwf/fdb test schema
-at `63672ea`, key-order fixture). [done: a87afaf]
+at `63672ea`, key-order fixture). [done: e129782]
 
 ```python
 class QueryError(ValueError)                              # every parse/order/local-path error
@@ -192,7 +192,7 @@ Commands: `uv run pytest tests/test_query.py tests/test_key_order.py -q`.
 Files: `src/snakemake_storage_plugin_fdb/grib.py`, `tests/test_grib.py` (marked
 `needs_raw` where `.raw` files are used; the synthetic parts run always),
 `tests/sites/meteoswiss/{conftest.py,test_conventions.py}` (site gating for samples +
-definitions, sample MARS keys; extended in steps 5–10). [done: d22d77e]
+definitions, sample MARS keys; extended in steps 5–10). [done: 2660ad9]
 
 ```python
 class GribError(ValueError)                     # not GRIB, non-GRIB bytes, undecodable/truncated message
@@ -230,7 +230,7 @@ Commands: `uv run pytest tests/test_grib.py -q`;
 ## Step 3 — Backend (`backend.py`) + tests against a temp FDB
 
 Files: `src/snakemake_storage_plugin_fdb/backend.py`, `tests/conftest.py`,
-`tests/test_backend.py`, `tests/data/schema`. [done: 78a2fb1]
+`tests/test_backend.py`, `tests/data/schema`. [done: 340ddd5]
 
 ```python
 ConfigValue = Path | str | dict[str, Any] | None
@@ -303,7 +303,7 @@ Commands: `uv run pytest tests/test_backend.py -q`.
 Files: `src/snakemake_storage_plugin_fdb/__init__.py`, `src/snakemake_storage_plugin_fdb/guard.py`,
 `src/snakemake_storage_plugin_fdb/query.py` (`oversized_components`), `tests/conftest.py`
 (`clean_env`, `make_provider` fixtures), `tests/test_settings.py`, `tests/test_plugin.py`
-(provider part), `tests/test_no_site_specifics.py`. [done: d1320ff]
+(provider part), `tests/test_no_site_specifics.py`. [done: 9185191]
 
 ```python
 # guard.py
@@ -380,7 +380,7 @@ Files: `__init__.py`, `backend.py` (`count_fields`, `spelling_diffs(parsed, expa
 `pyproject.toml`/`uv.lock` (`tenacity` declared), `tests/test_plugin.py` (`needs_raw`),
 `tests/conftest.py` (`clean_env` also resets the spelling-warning set),
 `tests/sites/meteoswiss/{conftest.py,test_conventions.py,test_read.py}` (`mch_schema`,
-`metkit_home`, `mch_sample` fixtures; read suite). [done: 4d67ebe]
+`metkit_home`, `mch_sample` fixtures; read suite). [done: 9a88020]
 
 `_fields()` (one `inspect`, not cached, spec §6), `exists()` (all combinations),
 `mtime()` with `os.stat` fallback, `size()`,
@@ -431,7 +431,7 @@ Files: `__init__.py`, `backend.py` (`reader()`: fresh handle per read, spec §2.
 (stale-read regression), `tests/conftest.py` (`clean_env` resets `_REMOVE_WARNED`;
 `fdb_config_file` factory), `tests/sites/meteoswiss/{conftest.py,test_read.py,test_write.py}`
 (`run_site`, `mch_fdb_config`, `mch_query_base` fixtures shared by the read and write
-suites). [done: 4cc11ee]
+suites). [done: 7ac0c8f]
 
 Implement spec §7.7 (count check, identifier and native modes, pre-check, duplicates,
 **guard call site** `self.provider.guard.check(msg, identifier, parsed)` for every
@@ -492,7 +492,7 @@ spelling check and identifier mode alike), `query.py` (`comparable`: one- or
 two-digit `time` as hours, `date` only as `YYYYMMDD`), `tests/test_settings.py`,
 `tests/test_query.py`, `tests/test_plugin.py` (`_stored_key` helper),
 `tests/sites/meteoswiss/test_write.py`.
-Decisions of 2026-09-15, reversible (spec §7.7). [done: 15b7031]
+Decisions of 2026-09-15, reversible (spec §7.7). [done: 26ba6bb]
 
 Acceptance:
 - default settings → `archive_mode == "native"`; `snakemake --help` shows it;
@@ -520,7 +520,7 @@ Commands: `uv run pytest -q`;
 ## Step 7 — Glob (`list_candidate_matches`)
 
 Files: `__init__.py` (`list_candidate_matches`, retried `_list`), `tests/test_plugin.py`
-(`needs_raw`), `tests/sites/meteoswiss/test_glob.py`. [done: 8fee360]
+(`needs_raw`), `tests/sites/meteoswiss/test_glob.py`. [done: 807255b]
 
 Implement spec §7.9: required keys constant (wildcard or absent → error), one `list` of
 the constant pairs, candidates from the pattern's pairs with listed values for
@@ -557,7 +557,7 @@ Commands: `uv run pytest tests/test_plugin.py -q -k glob`;
 Files: `tests/test_plugin.py` (`FDBStorageBase`, `TestStorageRead` gating,
 `TestStorageWrite`, `test_interface_conformance`,
 `test_managed_wrappers_without_rate_limiter`), `tests/conftest.py`
-(`temp_fdb_config`). [done: <pending commit>]
+(`temp_fdb_config`). [done: 85fd3ff]
 
 Spec §9.4 lists the conformance tests, and why each base test runs, is gated or has
 an override. No base test is disabled; `touch = False` and `files_only = True` match
