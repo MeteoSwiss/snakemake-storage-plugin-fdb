@@ -32,6 +32,11 @@ Revision 4 changes (2026-09-15, reversible, plan step 6a): `archive_mode` defaul
 archives query values in canonical spelling; mixed number/string pairs are not
 compared (§2.4, §4, §7.7 decisions, §8, §12).
 
+Revision 5 changes (2026-09-15, plan step 11): CI workflow in place (§11); no release
+automation, a hand-maintained `CHANGELOG.md` instead (user decision; format reversible,
+§11); the site-neutrality test and CI grep cover `scripts/` as well as `src/` (reversible,
+§1 goal 7, §9).
+
 ---
 
 ## 1. Goals and non-goals
@@ -69,9 +74,9 @@ compared (§2.4, §4, §7.7 decisions, §8, §12).
    patched language, an FDB config naming the varda-style schema. Site material is
    shipped as examples outside the package (`examples/meteoswiss/`,
    `docs/sites/meteoswiss.md`) and the tests for it live outside `src/`. Enforced by a
-   test and a CI grep (`mch|meteoswiss|cosmo|icon-ch` must not appear under `src/`),
-   which guards code location only. The rule extends to `scripts/` as a documentation
-   rule, not enforced by the grep (decided 2026-09-15, reversible; §9.5).
+   test and a CI grep (`mch|meteoswiss|cosmo|icon-ch` must not appear under `src/` or
+   `scripts/`), which guard code location only (`scripts/` decided 2026-09-15,
+   reversible, §9.5; a documentation rule only before plan step 11).
 
 ### Non-goals (v1)
 
@@ -1290,7 +1295,8 @@ config (never from plugin code), and run in CI with the definitions and schema s
 as a CI step. Skipping when the setup is absent is a *local convenience* only; with
 `SMK_FDB_TEST_REQUIRE_SITES=1` (set in CI) a missing prerequisite is a failure. The
 plugin code does not know about them. `tests/test_no_site_specifics.py` fails if
-`mch|meteoswiss|cosmo|icon-ch` (case-insensitive) appears anywhere under `src/`.
+`mch|meteoswiss|cosmo|icon-ch` (case-insensitive) appears anywhere under `src/` or
+`scripts/` (the CI `lint` job greps the same, plan step 11).
 
 ### 9.1 ECMWF samples (`.raw/`)
 
@@ -1424,7 +1430,7 @@ plain-path `eccodes_definitions`, `key_order`, `env`.
 `tests/test_key_order.py`: order derived from `.raw/schema` (skipped if absent), from an arbitrary
 schema text with `?`/`-`/defaults and several rules, from `key_order`, and the generic
 fallback; unknown keys alphabetical.
-`tests/test_no_site_specifics.py`: greps `src/` for `mch|meteoswiss|cosmo|icon-ch`.
+`tests/test_no_site_specifics.py`: greps `src/` and `scripts/` for `mch|meteoswiss|cosmo|icon-ch`.
 
 ### 9.4 Integration tests (temporary toc FDB per test session; skipped without `.raw/`)
 
@@ -1550,7 +1556,8 @@ variants are an explicit flag, not a side effect of `--seed` keyed off the file 
 Decided 2026-09-15 (reversible): one examples directory — the generic example is
 `examples/ecmwf/` (formerly a separate top-level directory), alongside `examples/meteoswiss/`.
 Decided 2026-09-15 (reversible): `init_dev_fdb.py` has no site flag;
-nothing site-specific goes in `scripts/` (documentation rule, not grep-enforced; goal 7).
+nothing site-specific goes in `scripts/` (goal 7; enforced by
+`tests/test_no_site_specifics.py` and the CI grep since plan step 11).
 
 ---
 
@@ -1592,7 +1599,20 @@ with an unstable Python API. Revisit for compressed summaries of large FDB listi
   never depends on them.
 - dev: `snakemake >= 9.27`, `pytest`, `ruff`, `coverage`.
 - Platform: Linux x86_64/aarch64 (pyfdb 5.23 wheels; 5.21.4.x also ships macOS
-  wheels). CI on `ubuntu-latest`.
+  wheels; the Linux wheels are `manylinux_2_28`). CI on `ubuntu-latest`.
+
+**CI (plan step 11, `.github/workflows/ci.yml`).** Required jobs: `lint` (ruff, the
+site-neutrality grep over `src/` and `scripts/`, `CHANGELOG.md` has `## [Unreleased]`),
+`test` (Python 3.11 and 3.12, `uv sync --locked`, suite without the `site_meteoswiss`
+marker, coverage report) and `site-meteoswiss` (definitions and metkit home provisioned
+by `examples/meteoswiss/setup.sh` and `make_metkit_home.py`, committed samples,
+`SMK_FDB_TEST_REQUIRE_SITES=1`, §9.2). Non-blocking: `pyfdb-latest` (see below).
+
+**Release notes — decided by the user (2026-09-15): no release-please, no
+conventional-PR check; a changelog.** `CHANGELOG.md` is maintained by hand in the *Keep a
+Changelog* format with an `## [Unreleased]` section that every user-visible change
+updates (reversible recommendation, followed). CI checks only that the section exists,
+not that each PR edits it.
 
 **pyfdb / eccodes version — decided: Option A** (`pyfdb>=5.21.4.21,<5.22`,
 `eccodes>=2.47,<2.48`). [verified: PyPI metadata + §2.9]

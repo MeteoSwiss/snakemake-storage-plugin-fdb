@@ -1,0 +1,97 @@
+# CI (plan step 11, spec §11). Required: lint, test, site-meteoswiss. pyfdb-latest is a
+# non-blocking canary. Tests use the committed samples in .raw/; nothing else is fetched
+# except packages and the site definitions (setup.sh).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes no floating major tag since v8: pin the release.
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Ruff (locked version, dev group only)
+        run: |
+          uv run --locked --only-group dev ruff format --check .
+          uv run --locked --only-group dev ruff check .
+      - name: No site-specific names in src/ and scripts/ (spec §1 goal 7)
+        run: "! grep -rniE 'mch|meteoswiss|cosmo|icon-ch' src/ scripts/"
+      - name: CHANGELOG.md has an Unreleased section
+        run: grep -qE '^## \[Unreleased\]' CHANGELOG.md
+
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run coverage run -m pytest -q -rs -m "not site_meteoswiss"
+      - run: uv run coverage report --include='src/*'
+
+  pyfdb-latest:
+    # Tells us when the <5.22 pin can be lifted. `uv pip` and `uv run --no-sync` never
+    # write uv.lock.
+    name: pyfdb-latest (canary, non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Upgrade pyfdb and eccodes in the environment only
+        run: |
+          uv pip install --upgrade "pyfdb>=5.23" "eccodes>=2.48,<3"
+          uv pip list | grep -E '^(pyfdb|fdb5lib|eccodes|eccodeslib|metkitlib|eckitlib) '
+      - run: uv run --no-sync pytest -q -rs -m "not site_meteoswiss"
+
+  site-meteoswiss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # A missing prerequisite fails instead of skipping (spec §9.2).
+      SMK_FDB_TEST_REQUIRE_SITES: "1"
+      SMK_FDB_TEST_MCH_SAMPLES: "${{ github.workspace }}/.raw/meteoswiss"
+      SMK_FDB_TEST_ECCODES_DEFINITIONS: "${{ github.workspace }}/.local/eccodes-cosmo-mars/definitions:${{ github.workspace }}/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions"
+      SMK_FDB_TEST_METKIT_HOME: "${{ github.workspace }}/.local/metkit-home"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Site definitions and MARS language (CI setup, not plugin code)
+        run: |
+          bash examples/meteoswiss/setup.sh --dest .local
+          uv run python examples/meteoswiss/make_metkit_home.py --dest .local/metkit-home
+      - run: uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs

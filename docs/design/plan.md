@@ -28,8 +28,10 @@ when the user supplies them via env vars/settings. Site material lives in
 `tests/sites/meteoswiss/` is **required**: steps 5, 6, 7 and 9 are accepted only when
 it passes with the COSMO definitions set, and CI runs it (step 11). Enforced code
 location by `tests/test_no_site_specifics.py` and a CI grep (steps 0, 4, 10, 11).
-The same rule applies to `scripts/` as a documentation rule (no grep enforces it):
-nothing site-specific there either; site setup commands live in `examples/meteoswiss/README.md`.
+The same rule applies to `scripts/`: nothing site-specific there either; site setup
+commands live in `examples/meteoswiss/README.md`. Since step 11 the test and the CI grep
+cover `src/` and `scripts/` (decided 2026-09-15, reversible; before, `scripts/` was a
+documentation rule only).
 Site-suite prerequisites for local runs: `examples/meteoswiss/setup.sh`,
 `examples/meteoswiss/make_metkit_home.py`, `examples/meteoswiss/fetch_ogd_samples.py`,
 then export `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss`,
@@ -37,12 +39,20 @@ then export `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss`,
 `SMK_FDB_TEST_METKIT_HOME=.local/metkit-home` (schema defaults to
 `examples/meteoswiss/realtime-varda.schema`).
 
-Layout (mirrors the current `poetry scaffold-snakemake-storage-plugin` output: `src/`
-layout, `tests/test_plugin.py`, ruff, release-please + conventional PRs):
+**Changelog (decided 2026-09-15, reversible).** `CHANGELOG.md` at the repository root is
+maintained by hand in the *Keep a Changelog* format: every step (or later change) with a
+user-visible effect adds a concise entry under `## [Unreleased]` (Added / Changed /
+Fixed / ...) in the same commit; internal refactors, tests and design-doc edits need
+none. Releases rename `[Unreleased]` to the version. No release-please and no
+conventional-PR check (user decision 2026-09-15); CI only checks that the file has an
+`## [Unreleased]` heading (step 11).
+
+Layout (follows the current `poetry scaffold-snakemake-storage-plugin` output for `src/`
+layout, `tests/test_plugin.py` and ruff; no release automation):
 
 ```
 pyproject.toml            hatchling build backend, uv-managed
-README.md, LICENSE, docs/intro.md, docs/further.md
+README.md, LICENSE, CHANGELOG.md, docs/intro.md, docs/further.md
 src/snakemake_storage_plugin_fdb/
     __init__.py           StorageProviderSettings, StorageProvider, StorageObject
     query.py              grammar, parser, normaliser, local suffix, request builders
@@ -55,7 +65,7 @@ tests/
     test_query.py         unit tests (no FDB)
     test_key_order.py     schema-derived / setting / generic key order (no FDB)
     test_settings.py      settings validation (no FDB)
-    test_no_site_specifics.py   greps src/ for mch|meteoswiss|cosmo|icon-ch
+    test_no_site_specifics.py   greps src/ and scripts/ for mch|meteoswiss|cosmo|icon-ch
     test_grib.py          eccodes helpers
     test_backend.py       backend against a temp FDB
     test_plugin.py        TestStorageBase subclasses (read, write), conformance + store/remove/glob tests
@@ -74,7 +84,7 @@ docs/sites/meteoswiss.md
 scripts/init_dev_fdb.py            creates and seeds a dev FDB (generic: --root, --schema, --seed, --variants; no site flags)
 scripts/fetch_ecmwf_samples.py     optional, not part of any step: re-downloads the committed .raw/ ECMWF files
                                    from ecmwf/fdb at a pinned commit (provenance in spec §2.1)
-.github/workflows/ci.yml, release-please.yml, conventional-prs.yml
+.github/workflows/ci.yml           lint, test (3.11/3.12), site-meteoswiss, pyfdb-latest canary (step 11)
 ```
 
 ---
@@ -332,7 +342,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
   `eccodes_definitions` as plain paths, `metkit_home`, `key_order`, `env`). No aliases,
   no site names.
 - `tests/test_no_site_specifics.py`: walks `src/` and fails on
-  `re.search(r"mch|meteoswiss|cosmo|icon-ch", text, re.I)` in any file.
+  `re.search(r"mch|meteoswiss|cosmo|icon-ch", text, re.I)` in any file (step 11 extends
+  it to `scripts/`, parametrised per directory).
 - `guard.py`: `IdentifierGuard` protocol, `IdentifierMismatch` exception, `NoGuard`,
   `StrictGuard` whose `__init__` raises
   `NotImplementedError("identifier_check=strict is reserved")`, and
@@ -617,7 +628,8 @@ site flag is replaced by `--root`/`--schema`/`--seed [DIR]`. The MeteoSwiss dev 
 documented command in `examples/meteoswiss/README.md`, run with the site env
 (`ECCODES_DEFINITION_PATH`, `METKIT_HOME`, `ECCODES_VERSION_CHECK_OFF=1`):
 `uv run python scripts/init_dev_fdb.py --root .fdb-mch --schema examples/meteoswiss/realtime-varda.schema --seed .raw/meteoswiss`.
-Nothing site-specific goes in `scripts/` (documentation rule, not grep-enforced).
+Nothing site-specific goes in `scripts/` (a documentation rule at this step; enforced by
+the test and the CI grep since step 11).
 
 `examples/ecmwf/Snakefile` (ECMWF flavour; `examples/ecmwf/config.yaml` holds
 `dates: ["20200101"]`):
@@ -1004,70 +1016,39 @@ but the live test)]
 
 ## Step 11 — CI
 
-Files: `.github/workflows/ci.yml`, `release-please.yml`, `conventional-prs.yml`.
+Files: `.github/workflows/ci.yml`, `CHANGELOG.md`, `tests/test_no_site_specifics.py`
+(covers `scripts/` too). [done: <pending commit>]
 
-```yaml
-name: CI
-on: { push: { branches: [main] }, pull_request: }
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with: { enable-cache: true }
-      - run: uv python install 3.12
-      - run: uv sync
-      - run: uv run ruff format --check . && uv run ruff check .
-      - name: No site-specific code in the package
-        run: '! grep -riEn "mch|meteoswiss|cosmo|icon-ch" src/'
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.11", "3.12"]
-    env: { ECKIT_EXCEPTION_IS_SILENT: "1" }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with: { enable-cache: true }
-      - run: uv python install ${{ matrix.python }}
-      - run: uv sync --locked --python ${{ matrix.python }}   # pinned pyfdb 5.21.4.x (spec §11 Option A)
-      - run: uv run coverage run -m pytest -q -rs -m "not site_meteoswiss"
-      - run: uv run coverage report -m
-  pyfdb-latest:
-    # Optional canary: tells us when the <5.22 pin can be lifted. Never blocks merges.
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    env: { ECKIT_EXCEPTION_IS_SILENT: "1" }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with: { enable-cache: true }
-      - run: uv python install 3.12
-      - run: uv sync --locked
-      - run: uv pip install --upgrade "pyfdb>=5.23" "eccodes>=2.48,<3"   # overrides the pin in the venv only
-      - run: uv run --no-sync pytest -q -rs -m "not site_meteoswiss"
-  site-meteoswiss:
-    runs-on: ubuntu-latest
-    env: { ECKIT_EXCEPTION_IS_SILENT: "1", SMK_FDB_TEST_REQUIRE_SITES: "1", ECCODES_VERSION_CHECK_OFF: "1" }   # last one: COSMO definitions' version-mismatch banner (spec §2.9)
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with: { enable-cache: true }
-      - run: uv python install 3.12
-      - run: uv sync
-      - name: Site definitions and MARS language (CI setup step, not plugin code)
-        run: |
-          bash examples/meteoswiss/setup.sh --dest .local        # clones eccodes-cosmo-mars (varda-ext), installs eccodes-cosmo-resources-python
-          uv run python examples/meteoswiss/make_metkit_home.py --dest .local/metkit-home
-          echo "SMK_FDB_TEST_ECCODES_DEFINITIONS=$PWD/.local/eccodes-cosmo-mars/definitions:$PWD/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions" >> "$GITHUB_ENV"
-          echo "SMK_FDB_TEST_METKIT_HOME=$PWD/.local/metkit-home" >> "$GITHUB_ENV"
-          echo "SMK_FDB_TEST_MCH_SCHEMA=$PWD/examples/meteoswiss/realtime-varda.schema" >> "$GITHUB_ENV"
-      - name: Sample data (committed empty-data samples)
-        run: echo "SMK_FDB_TEST_MCH_SAMPLES=$PWD/.raw/meteoswiss" >> "$GITHUB_ENV"
-      - run: uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs
-```
+Decided by the user (2026-09-15): no `release-please.yml` and no `conventional-prs.yml`;
+a changelog instead. Decided 2026-09-15 (reversible, recommendation followed): a
+hand-maintained `CHANGELOG.md` in the *Keep a Changelog* format (see the header), seeded
+with the user-visible features of steps 0–10 under `### Added` (nothing was released, so
+the pre-release behaviour changes and fixes are folded into those entries); CI checks
+only that the file has an `## [Unreleased]` heading, never that a PR edits it.
+
+`.github/workflows/ci.yml` is the source of truth; summary (triggers: push to `main`,
+pull requests, manual dispatch; `permissions: contents: read`; one run per ref, older
+pull-request runs cancelled, `main` runs always complete; `timeout-minutes` 10 for
+`lint`, 30 otherwise; `ECKIT_EXCEPTION_IS_SILENT` is left to `tests/conftest.py`, the
+plugin and the scripts, which default it). Every job runs on `ubuntu-latest` (glibc ≥ 2.28
+for the `manylinux_2_28` pyfdb/fdb5lib/eccodeslib wheels) with `actions/checkout@v7` and
+`astral-sh/setup-uv@v10.1.0` (`enable-cache: true`, `python-version` sets `UV_PYTHON`;
+setup-uv publishes no floating major tag since v8, so the release is pinned; checkout's
+`v7` is a major tag); all jobs but `lint` then run `uv sync --locked`:
+
+| job | runs | blocking |
+|---|---|---|
+| `lint` (3.12) | `uv run --locked --only-group dev ruff format --check .` and `... ruff check .` (locked ruff without the native stack); `! grep -rniE 'mch\|meteoswiss\|cosmo\|icon-ch' src/ scripts/`; `grep -qE '^## \[Unreleased\]' CHANGELOG.md` | yes |
+| `test` (matrix 3.11, 3.12, `fail-fast: false`) | `uv run coverage run -m pytest -q -rs -m "not site_meteoswiss"` on the locked pyfdb 5.21.4.x stack, then `coverage report --include='src/*'` (no threshold; the figure is informational) | yes |
+| `pyfdb-latest` (3.12) | `uv pip install --upgrade "pyfdb>=5.23" "eccodes>=2.48,<3"` into the synced `.venv`, lists the native stack, `uv run --no-sync pytest -q -rs -m "not site_meteoswiss"`; neither command writes `uv.lock` and the token is read-only, so no lock check | no (`continue-on-error: true`) |
+| `site-meteoswiss` (3.12) | `bash examples/meteoswiss/setup.sh --dest .local`, `make_metkit_home.py --dest .local/metkit-home`, `uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs` with job env `SMK_FDB_TEST_REQUIRE_SITES=1` and `SMK_FDB_TEST_{MCH_SAMPLES,ECCODES_DEFINITIONS,METKIT_HOME}` = `${{ github.workspace }}/` + `.raw/meteoswiss`, `.local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions`, `.local/metkit-home`. The schema uses the conftest default; `ECCODES_VERSION_CHECK_OFF` is not set job-wide, so the workflow test sees only what the profile's `env` passes (the `site_env` fixture sets it for direct decodes). `.local` is not cached: `setup.sh` tracks the `varda-ext` branch tip | yes |
+
+The site tests without the `site_meteoswiss` marker (schema key order, profile tagging)
+run in `test`.
+
+Decided 2026-09-15 (reversible): the site-neutrality grep and
+`tests/test_no_site_specifics.py` cover `scripts/` as well as `src/` (`scripts/` is
+clean; spec §1 goal 7).
 
 **CI sample data (decided):** the committed samples under `.raw/` (ECMWF) and
 `.raw/meteoswiss/` (OGD fields with emptied data section, commit c4677bd); no download
@@ -1077,14 +1058,43 @@ in CI. The OGD API is not usable for CI (24 h retention); `fetch_ogd_samples.py
 **pyfdb versions (decided, spec §11):** required jobs run the locked 5.21.4.x stack;
 the `pyfdb-latest` job is an optional, non-blocking canary on 5.23 + eccodes 2.48.
 
-Acceptance: lint green (incl. the src grep); `test` job green on the locked stack with
-the committed samples (no data-gated skips); `site-meteoswiss` job green with the
-committed `.raw/meteoswiss/` samples (with `SMK_FDB_TEST_REQUIRE_SITES=1` it fails
-rather than skips if the setup step breaks); `pyfdb-latest` may fail without blocking.
+Acceptance: lint green (incl. the `src/`+`scripts/` grep and the changelog check);
+`test` job green on the locked stack with the committed samples (no data-gated skips);
+`site-meteoswiss` job green with the committed `.raw/meteoswiss/` samples (with
+`SMK_FDB_TEST_REQUIRE_SITES=1` it fails rather than skips if the setup step breaks);
+`pyfdb-latest` may fail without blocking.
+
+Local validation (GitHub runners not available): `ci.yml` parses with PyYAML, passes
+`actionlint` 1.7.12 (with shellcheck 0.11.0) and `check-jsonschema --builtin-schema
+vendor.github-workflows`; every job's commands were run locally (Linux, glibc 2.31) with
+the same arguments, the 3.11 and canary environments in throwaway
+`UV_PROJECT_ENVIRONMENT`s and the site job's `.local` in a scratch directory.
+Results [verified 2026-09-15]: lint equivalents green (grep empty, changelog check
+passes and fails on a copy without the heading); `test` 368 passed, 28 deselected on
+3.11.14 and on 3.12.12, coverage 98 % of `src/`; `pyfdb-latest` (pyfdb/fdb5lib
+5.23.2.27, eccodes 2.48.0, eccodeslib 2.48.2.27, metkitlib 1.20.2.27, eckitlib 2.2.0.27)
+368 passed, `uv.lock` checksum unchanged; `site-meteoswiss` with the job's env values
+(setup.sh clone at `d04363540bb2`) 27 passed, 1 skipped (live fetch). On GitHub
+`test_empty_data_reproduces_committed_samples` also skips (plain skip: the full-size
+originals in the git-ignored `.local/raw-full/` are absent), so expect 26 passed,
+2 skipped. After the review simplifications (dev-group-only lint, no job-wide
+`ECKIT_EXCEPTION_IS_SILENT`/`ECCODES_VERSION_CHECK_OFF`/`SMK_FDB_TEST_MCH_SCHEMA`, no lock
+check, PR-only cancellation, timeouts) [verified 2026-09-15]: actionlint and
+check-jsonschema clean; lint commands green in a throwaway environment with `uv.lock`
+unchanged; the site suite with only the three job variables set 27 passed, 1 skipped.
+
+Commands: `uv run --locked --only-group dev ruff format --check . && uv run --locked --only-group dev ruff check .`
+(in a throwaway `UV_PROJECT_ENVIRONMENT` locally: it removes the non-dev packages);
+`! grep -rniE 'mch|meteoswiss|cosmo|icon-ch' src/ scripts/`;
+`grep -qE '^## \[Unreleased\]' CHANGELOG.md`;
+`uv run coverage run -m pytest -q -rs -m "not site_meteoswiss"`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs`
+(with the site env).
 
 ## Step 12 — Docs
 
-Files: `README.md`, `docs/intro.md`, `docs/further.md`, `docs/sites/meteoswiss.md`.
+Files: `README.md`, `docs/intro.md`, `docs/further.md`, `docs/sites/meteoswiss.md`,
+`CHANGELOG.md` (an `[Unreleased]` entry for the user docs; README links the changelog).
 
 Generic docs (README/intro/further): query grammar with generic MARS examples,
 canonical-spelling rule and warning (incl. case of enum values), key ordering
@@ -1163,7 +1173,7 @@ inverted.
 | 8 conformance | 5–7 | `uv run coverage run -m pytest -rs` |
 | 9 e2e (`examples/ecmwf/`) | 8 | `uv run pytest tests/test_workflow.py` |
 | 10 MeteoSwiss site suite (required) | 8 | `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -rs` |
-| 11 CI | 8 | green run |
+| 11 CI (+ changelog) | 8, 10 | green `ci.yml` run (lint, test, site-meteoswiss) |
 | 12 docs | 9, 10 | review |
 | 13 identifier guard (post-v1) | 6 | `uv run pytest tests/test_guard.py` |
 | 14 upstream | 5 | PR links |
