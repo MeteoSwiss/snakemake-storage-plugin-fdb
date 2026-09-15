@@ -135,6 +135,12 @@ def make_provider(tmp_path, clean_env) -> Callable[..., Any]:
 
 
 @pytest.fixture
+def temp_fdb_config(tmp_path) -> dict[str, Any]:
+    """Config of an empty toc FDB under ``tmp_path`` (``tests/data/schema``)."""
+    return fdb_config(tmp_path / "fdb")
+
+
+@pytest.fixture
 def empty_fdb(tmp_path) -> Callable[..., Any]:
     """Factory for a fresh ``Backend`` on an empty FDB (optionally another schema)."""
     from snakemake_storage_plugin_fdb.backend import Backend

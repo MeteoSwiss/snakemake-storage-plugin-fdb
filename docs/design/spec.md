@@ -279,7 +279,7 @@ the test suite).
   returned by `list_candidate_matches()` (`io/__init__.py:1767-1810`); `StorageObjectGlob`
   is optional but its absence gives an `AttributeError`.
 - `--touch` errors upfront if any output's plugin lacks `StorageObjectTouch`
-  (`dag.py:704-715`).
+  (`dag.py:776-787` `check_touch_compatible`, called from `workflow.py:1364`).
 - Untagged local prefix: `.snakemake/storage/fdb`; **tagged: `.snakemake/storage/<tag>`**
   (`storage.py:81-83`).
 - Snakemake's wildcard regex escapes `+`, `=`, `.` etc. in constant parts; a pattern
@@ -1382,11 +1382,41 @@ Fixtures build an FDB in `tmp_path_factory` with `tests/data/schema` and archive
 four `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
 `conftest.py` before importing the plugin.
 
-- `TestStorageRead(TestStorageBase)` with `retrieve_only = True`, `files_only = True`,
-  `delete = False`: `get_query` → a 3-step request over pre-archived variants;
-  `get_query_not_existing` → same request with `expver=0002`. Rationale:
-  `TestStorageBase._test_storage` writes the text `test` into the local path before
-  calling `store_object()` [verified: `tests.py:86-90`], which can never be valid GRIB.
+- Interface conformance (plan step 8; `snakemake-interface-storage-plugins` 4.4.1).
+  Both subclasses derive from `FDBStorageBase(TestStorageBase)` (`files_only = True`,
+  `touch = False`; an autouse fixture points the provider at an empty temp FDB in a
+  `clean_env`), so every base test runs; none is disabled:
+  - `TestStorageRead` (`retrieve_only = True`): `get_query` → a
+    3-step request over pre-archived variants; `get_query_not_existing` → same
+    request with `expver=0002`. `test_storage` and `test_storage_not_existing` are
+    overridden only to gate them on `.raw/` and switch the provider to the seeded
+    FDB; `test_query_validation` and `test_example_queries` need no data and run
+    without `.raw/`. `retrieve_only`
+    because `TestStorageBase._test_storage` writes the text `test` into the local
+    path before calling `store_object()` [verified: `tests.py:86-90`], which can
+    never be valid GRIB.
+  - `TestStorageWrite` (`.raw/`-gated, defaults `retrieve_only = store_only = False`,
+    `delete = True`, empty FDB per test): runs the base store sequence (store, delete
+    the local copy, `exists`, `mtime`, `size`, `checksum`, `inventory`, retrieve,
+    `remove` as a warning no-op). Its `_get_obj` override makes the object overwrite
+    the `test` text with the query's 3 GRIB messages before the real `store_object`.
+  - `test_interface_conformance`: `StoragePluginRegistry().get_plugin("fdb")` yields
+    `StorageProvider`, `StorageObject`, `StorageProviderSettings` and
+    `is_read_write()` (`StorageObjectRead` and `StorageObjectWrite`); no abstract
+    methods left; `StorageObject` is a `StorageObjectGlob` and deliberately **not** a
+    `StorageObjectTouch` (§7.10).
+  - `test_managed_wrappers_without_rate_limiter`: the `managed_*` coroutines Snakemake
+    calls (`store`, `exists`, `mtime`, `size`, `local_footprint`, `checksum`,
+    `retrieve`, `remove`) pass through the no-op rate limiter (`use_rate_limiter()` is
+    `False`) and return what the plain methods return; `print_query` equals the query
+    (`safe_print` is the identity); `managed_mtime` of a missing object raises
+    `FileOrDirectoryNotFoundError`. The values themselves (size, checksum `None`, the
+    `remove` warning) are asserted by `test_store_roundtrip`,
+    `test_exists_size_checksum_complete` and `test_remove_policy`.
+  The existing unit tests cover the rest of the provider surface
+  (`test_provider_settings_rate_limiter_and_safe_print`, `test_example_queries_valid`,
+  `test_exists_size_checksum_complete`: `local_footprint() == size()`,
+  `get_inventory_parent() is None`, `cleanup()`).
 - Write path (`tests/test_plugin.py`, plan step 6): `test_store_roundtrip` (both
   archive modes, `NoGuard` installed), `test_store_template` (padded GRIB1, schema with
   and without `number`), `test_store_strict_rejects` and `test_store_warn_fewer_fields`

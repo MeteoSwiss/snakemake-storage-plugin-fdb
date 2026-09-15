@@ -7,3 +7,5 @@ __pycache__/
 dist/
 CLAUDE.local.md
 WORK.md
+.coverage
+htmlcov/

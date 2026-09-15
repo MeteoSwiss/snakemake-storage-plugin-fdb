@@ -1,5 +1,5 @@
 """Provider and storage object (provider: plan step 4, read path: step 5, write
-path: step 6, glob: step 7).
+path: step 6, glob: step 7, ``TestStorageBase`` and interface conformance: step 8).
 """
 
 import asyncio
@@ -17,6 +17,12 @@ import pytest
 import yaml
 from snakemake.io import IOCache, IOFile, apply_wildcards, flag, glob_wildcards
 from snakemake_interface_common.exceptions import WorkflowError
+from snakemake_interface_storage_plugins.exceptions import FileOrDirectoryNotFoundError
+from snakemake_interface_storage_plugins.registry import StoragePluginRegistry
+from snakemake_interface_storage_plugins.storage_object import (
+    StorageObjectGlob,
+    StorageObjectTouch,
+)
 from snakemake_interface_storage_plugins.tests import TestStorageBase
 
 from snakemake_storage_plugin_fdb import (
@@ -178,6 +184,20 @@ def test_provider_settings_rate_limiter_and_safe_print(make_provider):
     assert provider.safe_print("fdb://class=od") == "fdb://class=od"
 
 
+def test_interface_conformance():
+    # loaded the way Snakemake loads storage plugins (module name prefix)
+    plugin = StoragePluginRegistry().get_plugin("fdb")
+    assert plugin.storage_provider is StorageProvider
+    assert plugin.storage_object is StorageObject
+    assert plugin.settings_cls is StorageProviderSettings
+    assert plugin.is_read_write()  # StorageObjectRead and StorageObjectWrite
+    assert not StorageProvider.__abstractmethods__
+    assert not StorageObject.__abstractmethods__
+    assert issubclass(StorageObject, StorageObjectGlob)
+    # deliberately absent: --touch then fails upfront for FDB outputs (spec §7.10)
+    assert not issubclass(StorageObject, StorageObjectTouch)
+
+
 def test_provider_settings_postprocess_invalid_unchanged(make_provider):
     provider = make_provider()
     assert provider.postprocess_query("s3://x") == "s3://x"
@@ -280,25 +300,42 @@ def test_wildcard_guard_unrecorded_short_query_accepted(make_provider):
 # --- read path (plan step 5) ----------------------------------------------------------
 
 
-@needs_raw
-class TestStorageRead(TestStorageBase):
-    """Interface conformance on pre-archived fields (store is not testable here:
-    ``TestStorageBase`` stores the text ``test``, never valid GRIB; spec §9.4)."""
+class FDBStorageBase(TestStorageBase):
+    """``TestStorageBase`` on a provider for the FDB configured in ``self.config``
+    (an empty temp FDB unless a test replaces it)."""
 
-    __test__ = True
-    retrieve_only = True
-    delete = False
-    files_only = True
+    files_only = True  # directories are not supported (spec §1)
+    touch = False  # no StorageObjectTouch (spec §7.10)
+    config: dict
 
     @pytest.fixture(autouse=True)
-    def _seeded(self, seeded_fdb):
-        self.seeded = seeded_fdb
+    def _config(self, temp_fdb_config, clean_env):
+        self.config = temp_fdb_config
 
     def get_storage_provider_cls(self):
         return StorageProvider
 
     def get_storage_provider_settings(self):
-        return StorageProviderSettings(config=yaml.safe_dump(self.seeded.config))
+        return StorageProviderSettings(config=yaml.safe_dump(self.config))
+
+
+class TestStorageRead(FDBStorageBase):
+    """Base tests on pre-archived fields (spec §9.4). ``test_storage`` and
+    ``test_storage_not_existing`` read the seeded FDB and need ``.raw/``;
+    ``test_query_validation`` and ``test_example_queries`` run without data."""
+
+    __test__ = True
+    retrieve_only = True  # the base store sequence writes text (TestStorageWrite)
+
+    @needs_raw
+    def test_storage(self, tmp_path, seeded_fdb):
+        self.config = seeded_fdb.config
+        super().test_storage(tmp_path)
+
+    @needs_raw
+    def test_storage_not_existing(self, tmp_path, seeded_fdb):
+        self.config = seeded_fdb.config
+        super().test_storage_not_existing(tmp_path)
 
     def get_query(self, tmp_path) -> str:
         return f"fdb://{EA},step=0/6/12,param=167"
@@ -319,6 +356,11 @@ def seeded_provider(seeded_fdb, make_provider):
 
 def _warnings(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def _write_local(obj: StorageObject, data: bytes) -> None:
+    obj.local_path().parent.mkdir(parents=True, exist_ok=True)
+    obj.local_path().write_bytes(data)
 
 
 @needs_raw
@@ -431,8 +473,7 @@ def test_mtime_timestamp_fallback_os_stat(seeded_provider, monkeypatch, caplog):
 @needs_raw
 def test_retrieve_request_order_and_size(seeded_provider):
     obj = seeded_provider().object(f"fdb://{EA},step=0/6/12,param=167/165")
-    obj.local_path().parent.mkdir(parents=True, exist_ok=True)
-    obj.local_path().write_bytes(b"stale")
+    _write_local(obj, b"stale")
     obj.retrieve_object()
     local = obj.local_path()
     assert local.stat().st_size == obj.size()
@@ -527,8 +568,7 @@ def _grib(steps=(0, 6, 12), params=(167,), zero_values=True) -> bytes:
 
 def _store(provider: StorageProvider, query: str, data: bytes) -> StorageObject:
     obj = provider.object(query)
-    obj.local_path().parent.mkdir(parents=True, exist_ok=True)
-    obj.local_path().write_bytes(data)
+    _write_local(obj, data)
     obj.store_object()
     return obj
 
@@ -841,6 +881,52 @@ def test_store_threads(make_provider):
     with ThreadPoolExecutor(max_workers=len(steps)) as pool:
         assert list(pool.map(store, steps)) == [True] * len(steps)
     assert _in_fdb(provider, f"fdb://{EA2},step=0/6/12/18,param=167") == 4
+
+
+@needs_raw
+class TestStorageWrite(FDBStorageBase):
+    """The base store sequence on an empty FDB: store, delete the local copy, exists,
+    mtime, size, checksum, inventory, retrieve, remove (a no-op with a warning, spec
+    §7.8). ``TestStorageBase`` writes the text ``test`` before ``store_object``
+    (spec §2.7, §9.4), so the object overwrites it with GRIB for the query first."""
+
+    __test__ = True
+
+    def _get_obj(self, tmp_path, query):
+        obj = super()._get_obj(tmp_path, query)
+
+        def store_object():
+            obj.local_path().write_bytes(_grib())
+            StorageObject.store_object(obj)
+
+        obj.store_object = store_object
+        return obj
+
+    def get_query(self, tmp_path) -> str:
+        return STORE_QUERY
+
+    def get_query_not_existing(self, tmp_path) -> str:
+        return STORE_QUERY  # the FDB is empty
+
+
+@needs_raw
+def test_managed_wrappers_without_rate_limiter(make_provider):
+    # the managed_* coroutines Snakemake calls pass through the no-op rate limiter
+    # and return what the plain methods return (values: test_store_roundtrip etc.)
+    provider = make_provider()
+    obj = provider.object(STORE_QUERY)
+    assert obj.print_query == obj.query  # safe_print is the identity
+    with pytest.raises(FileOrDirectoryNotFoundError):
+        asyncio.run(obj.managed_mtime())  # nothing stored yet
+    data = _grib()
+    _write_local(obj, data)
+    asyncio.run(obj.managed_store())
+    obj.local_path().unlink()
+    for name in ("exists", "mtime", "size", "local_footprint", "checksum"):
+        assert asyncio.run(getattr(obj, f"managed_{name}")()) == getattr(obj, name)()
+    asyncio.run(obj.managed_retrieve())
+    assert obj.local_path().read_bytes() == data
+    asyncio.run(obj.managed_remove())  # the warning: test_remove_policy
 
 
 @pytest.mark.parametrize("policy", ["warn", "ignore", "error"])

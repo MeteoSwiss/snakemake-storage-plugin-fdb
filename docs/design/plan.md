@@ -58,7 +58,7 @@ tests/
     test_no_site_specifics.py   greps src/ for mch|meteoswiss|cosmo|icon-ch
     test_grib.py          eccodes helpers
     test_backend.py       backend against a temp FDB
-    test_plugin.py        TestStorageBase subclass + store/remove/glob tests
+    test_plugin.py        TestStorageBase subclasses (read, write), conformance + store/remove/glob tests
     test_workflow.py      end-to-end snakemake run on examples/ecmwf/
     data/schema           extended pyfdb test schema (committed, 212 B)
     sites/meteoswiss/     required site suite, configured via SMK_FDB_TEST_* env vars (conftest.py, test_read/write/glob/workflow/conventions.py)
@@ -82,8 +82,9 @@ scripts/fetch_ecmwf_samples.py     optional, not part of any step: re-downloads 
 
 Files: `pyproject.toml`, `README.md`, `LICENSE` (BSD-3-Clause), `src/snakemake_storage_plugin_fdb/__init__.py`
 (docstring only; provider classes arrive in step 4), `.gitignore` (add `.snakemake/`,
-`*.part`, `.local/`, `.fdb/`, `.venv/`, `__pycache__/`, `dist/`, and the personal
-work-tracking files `CLAUDE.local.md`, `WORK.md`; not `.raw/`, which is committed),
+`*.part`, `.local/`, `.fdb/`, `.venv/`, `__pycache__/`, `dist/`, the coverage output
+`.coverage`, `htmlcov/` (step 8), and the personal work-tracking files
+`CLAUDE.local.md`, `WORK.md`; not `.raw/`, which is committed),
 `uv.lock` (committed), `[tool.ruff]`. [done: 9ec2639]
 
 ```toml
@@ -519,7 +520,7 @@ Commands: `uv run pytest -q`;
 ## Step 7 — Glob (`list_candidate_matches`)
 
 Files: `__init__.py` (`list_candidate_matches`, retried `_list`), `tests/test_plugin.py`
-(`needs_raw`), `tests/sites/meteoswiss/test_glob.py`. [done: <pending commit>]
+(`needs_raw`), `tests/sites/meteoswiss/test_glob.py`. [done: 8fee360]
 
 Implement spec §7.9: required keys constant (wildcard or absent → error), one `list` of
 the constant pairs, candidates from the pattern's pairs with listed values for
@@ -553,11 +554,28 @@ Commands: `uv run pytest tests/test_plugin.py -q -k glob`;
 
 ## Step 8 — `TestStorageBase` integration pass and interface conformance
 
-Files: `tests/test_plugin.py`, `tests/conftest.py`.
+Files: `tests/test_plugin.py` (`FDBStorageBase`, `TestStorageRead` gating,
+`TestStorageWrite`, `test_interface_conformance`,
+`test_managed_wrappers_without_rate_limiter`), `tests/conftest.py`
+(`temp_fdb_config`). [done: <pending commit>]
 
-Acceptance: `uv run pytest -q` green with `.raw/` present, and green-with-skips
-without it (`-rs` shows one skip reason per gated test); `coverage report` ≥ 85 % on
-`src/` when data is present.
+Spec §9.4 lists the conformance tests, and why each base test runs, is gated or has
+an override. No base test is disabled; `touch = False` and `files_only = True` match
+spec §1 non-goals.
+
+Acceptance:
+- `uv run pytest -q` green with `.raw/` present;
+- green with skips without it (`-rs` shows one skip reason per gated test):
+  `TestStorageRead::test_query_validation` and `::test_example_queries` still run;
+- `TestStorageRead` and `TestStorageWrite` pass every `TestStorageBase` test;
+- the plugin loads through `StoragePluginRegistry` as read-write, and `StorageObject`
+  is not a `StorageObjectTouch`;
+- the `managed_*` wrappers pass through the disabled rate limiter;
+- `coverage report` ≥ 85 % on `src/` when data is present.
+
+Commands: `uv run pytest tests/test_plugin.py -q -rs -k "TestStorage or conformance or managed"`;
+`uv run coverage run -m pytest -q -rs && uv run coverage report --include='src/*'`
+(`.coverage` and `htmlcov/` are git-ignored, step 0).
 
 ## Step 9 — Dev FDB and example workflow end-to-end
 
