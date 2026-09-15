@@ -6,21 +6,25 @@ Importing this module loads no FDB/eccodes native library: ``is_valid_query`` an
 (spec §4.1, §5).
 """
 
+import itertools
 import os
 import re
 import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_storage_plugins.common import Operation
-from snakemake_interface_storage_plugins.io import IOCacheStorageInterface
+from snakemake_interface_storage_plugins.io import IOCacheStorageInterface, Mtime
 from snakemake_interface_storage_plugins.settings import StorageProviderSettingsBase
 from snakemake_interface_storage_plugins.storage_object import (
     StorageObjectGlob,
     StorageObjectRead,
     StorageObjectWrite,
+    retry_decorator,
 )
 from snakemake_interface_storage_plugins.storage_provider import (
     ExampleQuery,
@@ -29,7 +33,16 @@ from snakemake_interface_storage_plugins.storage_provider import (
     StorageQueryValidationResult,
 )
 
-from .backend import Backend, SchemaInfo, parse_schema, resolve_config
+from .backend import (
+    Backend,
+    Field,
+    SchemaInfo,
+    count_fields,
+    fallback_expand,
+    map_error,
+    parse_schema,
+    resolve_config,
+)
 from .backend import resolve_schema_path as _resolve_schema_path
 from .guard import IDENTIFIER_CHECKS, make_guard
 from .query import NAME_MAX, KeyOrder, ParsedQuery, QueryError, normalize, parse
@@ -48,6 +61,17 @@ _ENV_LOCK = threading.Lock()
 # Values this process's providers applied from eccodes_definitions / metkit_home,
 # to warn when two providers disagree (one process environment, spec §4.1).
 _APPLIED: dict[str, str] = {}
+# Queries already warned about non-canonical spelling (once per process, spec §7.12).
+_SPELLING_WARNED: set[str] = set()
+_SPELLING_LOCK = threading.Lock()
+MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
+
+
+def _retry_fdb_io(func):
+    """The interface's ``retry_decorator`` (3 attempts, exponential wait from 3 s)
+    raising the last attempt's own exception instead of tenacity's ``RetryError``,
+    so it can be mapped (spec §6)."""
+    return retry_decorator(func).retry_with(reraise=True)
 
 
 # typing.Optional, not "X | None": Snakemake unwraps only typing.Optional for the CLI.
@@ -377,6 +401,9 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         self._parsed_for: str | None = None
         self._parsed: ParsedQuery | None = None
         self._parse_error: QueryError | None = None
+        self._expansion_for: str | None = None
+        self._expansion: dict[str, list[str]] = {}
+        self._no_mtime_warned = False
         parsed = self._parse()
         if parsed is None or self.provider.is_normalised(self.query):
             return
@@ -423,28 +450,192 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         except QueryError as e:
             raise WorkflowError(f"invalid FDB query {self.query}: {e}") from e
 
+    # --- read helpers ----------------------------------------------------------------
+
+    def _request(self) -> dict[str, str]:
+        """``inspect``/``retrieve`` request of the query; no wildcards allowed."""
+        parsed = self.parsed
+        if parsed.has_wildcards():
+            raise WorkflowError(f"FDB query {self.query} has unresolved wildcards")
+        return parsed.to_request()
+
+    @contextmanager
+    def _mapping_errors(
+        self, local: str | os.PathLike[str] | None = None
+    ) -> Iterator[None]:
+        """Raise known pyfdb failures as the ``WorkflowError`` of spec §6."""
+        try:
+            yield
+        except RuntimeError as e:
+            mapped = map_error(e, self.query, local)
+            if mapped is None:
+                raise
+            raise mapped from e
+
+    def _expanded(self) -> dict[str, list[str]]:
+        """Expanded request (spec §3.4), cached per query text.
+
+        The first computation runs the canonical-spelling check (spec §7.12); an
+        invalid request raises the mapped ``WorkflowError`` and is not cached.
+        """
+        if self._expansion_for != self.query:
+            request = self._request()
+            with self._mapping_errors():
+                expanded = self.provider.backend.expand(request)
+            self._check_spelling(expanded)
+            if expanded is None:
+                expanded = fallback_expand(request)
+            self._expansion, self._expansion_for = expanded, self.query
+        return self._expansion
+
+    def _expected(self) -> int:
+        """Expected field count ``E`` of the query."""
+        return count_fields(self._expanded())
+
+    def _check_spelling(self, expanded: dict[str, list[str]] | None) -> None:
+        """Spec §7.12 on ``expanded`` (metkit's expansion of the request, if any)."""
+        policy = self.provider.canonical_spelling
+        if policy == "ignore":
+            return
+        if expanded is None:
+            self.provider.logger.debug("canonical-spelling check skipped: no expansion")
+            return
+        diffs = self.provider.backend.spelling_diffs(self.parsed, expanded)
+        if not diffs:
+            return
+        (key, given, canonical), *rest = diffs
+        parts = [f"{key}={given} (canonical: {canonical})"]
+        parts += [f"{k}={g} ({c})" for k, g, c in rest]
+        message = (
+            f"Query {self.query} uses non-canonical spelling: {', '.join(parts)}. "
+            "Use canonical spellings to avoid duplicate local paths for the same field."
+        )
+        if policy == "error":
+            raise WorkflowError(message)
+        with _SPELLING_LOCK:
+            if self.query in _SPELLING_WARNED:
+                return
+            _SPELLING_WARNED.add(self.query)
+        self.provider.logger.warning(message)
+
+    @_retry_fdb_io
+    def _inspect(self, request: Mapping[str, str]) -> list[Field]:
+        return self.provider.backend.inspect(request)
+
+    @_retry_fdb_io
+    def _retrieve_to(
+        self, request: Mapping[str, str], dest: Path, expected: int
+    ) -> int:
+        return self.provider.backend.retrieve_to(request, dest, expected)
+
+    def _fields(self) -> list[Field]:
+        """Fields FDB holds for the query: one ``inspect``, not cached (spec §6)."""
+        request = self._request()
+        self._expanded()  # invalid requests and spelling errors before any FDB I/O
+        with self._mapping_errors():
+            return self._inspect(request)
+
+    def _complete(self, fields: list[Field]) -> bool:
+        expected = self._expected()
+        return expected > 0 and len(fields) == expected
+
+    @staticmethod
+    def _total_length(fields: list[Field]) -> int:
+        """Bytes of the fields' messages (= retrieved bytes, spec §7.2)."""
+        return sum(f.length for f in fields)
+
+    def _mtime_of(self, fields: list[Field]) -> float:
+        """Latest index timestamp; ``os.stat`` of the data file if it is 0 (§7.4)."""
+        times = [float(f.timestamp) or self._stat_mtime(f.uri_path) for f in fields]
+        return max(times)
+
+    def _stat_mtime(self, uri_path: str | None) -> float:
+        if uri_path:
+            try:
+                return os.stat(uri_path).st_mtime
+            except OSError:
+                pass
+        if not self._no_mtime_warned:
+            self._no_mtime_warned = True
+            self.provider.logger.warning(
+                f"FDB storage: a field of {self.query} has no index timestamp and no "
+                "local data file; its mtime is taken as 0"
+            )
+        return 0.0
+
+    def _missing_message(self, fields: list[Field]) -> str:
+        """Retrieve error: found/expected counts, the first missing combinations
+        (keys with several values only) and, if nothing matched, the optional
+        schema keys the query does not name (spec §7.5)."""
+        expanded = self._expanded()
+        keys = self.provider.key_order.sorted(expanded)
+        values = [list(dict.fromkeys(expanded[k])) for k in keys]
+        varying = [i for i, v in enumerate(values) if len(v) > 1] or range(len(keys))
+        present = {tuple(f.key.get(k, "") for k in keys) for f in fields}
+        combos = (c for c in itertools.product(*values) if c not in present)
+        shown = [
+            ",".join(f"{keys[i]}={c[i]}" for i in varying)
+            for c in itertools.islice(combos, MISSING_SHOWN)
+        ]
+        expected = self._expected()
+        missing = expected - len(fields)
+        message = f"{self.query}: {len(fields)} of {expected} fields found in FDB"
+        if shown:
+            message += f"; missing: {'; '.join(shown)}"
+            if missing > len(shown):
+                message += f" (and {missing - len(shown)} more)"
+        info = self.provider.schema_info
+        if not fields and info is not None and (optional := info.optional - set(keys)):
+            message += (
+                ". FDB matches keys exactly; optional schema keys not in the query: "
+                + ", ".join(sorted(optional))
+            )
+        return message
+
     # --- read path (plan step 5) ---------------------------------------------------
 
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
-        raise NotImplementedError
+        """One ``inspect`` fills existence, mtime and size of this object (§7.6)."""
+        key = self.cache_key()
+        if key in cache.exists_in_storage:
+            return
+        fields = self._fields()
+        exists = self._complete(fields)
+        cache.exists_in_storage[key] = exists
+        if exists:
+            cache.mtime[key] = Mtime(storage=self._mtime_of(fields))
+            cache.size[key] = self._total_length(fields)
 
     def get_inventory_parent(self) -> str | None:
-        raise NotImplementedError
+        return None
 
     def cleanup(self) -> None:
-        raise NotImplementedError
+        """Nothing to clean: handles are per thread and flushed after every store."""
 
     def exists(self) -> bool:
-        raise NotImplementedError
+        """All fields the query expands to are in FDB (spec §7.1)."""
+        return self._complete(self._fields())
 
     def mtime(self) -> float:
-        raise NotImplementedError
+        fields = self._fields()
+        if not fields:
+            raise FileNotFoundError(f"no fields in FDB for {self.query}")
+        return self._mtime_of(fields)
 
     def size(self) -> int:
-        raise NotImplementedError
+        return self._total_length(self._fields())
+
+    def checksum(self) -> str | None:
+        """``None``: Snakemake hashes the local copy instead (spec §7.3)."""
+        return None
 
     def retrieve_object(self) -> None:
-        raise NotImplementedError
+        fields = self._fields()
+        if not self._complete(fields):
+            raise WorkflowError(self._missing_message(fields))
+        local = self.local_path()
+        with self._mapping_errors(local):
+            self._retrieve_to(self._request(), local, self._total_length(fields))
 
     # --- write path (plan step 6) --------------------------------------------------
 

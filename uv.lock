@@ -1681,6 +1681,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "snakemake-interface-common" },
     { name = "snakemake-interface-storage-plugins" },
+    { name = "tenacity" },
 ]
 
 [package.dev-dependencies]
@@ -1698,6 +1699,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6" },
     { name = "snakemake-interface-common", specifier = ">=1.23,<2" },
     { name = "snakemake-interface-storage-plugins", specifier = ">=4.4.1,<5" },
+    { name = "tenacity", specifier = ">=9.1.4,<10" },
 ]
 
 [package.metadata.requires-dev]

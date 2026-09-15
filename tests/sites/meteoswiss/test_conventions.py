@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -53,16 +52,9 @@ SAMPLES = [
 ]
 
 
-def _sample(samples: Path, pattern: str) -> Path:
-    found = sorted(samples.glob(pattern))
-    if not found:
-        pytest.fail(f"no sample matching {pattern} in {samples}")
-    return found[-1]
-
-
 @pytest.fixture(scope="module")
-def decoded(mch_samples, eccodes_definitions) -> dict[str, list]:
-    paths = [str(_sample(mch_samples, pattern)) for pattern, _ in SAMPLES]
+def decoded(mch_sample, eccodes_definitions) -> dict[str, list]:
+    paths = [str(mch_sample(pattern)) for pattern, _ in SAMPLES]
     env = dict(os.environ)
     existing = env.get("ECCODES_DEFINITION_PATH")
     env["ECCODES_DEFINITION_PATH"] = (
@@ -79,8 +71,8 @@ def decoded(mch_samples, eccodes_definitions) -> dict[str, list]:
 
 
 @pytest.mark.parametrize("pattern, expected", SAMPLES, ids=[s[0] for s in SAMPLES])
-def test_sample_mars_keys(mch_samples, decoded, pattern, expected):
-    path = _sample(mch_samples, pattern)
+def test_sample_mars_keys(mch_sample, decoded, pattern, expected):
+    path = mch_sample(pattern)
     stamp = re.search(r"_(\d{8})(\d{4})_", path.name)
     assert stamp, path.name
     messages = decoded[str(path)]

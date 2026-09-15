@@ -88,14 +88,15 @@ PROVIDER_ENV_VARS = (
 def clean_env(monkeypatch) -> pytest.MonkeyPatch:
     """Unset the provider's environment variables; monkeypatch restores them.
 
-    Also resets the plugin's record of applied settings, so tests do not see each
-    other's "different settings in one process" warnings.
+    Also resets the plugin's per-process records (applied settings, queries warned
+    about spelling), so tests do not see each other's warnings.
     """
     import snakemake_storage_plugin_fdb as plugin
 
     for name in PROVIDER_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(plugin, "_APPLIED", {})
+    monkeypatch.setattr(plugin, "_SPELLING_WARNED", set())
     return monkeypatch
 
 

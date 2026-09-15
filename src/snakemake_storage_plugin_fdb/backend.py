@@ -250,6 +250,12 @@ def _as_date(value: str) -> date | None:
         return None
 
 
+def count_fields(expanded: Mapping[str, list[str]]) -> int:
+    """Expected field count ``E`` of an expanded request: product of the distinct
+    values per key (spec §3.4)."""
+    return math.prod(len(set(values)) for values in expanded.values())
+
+
 def _detail(exc: BaseException) -> str:
     lines = [line for line in str(exc).splitlines() if line.strip()]
     return _USER_ERROR_PREFIX.sub("", lines[0].strip()) if lines else type(exc).__name__
@@ -416,16 +422,21 @@ class Backend:
         expanded = self.expand(request)
         if expanded is None:
             expanded = fallback_expand(request)
-        return math.prod(len(set(values)) for values in expanded.values())
+        return count_fields(expanded)
 
-    def spelling_diffs(self, parsed: ParsedQuery) -> list[tuple[str, str, str]]:
+    def spelling_diffs(
+        self, parsed: ParsedQuery, expanded: Mapping[str, list[str]] | None = None
+    ) -> list[tuple[str, str, str]]:
         """``(key, given, canonical)`` for literal values FDB spells differently.
 
-        Keys with wildcards or ``to``/``by`` ranges are exempt; lists are compared
-        item by item. Empty (with a debug log) if expansion is unavailable (spec §7.12).
+        ``expanded`` is the expansion of ``parsed.constant_pairs()`` if the caller has
+        it already (else it is computed here). Keys with wildcards or ``to``/``by``
+        ranges are exempt; lists are compared item by item. Empty (with a debug log)
+        if expansion is unavailable (spec §7.12).
         """
         request = parsed.constant_pairs()
-        expanded = self.expand(request)
+        if expanded is None:
+            expanded = self.expand(request)
         if expanded is None:
             self.logger.debug("canonical-spelling check skipped (no expansion)")
             return []
