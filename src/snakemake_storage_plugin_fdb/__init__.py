@@ -846,5 +846,36 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     # --- glob (plan step 7) --------------------------------------------------------
 
+    @_retry_fdb_io
+    def _list(self, selection: Mapping[str, str]) -> list[Field]:
+        return self.provider.backend.list(selection)
+
     def list_candidate_matches(self) -> list[str]:
-        raise NotImplementedError
+        """Concrete queries for ``glob_wildcards`` (spec §7.9), sorted.
+
+        One ``list`` of the pattern's constant keys (omitted keys are wildcards). Each
+        field gives the pattern with its wildcard-bearing values replaced by the
+        field's canonical values; fields lacking such a key, or listing it empty, are
+        skipped. Keys the pattern does not name do not appear, so fields differing
+        only there give one candidate.
+        """
+        parsed = self.parsed
+        selection = parsed.constant_pairs()
+        required = self.provider.glob_required_keys
+        unconstrained = [key for key in required if key not in selection]
+        if unconstrained:
+            raise WorkflowError(
+                f"FDB glob pattern {self.query} needs constant values for "
+                f"{', '.join(unconstrained)} (glob_required_keys)"
+            )
+        wild = parsed.wildcard_keys()
+        with self._mapping_errors():
+            fields = self._list(selection)
+        candidates = set()
+        for f in fields:
+            if all(f.key.get(k) for k in wild):
+                pairs = tuple(
+                    (k, f.key[k] if k in wild else v) for k, v in parsed.pairs
+                )
+                candidates.add(ParsedQuery(pairs).to_query())
+        return sorted(candidates)

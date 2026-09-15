@@ -1,7 +1,5 @@
 """Provider and storage object (provider: plan step 4, read path: step 5, write
-path: step 6).
-
-Glob tests are added in plan step 7.
+path: step 6, glob: step 7).
 """
 
 import asyncio
@@ -17,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from snakemake.io import IOCache, IOFile, apply_wildcards, flag
+from snakemake.io import IOCache, IOFile, apply_wildcards, flag, glob_wildcards
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_storage_plugins.tests import TestStorageBase
 
@@ -383,11 +381,12 @@ def test_exists_wildcard_query_rejected(seeded_provider):
         obj.exists()
 
 
-@needs_raw
-def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
-    monkeypatch.setattr(StorageObject._inspect.retry, "sleep", lambda seconds: None)
-    provider = seeded_provider()
-    real, calls = provider.backend.inspect, []
+def _fail_once(monkeypatch, provider: StorageProvider, method: str) -> list:
+    """Make ``provider.backend.<method>`` raise a transient error on its first call
+    and skip the retry sleep of the ``StorageObject`` wrapper; returns the call log."""
+    wrapper = {"inspect": StorageObject._inspect, "list": StorageObject._list}[method]
+    monkeypatch.setattr(wrapper.retry, "sleep", lambda seconds: None)
+    real, calls = getattr(provider.backend, method), []
 
     def flaky(request):
         calls.append(request)
@@ -395,7 +394,14 @@ def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
             raise RuntimeError("transient")
         return real(request)
 
-    monkeypatch.setattr(provider.backend, "inspect", flaky)
+    monkeypatch.setattr(provider.backend, method, flaky)
+    return calls
+
+
+@needs_raw
+def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
+    provider = seeded_provider()
+    calls = _fail_once(monkeypatch, provider, "inspect")
     assert provider.object(f"fdb://{EA},step=0,param=167").exists() is True
     assert len(calls) == 2
 
@@ -856,3 +862,88 @@ def test_remove_policy(make_provider, caplog, policy):
         f"FDB cannot delete individual fields; existing fields for {query} will be "
         "masked by the next archive. Use `fdb purge` to reclaim space."
     ]
+
+
+# --- glob (plan step 7) ---------------------------------------------------------------
+
+
+def _glob(obj: StorageObject) -> dict[str, list[str]]:
+    """Snakemake's own ``glob_wildcards`` on a storage-object pattern (spec §2.7)."""
+    return glob_wildcards(flag(obj.query, "storage_object", obj))._asdict()
+
+
+@needs_raw
+@pytest.mark.parametrize("step", ["{step}", "{step,\\d+}"], ids=["plain", "constraint"])
+def test_glob_step_candidates_match_pattern(seeded_provider, step):
+    obj = seeded_provider().object(f"fdb://param=167,{EA},step={step}")
+    candidates = obj.list_candidate_matches()
+    assert candidates == [f"fdb://{EA},step={s},param=167" for s in ("0", "12", "6")]
+    # glob_wildcards keeps the candidates matching regex_from_filepattern(obj.query)
+    assert _glob(obj)["step"] == ["0", "12", "6"]
+
+
+@needs_raw
+def test_glob_keys_absent_from_pattern_collapse(seeded_provider):
+    # param and stream are wildcards for list (spec §2.3): 6 oper variants and the
+    # enda template give three candidates
+    obj = seeded_provider().object("fdb://class=ea,step={step}")
+    assert obj.list_candidate_matches() == [
+        "fdb://class=ea,step=0",
+        "fdb://class=ea,step=12",
+        "fdb://class=ea,step=6",
+    ]
+
+
+@needs_raw
+def test_glob_skips_fields_without_the_wildcard_key(seeded_provider):
+    # only the enda template carries number; the oper variants lack it
+    obj = seeded_provider().object("fdb://class=ea,step=0,param=167,number={n}")
+    assert obj.list_candidate_matches() == ["fdb://class=ea,step=0,number=0,param=167"]
+    assert _glob(obj) == {"n": ["0"]}
+
+
+@needs_raw
+def test_glob_wildcard_inside_value_and_constant_list(seeded_provider):
+    pattern = EA.replace("date=20200101", "date={year}0101")
+    obj = seeded_provider().object(f"fdb://{pattern},step=0/6,param={{p}}")
+    # the constant step list is copied verbatim: 4 fields give 2 candidates
+    assert _glob(obj) == {"year": ["2020", "2020"], "p": ["165", "167"]}
+
+
+@needs_raw
+@pytest.mark.parametrize(
+    "settings, query, missing",
+    [
+        ({}, "fdb://class={c},step={step}", "class"),
+        ({}, "fdb://expver=0001,step={step}", "class"),
+        ({"glob_required_keys": "class,expver"}, "fdb://class=ea,step={s}", "expver"),
+    ],
+    ids=["wildcard", "absent", "setting"],
+)
+def test_glob_required_keys_enforced(seeded_provider, settings, query, missing):
+    obj = seeded_provider(**settings).object(query)
+    with pytest.raises(
+        WorkflowError, match=f"needs constant values for {missing} \\(glob_required"
+    ):
+        obj.list_candidate_matches()
+
+
+@needs_raw
+def test_glob_required_keys_empty_allows_any_pattern(seeded_provider):
+    obj = seeded_provider(glob_required_keys="").object("fdb://class={c},stream=enda")
+    assert obj.list_candidate_matches() == ["fdb://class=ea,stream=enda"]
+
+
+@needs_raw
+def test_glob_invalid_value(seeded_provider):
+    obj = seeded_provider().object("fdb://class=zz,step={s}")
+    with pytest.raises(WorkflowError, match="Invalid MARS request"):
+        obj.list_candidate_matches()
+
+
+@needs_raw
+def test_glob_retries_transient_list_error(seeded_provider, monkeypatch):
+    provider = seeded_provider()
+    calls = _fail_once(monkeypatch, provider, "list")
+    assert len(provider.object(f"fdb://{EA},step={{s}}").list_candidate_matches()) == 3
+    assert len(calls) == 2

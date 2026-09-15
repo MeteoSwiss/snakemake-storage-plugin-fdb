@@ -627,7 +627,8 @@ class=od/expver=0001/stream=oper/date={date}/time=00/type=fc/levtype=sfc/step=0+
 
 - `request(q)`: `{key: value}` dict where a value with `/` is passed as the raw string
   (pyfdb splits on `/`, `pyfdb_type.py:65-68`), used for `inspect`/`retrieve`.
-- `selection(q, keys)`: subset of constant keys for `list` (glob).
+- `ParsedQuery.constant_pairs()`: the constant keys with raw values, the selection for
+  `list` (glob, §7.9).
 - `expand(q)` (`Backend.expand`): canonical expanded request via the internal
   `FDBToolRequest` (§2.3), parsed from its repr with a tolerant regex `^\t?(\w+)=(.*)$`
   per line (trailing `,` stripped). It returns `None` only when that internal API is
@@ -665,7 +666,7 @@ builder unwraps only `typing.Union` (`snakemake_interface_common/_common.py`
 | `store_check` | `Optional[str]`, `"strict"` | `strict`: the file must provide exactly the fields the query expands to; `warn`: fewer fields allowed (logged), more/foreign fields still an error. |
 | `canonical_spelling` | `Optional[str]`, `"warn"` | Runtime check of query values against FDB's canonical spelling (§7.12): `warn` (one warning per query), `error`, `ignore`. |
 | `remove_policy` | `Optional[str]`, `"warn"` | What `remove()` does: `warn` (no-op + one warning per query), `ignore` (silent no-op), `error` (raise). |
-| `glob_required_keys` | `Optional[str]`, `"class"` | Comma list of keys that must be constant in a `glob_wildcards` pattern (lower-cased; empty → none; invalid key names → error). |
+| `glob_required_keys` | `Optional[str]`, `"class"` | Comma list of keys that must be constant in a `glob_wildcards` pattern, i.e. present without a wildcard (lower-cased; empty → none; invalid key names → error at construction). A pattern violating it raises at glob time (§7.9). |
 | `eccodes_definitions` | `Optional[str]`, `None` | Colon-separated **plain directory paths** prepended, in order, to `ECCODES_DEFINITION_PATH` (each must be an existing directory, error naming the entry otherwise; made absolute; empty entries skipped; entries starting with `/MEMFS/`, eccodes' in-memory definitions, are passed as is). No aliases or site shorthands; how to obtain site definitions is documented per site (`docs/sites/meteoswiss.md`). |
 | `metkit_home` | `Optional[str]`, `None` | Exported (made absolute) as `METKIT_HOME` for a custom MARS language (e.g. extra enum values). Validated: `<dir>/share/metkit/language.yaml` must exist (otherwise FDB hangs, §2.6). Generic pass-through; the site recipe for building such a directory is documentation only. |
 | `key_order` | `Optional[str]`, `None` | Comma list overriding the canonical key order (§3.2). Default: derived from the FDB schema, else the generic rule. |
@@ -867,7 +868,8 @@ exponential wait from 3 s), copied with tenacity's `reraise=True`
 (`retry_decorator(f).retry_with(reraise=True)`, hence the direct `tenacity`
 dependency, §11),
 wraps only the FDB I/O calls, `StorageObject._inspect` and
-`StorageObject._retrieve_to`, which back `exists/mtime/size/retrieve_object/inventory`.
+`StorageObject._retrieve_to`, which back `exists/mtime/size/retrieve_object/inventory`,
+and `StorageObject._list`, which backs `list_candidate_matches` (§7.9).
 Errors raised by the plugin's own logic (invalid request from expansion, missing fields,
 spelling error, `FileNotFoundError` from `mtime`) are deterministic and not retried. After
 the last attempt, the attempt's own exception is raised instead of tenacity's
@@ -1148,14 +1150,35 @@ query covers every field of every index it touches; not planned for v1.
 
 ### 7.9 `list_candidate_matches()` (glob)
 
-1. Split the pattern's keys into constants and wildcard-bearing keys; require the keys
-   in `glob_required_keys` to be constant, else `WorkflowError`.
-2. `fdb.list({constant keys}, level=3)` (omitted keys act as wildcards, §2.3).
-3. For each element, emit `fdb://` + canonical-order `key=value` using the pattern's
-   constant text for constant keys and `combined_key()[k]` for wildcard keys; skip
-   elements lacking a pattern key or with an empty value for it; de-duplicate; return.
-   Values from FDB are canonical (`500011`, `icon-ch1-eps`, `time=0000`), so wildcard
-   constraints must match that form.
+Snakemake calls it on the pattern object built by `storage.<name>(...)` and matches
+`re.match(regex_from_filepattern(storage_object.query), candidate)` (§2.7), so every
+candidate is the pattern's normalised text (§3.2) with its wildcard-bearing values
+replaced.
+
+1. Split the pattern's keys into constants (`ParsedQuery.constant_pairs()`) and
+   wildcard-bearing keys (`wildcard_keys()`, including values that mix a wildcard with
+   literal text such as `date={year}0101`). Every key in `glob_required_keys` must be
+   constant; a required key that is a wildcard **or absent from the pattern** (both
+   would list everything under it) raises
+   `WorkflowError("FDB glob pattern <query> needs constant values for <keys> (glob_required_keys)")`
+   before any FDB I/O (`<keys>` comma-separated, in setting order).
+2. One `list(constant pairs, level=3)` on a fresh handle (§5), masked fields excluded.
+   Constant values are passed verbatim (lists, `to`/`by` ranges and aliases expanded by
+   metkit); keys absent from the pattern act as wildcards (§2.3). The call is
+   `StorageObject._list`, retried like `_inspect` (§6); pyfdb errors are mapped (§6),
+   e.g. `class=zz` → "Invalid MARS request". No canonical-spelling check runs.
+3. For each element: if any wildcard-bearing key is missing from `combined_key()` or
+   listed with an empty value (optional keys: absent under `tests/data/schema`, `''`
+   under the varda schema, e.g. `number` of `cf` fields), skip it. Otherwise emit
+   `fdb://` + the pattern's pairs in canonical key order, with the pattern's constant
+   text for constant keys and `combined_key()[k]` for wildcard-bearing keys. Keys absent
+   from the pattern do not appear, so fields that differ only in such keys (or only
+   within a constant list) give the same candidate.
+4. Return the de-duplicated candidates, sorted as strings. Snakemake's regex then
+   extracts the wildcard values (a mixed value such as `date={year}0101` matches when
+   the listed value fits; a candidate that does not fit a constraint is dropped by
+   Snakemake). Values from FDB are canonical (`500011`, `icon-ch2-eps` lower-case,
+   `time=0000`), so wildcard constraints must match that form.
 
 ### 7.10 `touch()`
 
@@ -1207,7 +1230,9 @@ expansion (§7.7) covers this case too.
 | multi-message file with duplicates | store error |
 | local output file not GRIB (e.g. `TestStorageBase`'s `test` text) | store error "not GRIB" |
 | FDB unreachable / bad config | `WorkflowError("FDB configuration error ...")` at first use, not at provider construction |
-| `class=zz` typo | `WorkflowError` (invalid request), not "missing" |
+| `class=zz` typo | `WorkflowError` (invalid request), not "missing"; the same for a glob pattern |
+| glob pattern with `class={c}` or without `class` (default `glob_required_keys`) | `WorkflowError("FDB glob pattern <query> needs constant values for class (glob_required_keys)")` before any FDB I/O (§7.9) |
+| glob `number={n}` over fields without `number` (control members, single-rule schema) | those fields are skipped; no candidate, no error (§7.9) |
 | `model=icon-ch1-eps` without `metkit_home` | `WorkflowError("Invalid MARS request ... cannot expand 'icon-ch1-eps' ...")` with a hint to set `metkit_home` |
 | very long value list (> 255 bytes component) | hashed component (constant) / error (wildcard) |
 | `inspect` on legacy index (timestamp 0) | `os.stat` fallback |
@@ -1377,7 +1402,18 @@ four `.raw` files plus derived variants. `ECKIT_EXCEPTION_IS_SILENT=1` is set in
   `time=0`/`00`: listed as `param=167`/`time=0000`, found and retrieved by the canonical
   query), `test_store_identifier_verbatim_without_expansion`, `test_store_identifier_key_absent_from_message_takes_query_value`; the
   guard and partial-archive tests set `archive_mode=identifier` explicitly; site suite
-  `tests/sites/meteoswiss/test_write.py::test_write_identifier_param_mismatch`. Glob: `test_glob` (step 7). Also `test_mtime_timestamp_fallback_os_stat`,
+  `tests/sites/meteoswiss/test_write.py::test_write_identifier_param_mismatch`. Glob
+  (plan step 7): `test_glob_step_candidates_match_pattern` (plain and constrained
+  wildcard; candidates match `regex_from_filepattern` and Snakemake's `glob_wildcards`),
+  `test_glob_keys_absent_from_pattern_collapse`, `test_glob_skips_fields_without_the_wildcard_key`,
+  `test_glob_wildcard_inside_value_and_constant_list`, `test_glob_required_keys_enforced`
+  (wildcard, absent, setting), `test_glob_required_keys_empty_allows_any_pattern`,
+  `test_glob_invalid_value`, `test_glob_retries_transient_list_error` (`_fail_once`,
+  shared with `test_exists_retries_transient_inspect_error`); site suite
+  `tests/sites/meteoswiss/test_glob.py`
+  (`test_glob_members`: candidates are the pattern with the member substituted,
+  `test_glob_members_skip_control`, `test_glob_params_are_canonical_cosmo_ids`,
+  `test_glob_model_is_listed_lower_case`). Also `test_mtime_timestamp_fallback_os_stat`,
   `tests/test_backend.py::test_config_forms` and `::test_map_error_table`,
   `test_canonical_spelling_warns_once`/`_error_raises`/`_silent` (`param=2t` vs
   `167` → warning text; `error` policy raises; ranges exempt).

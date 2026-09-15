@@ -518,15 +518,35 @@ Commands: `uv run pytest -q`;
 
 ## Step 7 — Glob (`list_candidate_matches`)
 
-Files: `__init__.py`, `tests/test_plugin.py` (`needs_raw`).
+Files: `__init__.py` (`list_candidate_matches`, retried `_list`), `tests/test_plugin.py`
+(`needs_raw`), `tests/sites/meteoswiss/test_glob.py`. [done: <pending commit>]
 
-Acceptance: pattern with `step={step}` against the fixture → candidates for steps
-0/6/12, each matching `regex_from_filepattern(pattern)`; `glob_required_keys`
-enforcement; elements with empty values for a pattern key are skipped;
+Implement spec §7.9: required keys constant (wildcard or absent → error), one `list` of
+the constant pairs, candidates from the pattern's pairs with listed values for
+wildcard-bearing keys, sorted and de-duplicated.
+
+Acceptance: pattern with `step={step}` (also `{step,\d+}`) against the fixture →
+candidates for steps 0/6/12, and Snakemake's `glob_wildcards` on the storage-object
+pattern (which matches them against `regex_from_filepattern(pattern)`) returns them
+(`test_glob_step_candidates_match_pattern`); keys absent from the pattern collapse
+(`test_glob_keys_absent_from_pattern_collapse`); elements lacking a pattern key or with
+an empty value for it are skipped (`test_glob_skips_fields_without_the_wildcard_key`);
+a wildcard inside a value (`date={year}0101`) with a constant list
+(`test_glob_wildcard_inside_value_and_constant_list`); `glob_required_keys` enforcement
+for a wildcard, an absent key and a setting value (`test_glob_required_keys_enforced`),
+empty setting allows any pattern (`test_glob_required_keys_empty_allows_any_pattern`);
+`class=zz` → invalid request (`test_glob_invalid_value`); a transient `list` failure is
+retried (`test_glob_retries_transient_list_error`, sharing `_fail_once` with the
+`exists` retry test);
 **site suite (required):** `tests/sites/meteoswiss/test_glob.py` — pattern
 `...,type=pf,number={member},step=6,param=500011` over the archived OGD members →
-candidates with `number=1` and `number=2`; a `param={p}` pattern yields COSMO ids
-(`500011`, `500041`) as canonical strings.
+the two candidates are the normalised pattern with `member` 1 and 2 substituted
+(`apply_wildcards`; `test_glob_members`); without `type` (`number={member,\d+}`) the cf
+fields (`number=''`) are skipped (`test_glob_members_skip_control`); a `param={p}`
+pattern yields COSMO ids (`500011`, `500041`) as canonical strings
+(`test_glob_params_are_canonical_cosmo_ids`); `model={model}` yields lower-case
+`icon-ch2-eps` (`test_glob_model_is_listed_lower_case`). Values are checked through
+Snakemake's `glob_wildcards` in the subprocess.
 
 Commands: `uv run pytest tests/test_plugin.py -q -k glob`;
 `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k glob -q`.
@@ -677,23 +697,37 @@ Stdlib `urllib` + `eccodes` only, no curl/jq. Reproduces the samples of spec §2
 ```python
 STAC = "https://data.geo.admin.ch/api/stac/v1/search"
 
+
 def search(collection, variable, perturbed, horizon, reference_datetime=None):
-    body = {"collections": [collection], "forecast:variable": variable,
-            "forecast:perturbed": perturbed, "forecast:horizon": horizon}
+    body = {
+        "collections": [collection],
+        "forecast:variable": variable,
+        "forecast:perturbed": perturbed,
+        "forecast:horizon": horizon,
+    }
     if reference_datetime:
         body["forecast:reference_datetime"] = reference_datetime
-    req = urllib.request.Request(STAC, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        STAC,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     feats = json.load(urllib.request.urlopen(req))["features"]
     # data is retained for 24 h only: without --reference-datetime take the newest feature
     feat = max(feats, key=lambda f: f["properties"]["forecast:reference_datetime"])
-    (asset,) = feat["assets"].values()          # exactly one asset per item
-    return feat["properties"]["forecast:reference_datetime"], asset["href"]   # pre-signed rgw.cscs.ch URL; GET only (HEAD returns an error body)
+    (asset,) = feat["assets"].values()  # exactly one asset per item
+    # pre-signed rgw.cscs.ch URL; GET only (HEAD returns an error body)
+    return feat["properties"]["forecast:reference_datetime"], asset["href"]
 
-def download(href) -> bytes: return urllib.request.urlopen(href).read()
+
+def download(href) -> bytes:
+    return urllib.request.urlopen(href).read()
+
 
 def subset_members(data: bytes, members: set[int]) -> bytes:
     # split with eccodes and keep messages whose perturbationNumber is in `members`
     ...
+
 
 # T_2M ctrl (1 msg), TOT_PREC ctrl (1 msg), T_2M perturb subset to members 1-2 (2 msgs)
 # -> .local/raw-full/meteoswiss/icon-ch2-eps_<YYYYMMDDHHMM>_step<h>_<var>_<ctrl|pert_mA-B>.grib2
