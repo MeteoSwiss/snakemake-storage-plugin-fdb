@@ -1,0 +1,2 @@
+param: Param; step: Step; date: Date; levelist: Double; expver: Expver; time: Time; number: Integer;
+[ class, expver, stream, date, time, domain? [ type, levtype [ step, quantile?, number?, levelist?, param ]] ]
