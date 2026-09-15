@@ -1,0 +1,894 @@
+# snakemake-storage-plugin-fdb — Implementation plan (revision 2)
+
+Companion to `spec.md`. Steps are ordered, small and independently testable; each lists
+the files it touches, acceptance criteria and the commands to run. Commands assume the
+repo root as cwd and `uv` on PATH (no `python` on PATH; always `uv run ...`). Set
+`UV_CACHE_DIR` to a writable location if the default cache is not writable (it was not
+on this node).
+
+**Test data is in git (decided).** `.raw/` (ECMWF samples `template.grib`,
+`quantile.grib`, `steprange.grib`, `synth11.grib`, `schema`) and `.raw/meteoswiss/` are
+committed. The MeteoSwiss OGD samples are committed as empty-data GRIB (constant field,
+`grid_simple`, `bitsPerValue=0`, 175–350 B each, MARS keys unchanged); full-size
+originals live in the git-ignored `.local/raw-full/meteoswiss/`. CI uses the in-repo
+samples; the fetch script only refreshes them. `compare.grib` is dropped. Tests still
+skip with a reason when data is absent. (Byte sizes quoted below for OGD files refer
+to the full-size originals.)
+
+**Version pins (decided: Option A, spec §11).** `pyfdb>=5.21.4.21,<5.22`,
+`eccodes>=2.47,<2.48` (bundled eccodes 2.47, same minor series as current site
+definitions). Required CI jobs use the locked 5.21.4.x stack; an optional
+`pyfdb-latest` canary runs 5.23 (step 11).
+
+**Site neutrality of the package, first-class MeteoSwiss support (spec §1 goals 5 and
+7).** Nothing MeteoSwiss-specific in `src/`: no keys/values, schemas, language patches,
+definitions aliases or ordering special cases — but the plugin must work end-to-end
+when the user supplies them via env vars/settings. Site material lives in
+`examples/meteoswiss/` and `docs/sites/`; the MeteoSwiss test suite under
+`tests/sites/meteoswiss/` is **required**: steps 5, 6, 7 and 9 are accepted only when
+it passes with the COSMO definitions set, and CI runs it (step 11). Enforced code
+location by `tests/test_no_site_specifics.py` and a CI grep (steps 0, 4, 10, 11).
+Site-suite prerequisites for local runs: `examples/meteoswiss/setup.sh`,
+`examples/meteoswiss/make_metkit_home.py`, `examples/meteoswiss/fetch_ogd_samples.py`,
+then export `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss`,
+`SMK_FDB_TEST_ECCODES_DEFINITIONS=.local/eccodes-cosmo-mars/definitions:<cosmo-resources defs>`,
+`SMK_FDB_TEST_METKIT_HOME=.local/metkit-home` (schema defaults to
+`examples/meteoswiss/realtime-varda.schema`).
+
+Layout (mirrors the current `poetry scaffold-snakemake-storage-plugin` output: `src/`
+layout, `tests/test_plugin.py`, ruff, release-please + conventional PRs):
+
+```
+pyproject.toml            hatchling build backend, uv-managed
+README.md, LICENSE, docs/intro.md, docs/further.md
+src/snakemake_storage_plugin_fdb/
+    __init__.py           StorageProviderSettings, StorageProvider, StorageObject
+    query.py              grammar, parser, normaliser, local suffix, request builders
+    backend.py            pyfdb access layer (config resolution, per-thread handles, inspect/list/retrieve/archive,
+                          timestamp, expansion, schema parsing, error mapping, canonical-spelling check)
+    grib.py               eccodes helpers (split messages, MARS keys, paramId)
+    guard.py              IdentifierGuard protocol, NoGuard, StrictGuard stub (reserved)
+tests/
+    conftest.py           temp FDB fixtures, derived GRIB variants, env setup, skip markers
+    test_query.py         unit tests (no FDB)
+    test_key_order.py     schema-derived / setting / generic key order (no FDB)
+    test_settings.py      settings validation (no FDB)
+    test_no_site_specifics.py   greps src/ for mch|meteoswiss|cosmo|icon-ch
+    test_grib.py          eccodes helpers
+    test_backend.py       backend against a temp FDB
+    test_plugin.py        TestStorageBase subclass + store/remove/glob tests
+    test_workflow.py      end-to-end snakemake run on example/
+    data/schema           extended pyfdb test schema (committed, 300 B)
+    sites/meteoswiss/     required site suite, configured via SMK_FDB_TEST_* env vars (conftest.py, test_read/write/glob/workflow/conventions.py)
+example/Snakefile, example/config.yaml               generic ECMWF-style example
+examples/meteoswiss/                                  everything MeteoSwiss, outside the package:
+    README.md, realtime-varda.schema, profile/config.yaml, Snakefile,
+    fetch_ogd_samples.py (OGD STAC API -> .raw/meteoswiss/, stdlib urllib + eccodes),
+    setup.sh (clone eccodes-cosmo-mars, pip install eccodes-cosmo-resources-python into .local/),
+    make_metkit_home.py (language.yaml recipe)
+docs/sites/meteoswiss.md
+scripts/init_dev_fdb.py            creates and seeds .fdb/ (generic)
+scripts/fetch_ecmwf_samples.py     downloads .raw/ files from ecmwf/fdb at a pinned commit
+.github/workflows/ci.yml, release-please.yml, conventional-prs.yml
+```
+
+---
+
+## Step 0 — Scaffold with uv
+
+Files: `pyproject.toml`, `README.md`, `LICENSE` (BSD-3-Clause), `src/snakemake_storage_plugin_fdb/__init__.py`
+(docstring only; provider classes arrive in step 4), `.gitignore` (add `.snakemake/`,
+`*.part`, `.local/`, `.fdb/`, `.venv/`, `__pycache__/`, `dist/`, and the personal
+work-tracking files `CLAUDE.local.md`, `WORK.md`; not `.raw/`, which is committed),
+`uv.lock` (committed), `[tool.ruff]`. [done: 9ec2639]
+
+```toml
+[project]
+name = "snakemake-storage-plugin-fdb"
+version = "0.1.0"
+description = "Snakemake storage plugin for ECMWF's Fields DataBase (FDB)"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Francesco Zanetta" }]
+dependencies = [
+  "snakemake-interface-common>=1.23,<2",
+  "snakemake-interface-storage-plugins>=4.4.1,<5",
+  "tenacity>=9.1.4,<10",           # used directly for the read-path retry policy (step 5); same bound as the interface
+  "pyfdb>=5.21.4.21,<5.22",        # Option A (spec §11); Option B: "pyfdb>=5.23.2.27,<6"
+  "eccodes>=2.47,<2.48",           # Option B: "eccodes>=2.48,<3"
+  "pyyaml>=6",
+]
+[dependency-groups]
+dev = ["snakemake>=9.27", "pytest>=8", "ruff", "coverage"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+packages = ["src/snakemake_storage_plugin_fdb"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["needs_raw: needs .raw/ ECMWF samples", "site_meteoswiss: MeteoSwiss site suite (env-configured; required in CI)"]
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+```
+
+Snakemake discovers the plugin by the module-name prefix `snakemake_storage_plugin_`.
+
+Acceptance: `uv sync` succeeds on Linux; `uv run python -c "import
+snakemake_storage_plugin_fdb"` works without loading `libfdb5`; `uv build` produces a
+wheel; `grep -riE 'mch|meteoswiss|cosmo|icon-ch' src/` finds nothing (also a
+`tests/test_no_site_specifics.py` from step 4 on).
+
+Commands: `uv sync`, `uv run ruff check . && uv run ruff format --check .`,
+`uv build`, `! grep -riE 'mch|meteoswiss|cosmo|icon-ch' src/`.
+
+## Step 1 — Query parser and local path (`query.py`) + unit tests
+
+Files: `src/snakemake_storage_plugin_fdb/query.py`, `tests/test_query.py`,
+`tests/test_key_order.py`, `tests/data/ecmwf-fdb-tests.schema` (ecmwf/fdb test schema
+at `63672ea`, key-order fixture). [done: a87afaf]
+
+```python
+class QueryError(ValueError)                              # every parse/order/local-path error
+SCHEME = "fdb://"; SUFFIX = ".grib"; NAME_MAX = 255; HASH_CHARS = 24
+
+@dataclass(frozen=True)
+class ParsedQuery:
+    pairs: tuple[tuple[str, str], ...]        # canonical key order, values verbatim
+    def keys(self) -> list[str]
+    def value(self, key) -> str               # raw "a/b/c"
+    def items(self, key) -> list[str]         # split on "/" outside wildcard tokens
+    def has_wildcards(self) -> bool
+    def wildcard_keys(self) -> set[str]
+    def constant_pairs(self) -> dict[str, str]
+    def single_valued(self) -> dict[str, str] # keys with exactly one literal item, no wildcard
+    def has_range(self, key) -> bool          # "to"/"by" present (case-insensitive)
+    def to_query(self) -> str
+    def to_request(self) -> dict[str, str]    # raw values, wildcard text included
+    def local_suffix(self) -> str             # raises QueryError (long wildcard component)
+    def oversized_components(self) -> list[tuple[str, int]]   # (key, bytes) over NAME_MAX; added in step 4 (wildcard guard)
+
+def parse(query: str, order: KeyOrder | None = None) -> ParsedQuery   # None -> KeyOrder.generic(); raises QueryError
+def normalize(query: str, order: KeyOrder | None = None) -> str       # purely syntactic (spec §3.2)
+def validate(query: str) -> tuple[bool, str | None]     # order-independent
+GENERIC_ORDER = ["class", "expver", "stream", "domain", "date", "time", "type", "levtype", "levelist", "step", "number", "param"]
+@dataclass(frozen=True)
+class KeyOrder:                                          # keys: tuple[str, ...]; unknown keys alphabetical
+    @classmethod
+    def from_setting(cls, csv: str); from_schema(cls, schema_text: str); generic(cls)   # QueryError on invalid/duplicate/empty
+    def sort_key(self, key: str) -> tuple[int, str]
+    def sorted(self, keys: Iterable[str]) -> list[str]
+```
+
+Acceptance: acceptance/rejection table (≥ 30 cases; values are generic MARS
+spellings — uppercase shortnames, `10m` steps, hyphenated enum values — with no site
+names in test data); `normalize` idempotent, metkit-free (a subprocess that imports
+`query` and normalises a query has none of `pyfdb`/`eccodes`/`gribapi` in
+`sys.modules`); order from setting / schema / generic
+(`tests/test_key_order.py`: a schema text with `?`, `?default`, `-` and two rule groups
+gives first-appearance order, plus `.raw/schema` when present; `#` comments to end of
+line are skipped, as eckit's `StreamParser` does (spec §3.2): a comment block with
+brackets and commas, a trailing `# comment` after a rule, and the full ecmwf/fdb
+`tests/fdb/etc/fdb/schema` copied to `tests/data/ecmwf-fdb-tests.schema`; unknown keys
+alphabetical); wildcard atoms with
+constraints verbatim; `/`→`+`; `.grib` suffix; component hashing; commutation property
+over a table of (query, wildcard values) using `snakemake.io.apply_wildcards`.
+
+Commands: `uv run pytest tests/test_query.py tests/test_key_order.py -q`.
+
+## Step 2 — GRIB helpers (`grib.py`) + tests
+
+Files: `src/snakemake_storage_plugin_fdb/grib.py`, `tests/test_grib.py` (marked
+`needs_raw` where `.raw` files are used; the synthetic parts run always),
+`tests/sites/meteoswiss/{conftest.py,test_conventions.py}` (site gating for samples +
+definitions, sample MARS keys; extended in steps 5–10). [done: d22d77e]
+
+```python
+class GribError(ValueError)                     # not GRIB, non-GRIB bytes, undecodable/truncated message
+@dataclass(frozen=True)
+class GribMessage: offset: int; length: int; data: bytes; mars: dict[str, str]; param_id: str
+def split_messages(path: str | os.PathLike[str]) -> list[GribMessage]
+    # NUL padding between/after messages allowed (GRIB1 120-byte records, spec §2.1);
+    # any other byte outside a message -> GribError("... trailing non-GRIB bytes at offset N" /
+    # "... non-GRIB bytes at offset N"); no message -> GribError("<path> is not GRIB ...")
+def mars_keys(msg: bytes) -> tuple[dict[str, str], str]   # (mars namespace, paramId); GribError if not GRIB/truncated
+def variant(template: bytes, zero_values: bool = True, **keys: Any) -> bytes   # GribError on unknown key
+```
+
+`eccodes` is imported lazily inside the functions (importing `grib` loads no native
+library); `ECCODES_DEFINITION_PATH` is never read or modified. The provider maps
+`GribError` to `WorkflowError` (steps 6, spec §6).
+
+Acceptance: `.raw` files → 1 message each with the keys and paramId of spec §2.1,
+`data` byte-exact, trailing NUL padding accepted; two concatenated (padded) files → 2
+with correct offsets; NUL padding between messages accepted; `template + b"GARBAGE"`,
+bytes between/before messages, truncated messages, `b"test"`, empty file → `GribError`;
+importing `grib` does not load `eccodes`; `variant()` with zeroed values ≈ 236 bytes; a
+GRIB2 message built from eccodes' `GRIB2` sample with `centre=215` decodes (`mars_keys`
+returns at least date/time/step/levtype/param); the 2-message
+`.raw/meteoswiss/...pert_m1-2.grib2` splits into messages at offsets 0/175 without site
+definitions; **site suite**: `tests/sites/meteoswiss/test_conventions.py` decodes the
+OGD samples in a subprocess with `ECCODES_DEFINITION_PATH` prepended from
+`SMK_FDB_TEST_ECCODES_DEFINITIONS` and gets `class=od stream=enfo expver=0001
+model=ICON-CH2-EPS levtype=sfc step=6`, `type=cf`/`pf`, `number=1/2` (pf only),
+`param`/paramId `500011`/`500041`, `timespan=none`/`fs`, `date`/`time` from the file name.
+
+Commands: `uv run pytest tests/test_grib.py -q`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k conventions -q`.
+
+## Step 3 — Backend (`backend.py`) + tests against a temp FDB
+
+Files: `src/snakemake_storage_plugin_fdb/backend.py`, `tests/conftest.py`,
+`tests/test_backend.py`, `tests/data/schema`. [done: 78a2fb1]
+
+```python
+ConfigValue = Path | str | dict[str, Any] | None
+@dataclass(frozen=True)
+class Field: key: dict[str, str]; length: int; timestamp: int; uri_path: str | None   # length 0 / uri_path None below level 3
+@dataclass(frozen=True)
+class SchemaInfo: keys: tuple[str, ...]; optional: frozenset[str]; removed: frozenset[str]; defaults: dict[str, str]
+def resolve_config(value: str | None) -> Path | str | None   # existing file -> Path, inline YAML/JSON mapping -> str, else WorkflowError
+def resolve_schema_path(config: ConfigValue, env: Mapping[str, str] | None = None) -> Path | None   # no pyfdb (spec §5); None if not an existing file
+def parse_schema(schema_text: str) -> SchemaInfo            # keys == KeyOrder.from_schema(text).keys; QueryError without rule keys
+def fallback_expand(request: Mapping[str, str]) -> dict[str, list[str]]   # "/" lists, integer and YYYYMMDD to/by ranges (spec §3.4)
+def count_fields(expanded: Mapping[str, list[str]]) -> int   # E = prod of distinct values per key (used by expected_count and the storage object)
+def map_error(exc: BaseException, query: str, local: str | PathLike | None = None) -> WorkflowError | None   # spec §6; None -> re-raise
+class Backend:                                               # methods propagate pyfdb RuntimeErrors; callers use map_error
+    def __init__(self, config: ConfigValue = None, user_config: ConfigValue = None,
+                 logger: logging.Logger | None = None, schema_info: SchemaInfo | None = None)
+    def handle(self) -> pyfdb.FDB                            # archiving handle, threading.local; pyfdb imported here
+    def reader(self) -> pyfdb.FDB                            # fresh handle per inspect/list/retrieve (stale catalogue, spec §2.4; added in step 6)
+    def inspect(self, request: Mapping[str, str]) -> list[Field]
+    def list(self, selection: Mapping[str, str], level: int = 3, include_masked: bool = False) -> list[Field]
+    def retrieve_to(self, request, dest: str | PathLike, expected: int | None = None) -> int   # <dest>.part, fsync, os.replace
+    def archive(self, data: bytes, identifier: Mapping[str, str] | None = None) -> None
+    def flush(self) -> None
+    def expand(self, request) -> dict[str, list[str]] | None  # internal FDBToolRequest; None if unavailable; invalid -> RuntimeError
+    def expected_count(self, request) -> int                  # count_fields(expand()); fallback_expand when expand() is None
+    def spelling_diffs(self, parsed: ParsedQuery, expanded: Mapping[str, list[str]] | None = None) -> list[tuple[str, str, str]]
+                                                              # (key, given, canonical), canonical key order; `expanded` = expansion of
+                                                              # parsed.constant_pairs() if the caller has it (avoids a second expansion)
+    @staticmethod
+    def timestamp_of(element: object) -> int
+```
+
+`conftest.py`: `os.environ.setdefault("ECKIT_EXCEPTION_IS_SILENT", "1")` before any
+plugin import; `fdb_config(root, schema=tests/data/schema)`; session-scoped
+`seeded_fdb` under `tmp_path_factory` (skips without `.raw/`): the four `.raw` files
+archived natively plus zeroed `class=ea,stream=oper` variants of `template.grib` for
+step 0/6/12 × param 167/165 (≈ 12 KB); function-scoped `empty_fdb` factory.
+`needs_raw` is defined per test module (as in `tests/test_grib.py`). No site-suite
+additions in this step (no site acceptance item); backend use under the varda schema is
+exercised by steps 5–7.
+
+Acceptance:
+- `inspect` returns 4 fields for the 2×2 request; timestamps between flush start and
+  end (within 1 s); aliases/`to`/`by` find 3 fields; missing combinations are omitted;
+- `expand({"param": "2t/165", "step": "0/to/12/by/6", "date": "2020-01-01"})` →
+  `{"param": ["167","165"], "step": ["0","6","12"], "date": ["20200101"]}`; an invalid
+  request raises; fallback path unit-tested by monkeypatching the import to fail
+  (`expand` → `None`, `expected_count` via `fallback_expand`, `spelling_diffs` → `[]`);
+- `spelling_diffs` for `param=2t,class=EA,step=0/to/6/by/6` → `[("class","EA","ea"),("param","2t","167")]` (canonical key order; range exempt);
+- `retrieve_to` writes exactly `sum(length)` bytes in request order, replaces an
+  existing file, and on error or byte-count mismatch leaves no `.part` and the
+  destination untouched;
+- `parse_schema` on `tests/data/schema` → ordered keys, optional {domain, quantile,
+  number, levelist}; on an inline schema text using `key-`, `key?default` and two rule
+  groups → removed/defaults/order as expected (no site schema file in `tests/data/`);
+- `resolve_schema_path(config)` finds the schema for inline YAML, a config file, a
+  dict, and the `FDB_CONFIG`/`FDB5_CONFIG`/`FDB_CONFIG_FILE`/`FDB5_CONFIG_FILE`/
+  `FDB_HOME` (`config.yaml`/`config.json`, `~fdb`)/`FDB_SCHEMA_FILE` fallbacks; a
+  subprocess importing `backend` and calling the pure helpers loads no
+  `pyfdb`/`eccodes`;
+- `map_error` table from spec §6 (5.21.4.23 strings); `resolve_config` forms;
+  `class=zz` → invalid request; missing schema file / root → configuration error at
+  first use, not at construction; identifier archive + masking visible with
+  `include_masked=True`; one handle per thread.
+
+Commands: `uv run pytest tests/test_backend.py -q`.
+
+## Step 4 — Settings, guard hook and provider (`__init__.py`, `guard.py`)
+
+Files: `src/snakemake_storage_plugin_fdb/__init__.py`, `src/snakemake_storage_plugin_fdb/guard.py`,
+`src/snakemake_storage_plugin_fdb/query.py` (`oversized_components`), `tests/conftest.py`
+(`clean_env`, `make_provider` fixtures), `tests/test_settings.py`, `tests/test_plugin.py`
+(provider part), `tests/test_no_site_specifics.py`. [done: d1320ff]
+
+```python
+# guard.py
+IDENTIFIER_CHECKS = ("none", "strict")
+class IdentifierMismatch(ValueError): __init__(self, message_index: int, key: str, identifier_value: str, grib_value: str | None)
+@runtime_checkable
+class IdentifierGuard(Protocol): def check(self, message: GribMessage, identifier: Mapping[str, str], query: ParsedQuery) -> None
+class NoGuard                                   # check() returns None
+class StrictGuard                               # __init__ raises NotImplementedError("identifier_check=strict is reserved")
+def make_guard(settings) -> IdentifierGuard     # None/"none" -> NoGuard; "strict" -> StrictGuard() (raises); else ValueError
+# __init__.py
+@dataclass
+class StorageProviderSettings(StorageProviderSettingsBase)   # spec §4 fields, typing.Optional[str]
+class StorageProvider(StorageProviderBase):
+    # attributes: archive_mode, store_check, canonical_spelling, remove_policy, glob_required_keys,
+    #             config, user_config, schema_path, schema_info, key_order, backend, guard
+    def postprocess_query(self, query) -> str   # normalize(query, key_order); records result; invalid -> unchanged
+    def is_normalised(self, query) -> bool      # recorded by postprocess_query (spec §3.3)
+class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
+    parsed: ParsedQuery                         # property, cached per query text; WorkflowError if invalid
+    def local_suffix(self) -> str               # other abstract methods: NotImplementedError until steps 5-7
+```
+
+- `StorageProviderSettings` per spec §4 (incl. `identifier_check`, `canonical_spelling`,
+  `eccodes_definitions` as plain paths, `metkit_home`, `key_order`, `env`). No aliases,
+  no site names.
+- `tests/test_no_site_specifics.py`: walks `src/` and fails on
+  `re.search(r"mch|meteoswiss|cosmo|icon-ch", text, re.I)` in any file.
+- `guard.py`: `IdentifierGuard` protocol, `IdentifierMismatch` exception, `NoGuard`,
+  `StrictGuard` whose `__init__` raises `NotImplementedError("reserved")`, and
+  `make_guard(settings) -> IdentifierGuard` (returns `NoGuard()` for `none`).
+- `StorageProvider.__post_init__`: settings validation (reject `identifier_check` other
+  than `none` with the spec's message), env export (`ECKIT_EXCEPTION_IS_SILENT`
+  setdefault, `env` overrides, `ECCODES_DEFINITION_PATH` from the plain-path list,
+  `METKIT_HOME` with `language.yaml` check), schema path resolution + `KeyOrder`
+  (before any lazy import), lazy import, `Backend`, `self.guard`.
+- `example_queries`, `is_valid_query`, `postprocess_query`, rate-limiter methods,
+  `safe_print`.
+- Over-long substituted wildcard guard (spec §3.3): `postprocess_query` records the
+  normalised queries; `StorageObject.__post_init__` raises `WorkflowError` if its query
+  was not recorded and `local_suffix()` hashes a component. Verify the job-process
+  assumption (Snakefile re-parsed → constant queries recorded) against the snakemake
+  source and note the result in the spec. Result: verified, no alternative needed
+  (spec §3.3).
+
+Acceptance:
+- `is_valid_query` accepts the example queries and wildcard forms, rejects `s3://x`,
+  `test/x.txt`, `fdb://class=od/expver=0001`, `fdb://`, `fdb://a=`;
+- `uv run snakemake --help` lists all `--storage-fdb-*` options;
+- `identifier_check="strict"` → `WorkflowError` mentioning "reserved"; `NoGuard.check`
+  never raises; `StrictGuard()` raises `NotImplementedError`;
+- environment precedence (spec §4.1): with `ECCODES_DEFINITION_PATH=/x` pre-set and
+  `eccodes_definitions="<a>:<b>"` (existing temp directories) the process ends with
+  `<a>:<b>:/x`, unchanged by a second identical provider; without the setting
+  the env is untouched; `METKIT_HOME` pre-set and no setting → untouched; `config`
+  given → `FDB_CONFIG`/`FDB_CONFIG_FILE`/`FDB_HOME` left as they were; `env="FDB_HOME=/y"`
+  overrides;
+- `metkit_home` without `share/metkit/language.yaml` → error at construction;
+  `eccodes_definitions` with a non-existent directory → error naming it;
+  `key_order="date,time,class"` reorders a query accordingly; a provider whose config
+  names `tests/data/schema` orders keys as the schema does;
+- `tests/test_no_site_specifics.py` passes;
+- provider with an unreachable FDB does not raise until first I/O;
+- a pattern `fdb://...,param={p}` whose substituted value makes the `param` component
+  exceed 255 bytes → `WorkflowError` at object construction; a constant over-long list
+  query that went through `postprocess_query` is hashed without error.
+
+Commands: `uv run pytest tests/test_settings.py tests/test_plugin.py -q -k "valid or example or settings or guard"`.
+
+## Step 5 — Read path
+
+Files: `__init__.py`, `backend.py` (`count_fields`, `spelling_diffs(parsed, expanded=None)`),
+`pyproject.toml`/`uv.lock` (`tenacity` declared), `tests/test_plugin.py` (`needs_raw`),
+`tests/conftest.py` (`clean_env` also resets the spelling-warning set),
+`tests/sites/meteoswiss/{conftest.py,test_conventions.py,test_read.py}` (`mch_schema`,
+`metkit_home`, `mch_sample` fixtures; read suite). [done: 4d67ebe]
+
+`_fields()` (one `inspect`, not cached, spec §6), `exists()` (all combinations),
+`mtime()` with `os.stat` fallback, `size()`,
+`checksum() -> None`, `retrieve_object()`, `inventory()`, `get_inventory_parent() ->
+None`, `cleanup()` (replacing the step-4 `NotImplementedError` stubs; `local_suffix()`
+and `parsed` exist since step 4); the canonical-spelling check (spec §7.12) runs
+once per object when `expand()` is first computed (`_expanded()`, cached per query
+text; the same expansion is handed to `spelling_diffs`, so metkit expands once per
+object); the FDB I/O helpers `_inspect`/`_retrieve_to` behind
+`exists/mtime/size/retrieve_object` are wrapped with
+`retry_decorator(f).retry_with(reraise=True)` (`_retry_fdb_io`: the interface's
+policy, the last attempt's own exception surfaced; deterministic plugin errors are not
+retried, spec §6); pyfdb errors are mapped in the `_mapping_errors(local=None)` context
+manager (`map_error`, spec §6).
+
+Acceptance:
+- `TestStorageRead(TestStorageBase)` (`retrieve_only=True, delete=False, files_only=True`)
+  passes `test_storage` and `test_storage_not_existing`;
+- 3 of 4 fields present → `exists() is False`; `retrieve_object()` names the missing one;
+  no field found → the error lists the optional schema keys the query omits; `class=zz`
+  → invalid request; a wildcard query → error; a transient `inspect` failure is retried;
+- `mtime()` float within 1 s of the fixture flush; monkeypatched `timestamp=0` →
+  `os.stat` value;
+- `inventory()` fills exists/mtime/size for `cache_key()` only (mtime/size only when it
+  exists), with one `inspect`, never `checksum`;
+- `test_canonical_spelling`: `param=2t` query logs exactly one warning containing
+  `canonical: 167`; `canonical_spelling="error"` raises; `ignore` is silent; a `to/by`
+  step range triggers nothing; local path unchanged by the check;
+- **site suite (required):** `tests/sites/meteoswiss/test_read.py` — with the COSMO
+  definitions, varda schema and metkit home from the env vars, `exists/mtime/size/
+  retrieve_object` on the OGD samples pre-archived into a temp FDB (`cf` T_2M,
+  `cf` TOT_PREC with `timespan=fs`, `pf` members 1/2) pass; `number=1/to/3` →
+  `exists()` False; TOT_PREC without `timespan` → `exists()` False; without `metkit_home` the `model` request is an invalid-request
+  error. FDB access runs in subprocesses (definitions and MARS language must be set
+  before the libraries load; metkit reads the language once per process), configured
+  once by the `eccodes_definitions`/`metkit_home` settings and once by plain
+  `ECCODES_DEFINITION_PATH`/`METKIT_HOME` (`test_read_samples[settings|env]`,
+  `test_read_model_requires_metkit_home`).
+
+Commands: `uv run pytest tests/test_plugin.py -q -k "Read or exists or mtime or retrieve or inventory or spelling"`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k read -q`.
+
+## Step 6 — Write path (with the guard hook wired, not implemented)
+
+Files: `__init__.py`, `backend.py` (`reader()`: fresh handle per read, spec §2.4/§5),
+`query.py` (`comparable`, `INT_RE` shared with `backend.py`), `tests/test_plugin.py`
+(`needs_raw`), `tests/test_query.py` (`test_comparable`), `tests/test_backend.py`
+(stale-read regression), `tests/conftest.py` (`clean_env` resets `_REMOVE_WARNED`;
+`fdb_config_file` factory), `tests/sites/meteoswiss/{conftest.py,test_read.py,test_write.py}`
+(`run_site`, `mch_fdb_config`, `mch_query_base` fixtures shared by the read and write
+suites). [done: 4cc11ee]
+
+Implement spec §7.7 (count check, identifier and native modes, pre-check, duplicates,
+**guard call site** `self.provider.guard.check(msg, identifier, parsed)` for every
+message before the first `archive()`, post-check with `t_start`, `store_check`) and §7.8
+(`remove_policy`). Everything checkable from the file fails before any `archive()`
+("nothing was archived"); only the post-check and archive failures leave fields behind,
+and their messages say so.
+
+Acceptance:
+- store a 3-message file matching `step=0/6/12,param=167` → `exists()`, `mtime() >=
+  t_start`, `size()` = sum of message lengths (= file size for unpadded input; smaller
+  for NUL-padded GRIB1, spec §7.2), retrieve after deleting the local copy gives the same
+  message keys; both archive modes (`test_store_roundtrip`);
+- `template.grib` (`enda`, `number=0`) stores in identifier mode under
+  `tests/data/schema` **and** under `.raw/schema` (number dropped); native mode under
+  `.raw/schema` raises the mapped schema error (`test_store_template`);
+- strict, both modes: 2 of 3 fields → error; foreign field → error (identifier: pre-check
+  before archiving; native: post-check); duplicate → error; trailing garbage → error;
+  text file → "not GRIB" (`test_store_strict_rejects`);
+- warn: 2 of 3 fields → warning, `exists()` False afterwards; foreign field still error
+  (`test_store_warn_fewer_fields`);
+- a test guard (`RecordingGuard`) injected via `provider.guard` sees every message with
+  its identifier **before** any archive call; a guard raising `IdentifierMismatch` on
+  message 2 leaves FDB unchanged (`inspect` empty) and surfaces as `WorkflowError`
+  (`test_store_guard_*`);
+- masking: `mtime()` increases, new bytes retrieved, `include_masked=True` shows 2
+  (`test_store_masking_rerun`; needs fresh read handles, spec §2.4);
+- a failing second `archive()` → error saying 1 of 3 calls succeeded and the fields stay
+  in FDB, no retry; wildcard query rejected;
+- `remove()` policies (`test_remove_policy`); 4 threads storing 4 distinct outputs
+  concurrently (`test_store_threads`);
+- **site suite (required):** `tests/sites/meteoswiss/test_write.py` — store the OGD
+  ctrl T_2M file (native and identifier mode) under the varda schema via
+  `fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=<d>,time=<t>,type=cf,levtype=sfc,step=6,param=500011`;
+  listed keys have `domain=''` (removed by `domain-`, spec §2.8), `number=''`,
+  `timespan=none`, `model=icon-ch2-eps`; retrieve is byte-identical to the sample file
+  (`test_write_ctrl[native|identifier]`); the 2-member file via `type=pf,number=1/2`
+  (`test_write_members`); strict `store_check` rejects the 2-member file stored as
+  `number=1/3` (identifier: pre-check, nothing archived; native: post-check, member 1
+  left in FDB; `test_write_strict_rejects_foreign_member`); `remove_policy=warn` logs
+  once per query and deletes nothing (`test_write_remove_policy_warn`). Configured
+  through the `eccodes_definitions`/`metkit_home` settings, in subprocesses.
+
+Commands: `uv run pytest tests/test_plugin.py -q -k "store or remove or thread or guard"`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k write -q`.
+
+(Step 6 was accepted with `identifier` as the default archive mode; step 6a changes
+the default to `native`, and the identifier-specific tests above now set
+`archive_mode=identifier` explicitly.)
+
+## Step 6a — Default archive mode and single-value identifier check
+
+Files: `__init__.py` (`archive_mode` default `native` and help; `_allowed_values`/
+`_precheck` cover single-valued keys, keys with items of mixed kind dropped up front;
+`_canonical_single_values`: identifier values from the query spelled as in the
+object's expansion; `_expanded()` logs a missing metkit expansion once, for the
+spelling check and identifier mode alike), `query.py` (`comparable`: one- or
+two-digit `time` as hours, `date` only as `YYYYMMDD`), `tests/test_settings.py`,
+`tests/test_query.py`, `tests/test_plugin.py` (`_stored_key` helper),
+`tests/sites/meteoswiss/test_write.py`.
+Decisions of 2026-09-15, reversible (spec §7.7). [done: 15b7031]
+
+Acceptance:
+- default settings → `archive_mode == "native"`; `snakemake --help` shows it;
+- `synth11.grib` under `tests/data/ecmwf-fdb-tests.schema` stores and reads back with
+  default settings; with `archive_mode=identifier` it fails with "cannot determine"
+  (`test_store_default_native_under_multi_rule_schema`);
+- identifier mode: a single-valued `step`/`param` that contradicts message 2 → error
+  naming key, both values, message index and file, "nothing was archived", FDB empty
+  (`test_store_identifier_single_value_mismatch`); `param=167` and `param=167.128` vs
+  GRIB `167.128` store and, like `time=0`/`00`, are archived in canonical spelling (`param=167`,
+  `time=0000`) and found and retrieved by the canonical query, post-check included
+  (`test_store_identifier_archives_canonical_spelling`); without expansion the value
+  stays verbatim with a debug log (`test_store_identifier_verbatim_without_expansion`); `quantile=1:10` for a GRIB without `quantile` labels the field
+  (`test_store_identifier_key_absent_from_message_takes_query_value`);
+- both modes stay covered (`test_store_roundtrip`, `test_store_strict_rejects`,
+  `test_store_warn_fewer_fields`, `test_store_template`); guard and partial-archive
+  tests set `archive_mode=identifier`;
+- **site suite:** `test_write_identifier_param_mismatch` (ctrl T_2M stored as
+  `param=500041` → error, nothing archived); all step 5/6 site tests still pass.
+
+Commands: `uv run pytest -q`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q`;
+`uv run snakemake --help | grep -A3 -- --storage-fdb-archive-mode`.
+
+## Step 7 — Glob (`list_candidate_matches`)
+
+Files: `__init__.py`, `tests/test_plugin.py` (`needs_raw`).
+
+Acceptance: pattern with `step={step}` against the fixture → candidates for steps
+0/6/12, each matching `regex_from_filepattern(pattern)`; `glob_required_keys`
+enforcement; elements with empty values for a pattern key are skipped;
+**site suite (required):** `tests/sites/meteoswiss/test_glob.py` — pattern
+`...,type=pf,number={member},step=6,param=500011` over the archived OGD members →
+candidates with `number=1` and `number=2`; a `param={p}` pattern yields COSMO ids
+(`500011`, `500041`) as canonical strings.
+
+Commands: `uv run pytest tests/test_plugin.py -q -k glob`;
+`SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k glob -q`.
+
+## Step 8 — `TestStorageBase` integration pass and interface conformance
+
+Files: `tests/test_plugin.py`, `tests/conftest.py`.
+
+Acceptance: `uv run pytest -q` green with `.raw/` present, and green-with-skips
+without it (`-rs` shows one skip reason per gated test); `coverage report` ≥ 85 % on
+`src/` when data is present.
+
+## Step 9 — Dev FDB and example workflow end-to-end
+
+Files: `scripts/init_dev_fdb.py`, `example/Snakefile`, `example/config.yaml`,
+`example/README.md`, `tests/test_workflow.py` (`needs_raw`).
+
+`scripts/init_dev_fdb.py [--root .fdb] [--seed] [--mch]`: writes `.fdb/schema`
+(copy of `tests/data/schema`, or `tests/data/mch/realtime-varda.schema` with `--mch`),
+`.fdb/root/`, `.fdb/config.yaml`; `--seed` archives `.raw/*.grib` plus derived
+variants when `.raw/` exists.
+
+`example/Snakefile` (ECMWF flavour):
+
+```python
+storage:
+    provider="fdb"
+
+DATES = ["20200101"]
+
+rule all:
+    input: expand("done/{date}.txt", date=DATES)
+
+rule shift_expver:
+    input:
+        storage.fdb("fdb://class=ea,expver=0001,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
+    output:
+        storage.fdb("fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
+    run:
+        import eccodes
+        with open(input[0], "rb") as fi, open(output[0], "wb") as fo:
+            while (h := eccodes.codes_grib_new_from_file(fi)) is not None:
+                eccodes.codes_set(h, "expver", "0002"); eccodes.codes_write(h, fo); eccodes.codes_release(h)
+
+rule done:
+    input: storage.fdb("fdb://class=ea,expver=0002,stream=oper,date={date},time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167")
+    output: "done/{date}.txt"
+    shell: "grib_ls {input} > {output}"
+```
+
+`examples/meteoswiss/Snakefile` (site example, documentation + site-suite e2e when
+data is present; all values user-supplied via `examples/meteoswiss/profile/config.yaml`):
+
+```python
+storage mch:
+    provider="fdb"      # config, eccodes_definitions, metkit_home come from the profile (tag "mch")
+
+rule t2m_control:
+    input:
+        storage.mch("fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date={date},time={time},type=cf,levtype=sfc,step=6,param=500011")
+    output: "t2m/{date}{time}.txt"
+    shell: "grib_ls -p shortName,step,number {input} > {output}"
+```
+
+`examples/meteoswiss/profile/config.yaml`:
+
+```yaml
+storage-fdb-config: ["mch::.fdb-mch/config.yaml"]      # TAG::VALUE (spec §2.7)
+storage-fdb-eccodes-definitions: ["mch::.local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/definitions"]
+storage-fdb-metkit-home: ["mch::.local/metkit-home"]
+storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]   # silence the COSMO definitions' version banner (spec §2.9)
+```
+
+Run: `uv run python scripts/init_dev_fdb.py --seed && cd example && uv run snakemake
+--storage-fdb-config ../.fdb/config.yaml -c1`.
+
+`tests/test_workflow.py` copies `example/` and a fresh `.fdb/` into `tmp_path`, runs the
+command via `subprocess` (default `native` archive mode; neither example sets a mode),
+asserts: exit 0; local file
+`.snakemake/storage/fdb/class=ea/expver=0002/.../step=0+6+12/param=167.grib` created
+then removed; the field is in FDB; second run "Nothing to be done"; `--delete-all-output`
+logs the remove warning and leaves the field; a tiny `glob_wildcards` Snakefile returns
+steps 0/6/12.
+
+**Site suite (required):** `tests/sites/meteoswiss/test_workflow.py` initialises
+`.fdb-mch/` with `examples/meteoswiss/realtime-varda.schema`, archives the OGD samples,
+copies `examples/meteoswiss/` into `tmp_path`, rewrites `date`/`time` in the Snakefile
+from the samples, and runs
+`snakemake --profile examples/meteoswiss/profile -c1` with `ECCODES_DEFINITION_PATH`
+and `METKIT_HOME` exported from the `SMK_FDB_TEST_*` variables: the `t2m_control` rule
+retrieves the field, the output is produced, a second run is a no-op. This guarantees
+that `examples/meteoswiss/` (profile, schema, Snakefile, language recipe) works.
+
+Acceptance: `uv run pytest tests/test_workflow.py -q` green with data; manual run
+works; `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k workflow -q` green.
+
+## Step 10 — MeteoSwiss site material (outside the package) and required site suite
+
+Files (none under `src/`): `examples/meteoswiss/{README.md,realtime-varda.schema,profile/config.yaml,Snakefile,setup.sh,make_metkit_home.py,fetch_ogd_samples.py}`,
+`tests/sites/meteoswiss/{conftest.py,test_meteoswiss.py}`, `docs/sites/meteoswiss.md`.
+
+`setup.sh [--dest .local]`: `git clone --depth 1 --branch varda-ext
+https://github.com/MeteoSwiss/eccodes-cosmo-mars.git $DEST/eccodes-cosmo-mars` (evalml
+uses the ssh URL; https works for the public repo) and `uv pip install
+"eccodes-cosmo-resources-python>=2.47.0.1,<2.48"` (or a version matching the installed
+eccodes), then prints the `eccodes_definitions` value to use
+(`$DEST/eccodes-cosmo-mars/definitions:<eccodes_cosmo_resources.get_definitions_path()>`).
+
+`make_metkit_home.py [--dest .local/metkit-home] [--models icon-ch1-eps,icon-ch2-eps,varda-single,varda-single-g,kenda-ch1,icon-rea-l-ch1]`:
+copies `metkitlib/share/metkit/*` into `<dest>/share/metkit/` and appends the models to
+the context-free `model` enum block via YAML (`d["_field"]["model"]["type"][-1]["values"]`).
+Documented as a recipe in `docs/sites/meteoswiss.md`; the plugin only sees the resulting
+directory through the generic `metkit_home` setting.
+
+`fetch_ogd_samples.py` (needs only network access; run with `uv run python
+examples/meteoswiss/fetch_ogd_samples.py [--collection ch.meteoschweiz.ogd-forecasting-icon-ch2]
+[--reference-datetime 2026-09-15T12:00:00Z] [--horizon P0DT06H00M00S] [--members 1,2] [--out .raw/meteoswiss]`).
+Stdlib `urllib` + `eccodes` only, no curl/jq. Reproduces the samples of spec §2.9:
+
+```python
+STAC = "https://data.geo.admin.ch/api/stac/v1/search"
+
+def search(collection, variable, perturbed, horizon, reference_datetime=None):
+    body = {"collections": [collection], "forecast:variable": variable,
+            "forecast:perturbed": perturbed, "forecast:horizon": horizon}
+    if reference_datetime:
+        body["forecast:reference_datetime"] = reference_datetime
+    req = urllib.request.Request(STAC, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    feats = json.load(urllib.request.urlopen(req))["features"]
+    # data is retained for 24 h only: without --reference-datetime take the newest feature
+    feat = max(feats, key=lambda f: f["properties"]["forecast:reference_datetime"])
+    (asset,) = feat["assets"].values()          # exactly one asset per item
+    return feat["properties"]["forecast:reference_datetime"], asset["href"]   # pre-signed rgw.cscs.ch URL; GET only (HEAD returns an error body)
+
+def download(href) -> bytes: return urllib.request.urlopen(href).read()
+
+def subset_members(data: bytes, members: set[int]) -> bytes:
+    # split with eccodes and keep messages whose perturbationNumber is in `members`
+    ...
+
+# T_2M ctrl (1 msg), TOT_PREC ctrl (1 msg), T_2M perturb subset to members 1-2 (2 msgs)
+# -> .raw/meteoswiss/icon-ch2-eps_<yyyymmddHHMM>_step<h>_<var>_{ctrl|pert_m1-2}.grib2
+```
+
+After writing, the script prints `grib_ls -n mars`-equivalent key dumps via eccodes
+(with `ECCODES_DEFINITION_PATH` set to cosmo-mars + cosmo definitions when available)
+so the user can eyeball `class/stream/type/model/step/number/timespan`.
+
+Expected: 3 files, 4 messages, ≈ 2.27 MB for CH2 (`t_2m` ctrl 567 927 B, `tot_prec`
+ctrl 567 951 B, perturbed members 1–2 1 135 854 B); CH1 would be ≈ 4× larger. Not
+committed; git-ignored. The full perturbed CH2 file is 11.4 MB (20 members) and is
+never kept.
+
+Acceptance for the script: run twice in a row → identical file set (same reference
+time within the 24 h window); run with an expired `--reference-datetime` → clear error
+("no items; OGD retains 24 h"); `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss uv run pytest
+tests/sites/meteoswiss -rs` afterwards no longer skips for "samples".
+
+`tests/sites/meteoswiss/` (`conftest.py`, `test_read.py`, `test_write.py`,
+`test_glob.py`, `test_workflow.py`, `test_conventions.py`; marker `site_meteoswiss`;
+part of the default `pytest` run — it skips only when prerequisites are missing and
+`SMK_FDB_TEST_REQUIRE_SITES` is unset):
+- gating (`conftest.py`): four separate `skipif` reasons from env vars only —
+  `SMK_FDB_TEST_MCH_SAMPLES` (dir with the OGD files), `SMK_FDB_TEST_MCH_SCHEMA`
+  (default `examples/meteoswiss/realtime-varda.schema`), `SMK_FDB_TEST_ECCODES_DEFINITIONS`
+  (colon list of existing dirs), `SMK_FDB_TEST_METKIT_HOME` (must contain
+  `share/metkit/language.yaml`); with `SMK_FDB_TEST_REQUIRE_SITES=1` each missing item
+  is `pytest.fail` instead of skip. The plugin package is exercised only through its
+  public settings (`config`, `eccodes_definitions`, `metkit_home`) or, in a second
+  parametrisation, through the plain environment variables `ECCODES_DEFINITION_PATH`/
+  `METKIT_HOME` with no plugin settings at all (proves goal 7's "works via generic
+  means"); nothing in `src/` refers to this suite;
+- fixture: temp FDB with the schema from the env var; provider settings built from the
+  env vars; the fixture reads `date`/`time` from the sample messages (the OGD reference
+  time changes with every fetch) and builds queries with them;
+- `test_native_archive_and_read`: default `archive_mode` (`native`), store the ctrl T_2M file via
+  `fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=<d>,time=<t>,type=cf,levtype=sfc,step=6,param=500011`
+  → `exists()`, `mtime` 10-digit float, `size()==567927`, retrieve round trip
+  byte-identical, listed keys have `domain=''`, `number=''`, `timespan=none`,
+  `model=icon-ch2-eps` [all verified in spec §2.9];
+- `test_identifier_archive`: same with `archive_mode="identifier"` set explicitly
+  (single-rule varda schema);
+- `test_members`: the 2-message perturbed file via `...,type=pf,number=1/2,step=6,param=500011`
+  → 2 fields, `size()==1135854`; `number=1/to/3` → `exists()` False (member 3 absent);
+- `test_accumulation_needs_timespan`: `param=500041` without `timespan=fs` → `exists()`
+  False; with it → True;
+- `test_number_context`: `type=cf` with `number=0` → invalid-request error;
+- `test_model_requires_metkit_home`: provider without `metkit_home` → invalid-request
+  error mentioning `icon-ch2-eps`;
+- `test_canonical_spelling_mch`: query with `param=T_2M,model=ICON-CH2-EPS` → warning
+  lists `500011` and `icon-ch2-eps`;
+- `test_synthetic_icon` (not sample-gated, but gated on the definitions): build a GRIB2
+  message from eccodes' `GRIB2` sample with `centre=215, generatingProcessIdentifier=142,
+  typeOfGeneratingProcess=4, productDefinitionTemplateNumber=1, perturbationNumber=0,
+  discipline=0, parameterCategory=0, parameterNumber=0, typeOfFirstFixedSurface=103,
+  level=2`; assert `mars_keys` gives `class=od, stream=enfo, type=cf,
+  model=ICON-CH2-EPS, expver=0001, param=500011`; if eccodes cannot produce that
+  (a regular grid is fine), drop this test and keep the sample gating only.
+
+- `test_key_order_from_site_schema`: with the schema from the env var, a query written
+  in ECMWF order is normalised to
+  `date,time,stream,class,expver,model,type,levtype,number,step,param,levelist,timespan`
+  order without any site knowledge in the package.
+
+Acceptance: `uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs` shows the
+exact missing prerequisite when skipping locally; `SMK_FDB_TEST_REQUIRE_SITES=1 ...`
+green on a node with samples + definitions (and in CI, step 11);
+`grep -riE 'mch|meteoswiss|cosmo|icon-ch' src/` still empty.
+
+## Step 11 — CI
+
+Files: `.github/workflows/ci.yml`, `release-please.yml`, `conventional-prs.yml`.
+
+```yaml
+name: CI
+on: { push: { branches: [main] }, pull_request: }
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install 3.12
+      - run: uv sync
+      - run: uv run ruff format --check . && uv run ruff check .
+      - name: No site-specific code in the package
+        run: '! grep -riEn "mch|meteoswiss|cosmo|icon-ch" src/'
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    env: { ECKIT_EXCEPTION_IS_SILENT: "1" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --locked --python ${{ matrix.python }}   # pinned pyfdb 5.21.4.x (spec §11 Option A)
+      - run: uv run coverage run -m pytest -q -rs -m "not site_meteoswiss"
+      - run: uv run coverage report -m
+  pyfdb-latest:
+    # Optional canary: tells us when the <5.22 pin can be lifted. Never blocks merges.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env: { ECKIT_EXCEPTION_IS_SILENT: "1" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv pip install --upgrade "pyfdb>=5.23" "eccodes>=2.48,<3"   # overrides the pin in the venv only
+      - run: uv run --no-sync pytest -q -rs -m "not site_meteoswiss"
+  site-meteoswiss:
+    runs-on: ubuntu-latest
+    env: { ECKIT_EXCEPTION_IS_SILENT: "1", SMK_FDB_TEST_REQUIRE_SITES: "1", ECCODES_VERSION_CHECK_OFF: "1" }   # last one: COSMO definitions' version-mismatch banner (spec §2.9)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install 3.12
+      - run: uv sync
+      - name: Site definitions and MARS language (CI setup step, not plugin code)
+        run: |
+          bash examples/meteoswiss/setup.sh --dest .local        # clones eccodes-cosmo-mars (varda-ext), installs eccodes-cosmo-resources-python
+          uv run python examples/meteoswiss/make_metkit_home.py --dest .local/metkit-home
+          echo "SMK_FDB_TEST_ECCODES_DEFINITIONS=$PWD/.local/eccodes-cosmo-mars/definitions:$(uv run python -c 'import eccodes_cosmo_resources as c; print(c.get_definitions_path())')" >> "$GITHUB_ENV"
+          echo "SMK_FDB_TEST_METKIT_HOME=$PWD/.local/metkit-home" >> "$GITHUB_ENV"
+          echo "SMK_FDB_TEST_MCH_SCHEMA=$PWD/examples/meteoswiss/realtime-varda.schema" >> "$GITHUB_ENV"
+      - name: Sample data (committed empty-data samples)
+        run: echo "SMK_FDB_TEST_MCH_SAMPLES=$PWD/.raw/meteoswiss" >> "$GITHUB_ENV"
+      - run: uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs
+```
+
+**CI sample data (decided):** the committed samples under `.raw/` (ECMWF) and
+`.raw/meteoswiss/` (OGD fields with emptied data section, commit c4677bd); no download
+in CI. The OGD API is not usable for CI (24 h retention); `fetch_ogd_samples.py` is only
+for refreshing the samples manually.
+
+**pyfdb versions (decided, spec §11):** required jobs run the locked 5.21.4.x stack;
+the `pyfdb-latest` job is an optional, non-blocking canary on 5.23 + eccodes 2.48.
+
+Acceptance: lint green (incl. the src grep); `test` job green on the locked stack with
+the committed samples (no data-gated skips); `site-meteoswiss` job green with the
+committed `.raw/meteoswiss/` samples (with `SMK_FDB_TEST_REQUIRE_SITES=1` it fails
+rather than skips if the setup step breaks); `pyfdb-latest` may fail without blocking.
+
+## Step 12 — Docs
+
+Files: `README.md`, `docs/intro.md`, `docs/further.md`, `docs/sites/meteoswiss.md`.
+
+Generic docs (README/intro/further): query grammar with generic MARS examples,
+canonical-spelling rule and warning (incl. case of enum values), key ordering
+(setting / schema / generic), settings table (all pass-throughs), semantics of
+exists/mtime/remove (masking, `fdb purge`), native (default) vs identifier mode
+(identifier only with schemas whose rules share one key set; single-valued query keys
+checked against the GRIB; relabelling needs `grib_set`) and the reserved
+`identifier_check`, wildcard rules, tagged FDBs and profiles, dev FDB setup, the
+pyfdb/eccodes version choice, how to point the plugin at *any* site's definitions and
+MARS language (`eccodes_definitions`, `metkit_home`, `env`), limitations, platform note.
+
+`docs/sites/meteoswiss.md` (site page, links to `examples/meteoswiss/`): clone
+`eccodes-cosmo-mars` `varda-ext` + install `eccodes-cosmo-resources-python`,
+`make_metkit_home.py`, the profile, `realtime-varda.schema`, `timespan=fs` for
+accumulations, COSMO paramIds, lower-case `model`, `number` only for `pf`, fetching
+samples from the OGD API and its 24 h retention, the definitions-version warning
+(harmless for patch-level differences; silence with `ECCODES_VERSION_CHECK_OFF=1`,
+spec §2.9).
+
+## Step 13 — Identifier guard (post-v1)
+
+Files: `guard.py` (`StrictGuard`), `__init__.py` (settings accept `strict`),
+`tests/test_guard.py`.
+
+Implement spec §7.7 `StrictGuard`, on top of the built-in pre-check of step 6a (constant
+query keys the message carries, light `comparable` normalisation, incomparable aliases
+skipped). The guard adds:
+- exact canonicalisation: derive the message's MARS keys (`grib.mars_keys`, with the
+  provider's definitions active) and canonicalise both sides the way FDB does (param
+  shortnames, step units such as `0m`, time/date aliases the pre-check skips, via
+  `Backend.expand` of a one-field request);
+- keys the message does not carry (query labels, schema defaults): schema-level
+  consistency, i.e. the identifier selects exactly one schema rule and names only that
+  rule's keys;
+- all mismatches of a file collected and raised as `IdentifierMismatch` together.
+
+Acceptance: `step=0m` in the GRIB vs a `step=10m` identifier is rejected (skipped by the
+pre-check); `T_2M` vs `500011` is accepted (canonical equality); an identifier whose
+query labels select no single schema rule is rejected; a MeteoSwiss message archived
+under `realtime-varda.schema` passes with the correct identifier;
+`identifier_check=strict` becomes a legal setting and the reserved-error test is
+inverted.
+
+## Step 14 — Upstream PRs to ecmwf/fdb (pyfdb)
+
+- `src/pyfdb_bindings/bindings.cc:334-390`: add
+  `.def("timestamp", [](const fdb5::ListElement& e) -> long long { return static_cast<long long>(e.timestamp()); })`
+  (`ListElement::timestamp()` exists in `src/fdb5/api/helpers/ListElement.h:71`);
+  `src/pyfdb/pyfdb_iterator.py`: `ListElement.timestamp() -> int` with a docstring
+  ("index flush time, POSIX seconds; 0 for level < 3 and legacy indexes"); fix the
+  9-digit docstring typos in `pyfdb.py`; tests in `tests/pyfdb/integration/test_list.py`.
+- Optional: public `pyfdb.expand(selection) -> dict[str, list[str]]` wrapping
+  `mars_request_from_map`, so the plugin need not parse `FDBToolRequest` repr.
+- Plugin follow-up: prefer `element.timestamp()` / `pyfdb.expand` when present, keep the
+  fallbacks.
+
+---
+
+## Order of work and checkpoints
+
+| step | depends on | checkpoint command |
+|---|---|---|
+| 0 scaffold | – | `uv sync && uv build` |
+| 1 query | 0 | `uv run pytest tests/test_query.py` |
+| 2 grib | 0 | `uv run pytest tests/test_grib.py` |
+| 3 backend | 1, 2 | `uv run pytest tests/test_backend.py` |
+| 4 settings/guard/provider | 3 | `uv run snakemake --help \| grep storage-fdb` |
+| 5 read | 4 | `uv run pytest -k "Read or spelling"` |
+| 6 write (+ guard hook) | 5 | `uv run pytest -k "store or remove or guard"` |
+| 6a default native, single-value check | 6 | `uv run pytest -k "store or settings"` |
+| 7 glob | 5 | `uv run pytest -k glob` |
+| 8 conformance | 5–7 | `uv run coverage run -m pytest -rs` |
+| 9 e2e | 8 | `uv run pytest tests/test_workflow.py` |
+| 10 MeteoSwiss site suite (required) | 8 | `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -rs` |
+| 11 CI (data provisioning open) | 8 | green run |
+| 12 docs | 9, 10 | review |
+| 13 identifier guard (post-v1) | 6 | `uv run pytest tests/test_guard.py` |
+| 14 upstream | 5 | PR links |
