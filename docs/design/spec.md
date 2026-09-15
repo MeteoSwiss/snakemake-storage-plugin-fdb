@@ -45,8 +45,9 @@ compared (§2.4, §4, §7.7 decisions, §8, §12).
    (`/` value lists, `to`/`by` ranges). It maps to exactly one local file holding all
    matching GRIB messages.
 3. FDB location configurable per provider instance (settings, incl. tagged settings),
-   falling back to FDB's own environment variables. Dev FDBs live under `.fdb/` in the
-   workspace (test FDBs under pytest's temporary directories) and stay small.
+   falling back to FDB's own environment variables. Dev FDBs live under `.fdb/` (and
+   `.fdb-mch/` for the MeteoSwiss example, both git-ignored) in the workspace (test FDBs
+   under pytest's temporary directories) and stay small.
 4. Correct Snakemake semantics for `exists`, `mtime`, `size`, retrieve, store, remove,
    inventory and `glob_wildcards`, given FDB's constraints (immutable, masked
    overwrites, no per-field deletion).
@@ -1303,12 +1304,11 @@ plugin code does not know about them. `tests/test_no_site_specifics.py` fails if
 Source: the MeteoSwiss Open Government Data REST API (§2.9), **not** the internal
 `/store_new` archive. Everything in this subsection is [verified: §2.9] unless marked.
 All MeteoSwiss material lives outside the package: `examples/meteoswiss/` (schema,
-profile, Snakefile, `language.yaml` recipe, fetch script) and `docs/sites/meteoswiss.md`;
-tests under `tests/sites/meteoswiss/`. The suite uses the `.raw/meteoswiss/` OGD
-samples and the `examples/meteoswiss/` material directly, so the examples are
-guaranteed to work (from plan step 10 the e2e test runs `examples/meteoswiss/Snakefile`
-with `examples/meteoswiss/profile/config.yaml`; until then it writes the same Snakefile
-and profile itself, §9.5).
+profile, Snakefile, `grib_keys.py`, `setup.sh`, `language.yaml` recipe, fetch script,
+README) and `docs/sites/meteoswiss.md`; tests under `tests/sites/meteoswiss/`. The
+suite uses the `.raw/meteoswiss/` OGD samples and the `examples/meteoswiss/` material
+directly, so the examples are guaranteed to work (since plan step 10 the e2e test runs
+a copy of `examples/meteoswiss/` with its Snakefile and `profile/config.yaml`, §9.5).
 
 - Samples: the three CH2 files listed in §2.9 (`.raw/meteoswiss/`, committed as
   empty-data copies; the ≈ 2.27 MB full-size originals are in the git-ignored
@@ -1319,11 +1319,17 @@ and profile itself, §9.5).
   with stdlib `urllib` + `eccodes` only (runs under `uv run`), searches the STAC API for the
   latest reference time (or `--reference-datetime`), `GET`s the pre-signed asset URL,
   subsets the perturbed file to members 1–2 by `perturbationNumber`, writes full-size
-  files to the git-ignored `.local/raw-full/meteoswiss/`. With `--empty-data` it also
-  writes the committed copies to `.raw/meteoswiss/` (data section replaced by a constant
-  field, `grid_simple`, `bitsPerValue=0`; MARS keys verified unchanged; existing files
-  overwritten only with `--force`). Both use the committed naming scheme
-  `icon-ch2-eps_<YYYYMMDDHHMM>_step<h>_<var>_<ctrl|pert_mA-B>.grib2`.
+  files to `--out` (default the git-ignored `.local/raw-full/meteoswiss/`). With
+  `--empty-data [DIR]` it also writes the committed copies to DIR (default
+  `.raw/meteoswiss/`; data section replaced by a constant zero field, `grid_simple`,
+  `bitsPerValue=0`; MARS keys verified unchanged; existing files overwritten only with
+  `--force`, checked before any download). Both use the committed naming scheme
+  `<model>_<YYYYMMDDHHMM>_step<h>_<var>_<ctrl|pert_mA-B>.grib2` (`icon-ch2-eps` for the
+  CH2 collection). [verified: plan step 10, live run into a scratch directory: the
+  constant-field copies are byte-identical to the committed samples, a rerun writes
+  identical full-size files, `--empty-data` again without `--force` refuses, an expired
+  `--reference-datetime` fails with "no items ...; OGD retains data for 24 h after
+  publication"]
   Decided 2026-09-15 (reversible): full-size by default, committed copies only with
   `--empty-data`. Because OGD data is retained for only 24 h, the script always
   produces a *recent* reference time; the file names carry it, and the tests take
@@ -1333,22 +1339,39 @@ and profile itself, §9.5).
 - The constant-field size trick (`grib_set -d 0`, §2.6 in revision 1) is no longer
   needed for fetching; it is how the committed samples were shrunk (a zeroed CH2 field
   is a few hundred bytes).
-- `examples/meteoswiss/realtime-varda.schema`: verbatim copy of evalml's schema (§2.8,
-  3 KB) [verified]. Not under `tests/data/` and never referenced by package code.
-- `examples/meteoswiss/make_metkit_home.py [--models icon-ch1-eps,icon-ch2-eps]`:
-  copies `metkitlib/share/metkit` from the installed wheel into `<dir>/share/metkit` and
+- `examples/meteoswiss/realtime-varda.schema`: evalml's schema (§2.8) behind a `#`
+  comment header with its provenance (`MeteoSwiss/evalml`, branch `enable_fdb`,
+  `resources/fdb/realtime-varda.schema`, last changed in commit `15cf43af69a1`, git
+  blob `c64fd7e4b236`, 3214 B) and evalml's BSD-3-Clause license text; the body is
+  byte-identical to that blob [verified: `gh api`, `git hash-object`; key order and
+  `parse_schema` equal those of the bare file]. Not under `tests/data/` and never
+  referenced by package code.
+- `examples/meteoswiss/make_metkit_home.py [--dest .local/metkit-home] [--models icon-ch1-eps,icon-ch2-eps]`:
+  copies `metkitlib/share/metkit` from the installed wheel into `<dest>/share/metkit` and
   appends the models to the context-free `model` enum block (YAML-based, unlike
-  evalml's regex patch); output used via the generic `metkit_home` setting [verified
-  mechanism]. The recipe is documented in `docs/sites/meteoswiss.md`.
+  evalml's regex patch); output used via the generic `metkit_home` setting [verified:
+  site suite with the generated directory]. The recipe is documented in
+  `docs/sites/meteoswiss.md`.
   Decided 2026-09-15 (reversible): the default is the models the committed samples and
-  the MeteoSwiss example need (`icon-ch1-eps,icon-ch2-eps`); other models
-  (`varda-single`, `varda-single-g`, `kenda-ch1`, `icon-rea-l-ch1`) are passed with
-  `--models`. The full list of valid model values is [assumed] until plan step 10 checks
-  it against `MeteoSwiss/eccodes-cosmo-mars` and the evalml `enable_fdb` language patch.
+  the MeteoSwiss example need (`icon-ch1-eps,icon-ch2-eps`); other models are passed
+  with `--models`. Valid model values [verified: plan step 10, `marsModel` concepts of
+  `MeteoSwiss/eccodes-cosmo-mars` `varda-ext` at `d04363540bb2` via `gh api`; metkit
+  expands each with the generated language, the stock language rejects each]:
+  `cosmo-1e`, `cosmo-2e`, `kenda-1`, `snowpolino`, `icon-ch1-eps`, `icon-ch2-eps`,
+  `kenda-ch1`, `icon-rea-l-ch1`, `varda-single`, `varda-ens` (`grib2/local.215.def`)
+  and `varda-single-g` (`grib2/local.98.def`); `main` and `varda` lack `varda-ens` and
+  `local.98.def`, and evalml's `enable_fdb` language patch adds only `varda-single`,
+  `varda-single-g`. (The previously assumed extras `varda-single`, `varda-single-g`,
+  `kenda-ch1`, `icon-rea-l-ch1` were incomplete.)
 - Definitions: users clone `eccodes-cosmo-mars` (branch `varda-ext`) and install
   `eccodes-cosmo-resources-python` themselves (documented; `examples/meteoswiss/setup.sh`
-  does both into `.local/`), then pass the two directories as plain paths in
-  `eccodes_definitions` (cosmo-mars first). No package extra, no alias.
+  does both into `.local/`, idempotently: `.local/eccodes-cosmo-mars` and, with
+  `uv pip install --target`, `.local/eccodes-cosmo-resources`, whose definitions are
+  under `share/eccodes-cosmo-resources/definitions`), then pass the two directories as
+  plain paths in `eccodes_definitions` (cosmo-mars first). No package extra, no alias.
+  The definitions are installed, never copied into the repository
+  (`COSMO-ORG/eccodes-cosmo-resources` declares no license; the PyPI wheel declares
+  BSD-3-Clause).
 - Test configuration (env vars read only by `tests/sites/meteoswiss/conftest.py`):
   `SMK_FDB_TEST_MCH_SAMPLES` (directory with the OGD files), `SMK_FDB_TEST_MCH_SCHEMA`
   (defaults to `examples/meteoswiss/realtime-varda.schema`), `SMK_FDB_TEST_ECCODES_DEFINITIONS`
@@ -1366,12 +1389,13 @@ and profile itself, §9.5).
   `examples/meteoswiss/make_metkit_home.py`, export the `SMK_FDB_TEST_*` variables) and
   `SMK_FDB_TEST_REQUIRE_SITES=1` turns any remaining skip into a failure. Sample data
   is not an open item any more: CI uses the committed `.raw/meteoswiss/` samples (plan
-  step 11). A synthetic variant runs
-  **without** the samples but still needs the definitions: it uses the constant-field
-  technique (a GRIB2 message built from eccodes' `GRIB2` sample with `centre=215`, GPI
-  142, PDT 1, `T_2M`) if that decodes to the same MARS keys — to be confirmed in plan
-  step 10; if it does not, the synthetic variant is dropped and the suite stays
-  sample-gated.
+  step 11). A synthetic variant (`test_synthetic_icon`) runs
+  **without** the samples but still needs the definitions: a GRIB2 message built from
+  eccodes' `GRIB2` sample with `centre=215`, GPI 142, PDT 1, `T_2M` and a local section
+  (`grib2LocalSectionPresent=1`, `localDefinitionNumber=253`, as in the OGD files)
+  decodes to `class=od, stream=enfo, type=cf, model=ICON-CH2-EPS, expver=0001,
+  param=500011` [verified: plan step 10; without the local section cosmo-mars adds none
+  of `class/stream/type/model/expver`].
 - CI: the 24 h OGD retention makes the API unsuitable for reproducible CI fixtures, so
   CI uses the committed empty-data samples (decided; plan step 11). Everything else the
   suite needs (definitions, schema, language) is provisioned in CI.
@@ -1484,16 +1508,20 @@ them (§3.3): untagged settings reach spawned jobs.
 Site e2e (`tests/sites/meteoswiss/test_workflow.py`, required): `scripts/init_dev_fdb.py
 --root .fdb-mch --schema <varda schema> --seed <samples dir>` with
 `ECCODES_DEFINITION_PATH`/`METKIT_HOME`/`ECCODES_VERSION_CHECK_OFF=1` (the documented
-MeteoSwiss command, 4 messages), then `snakemake --profile profile -c1 t2m/<date><time>.txt`
-without those variables on a Snakefile written by the test: tagged `storage mch:`,
-profile values `mch::` for `config`, `eccodes_definitions`, `metkit_home`, `env`, and one
-`shell` rule (`date`/`time` wildcards; the target comes from the sample name) retrieving
-the `type=cf` T_2M field (byte-identical copy; eccodes in the shell job, a `keys.py`
-next to the Snakefile, decodes `T_2M` through the exported definitions; local copy under
-`.snakemake/storage/mch/` removed); a second run is a no-op. A `shell` rule runs in the
-main process under the local executor; a `run:` rule would be spawned and lose the
-tagged settings (upstream issue, §2.7). The test is self-contained until
-`examples/meteoswiss/` exists (plan step 10).
+MeteoSwiss command, 4 messages) in a temporary directory, then, in a copy of
+`examples/meteoswiss/` two levels below it, `snakemake --profile profile -c1` without
+those variables (since plan step 10; before, the test wrote an equivalent Snakefile and
+profile itself). The shipped example has a tagged `storage mch:` provider and profile
+values `mch::` for `config` (`../../.fdb-mch/config.yaml`), `eccodes_definitions`,
+`metkit_home` (under `../../.local/`) and `env`; the test replaces the two `.local/` paths
+with `--storage-fdb-eccodes-definitions`/`--storage-fdb-metkit-home mch::<SMK_FDB_TEST_*>`
+on the command line, which take precedence over the profile. `rule all` collects
+`t2m/<date><time>.txt` for every control T_2M field `glob_wildcards` finds, and one
+`shell` rule retrieves the field (byte-identical copy; the example's `grib_keys.py`
+decodes `T_2M 6 0` through the exported definitions, stderr to its own rule log, §2.9;
+local copy under `.snakemake/storage/mch/` removed); a second run is a no-op. A `shell`
+rule runs in the main process under the local executor; a `run:` rule would be spawned
+and lose the tagged settings (upstream issue, §2.7).
 
 `scripts/init_dev_fdb.py` is generic: `--root DIR` (default `.fdb`), `--schema PATH`
 (default `tests/data/schema`), `--seed [DIR]` (natively archive every GRIB file directly

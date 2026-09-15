@@ -127,6 +127,16 @@ def eccodes_definitions() -> str:
 
 
 @pytest.fixture(scope="session")
+def site_env(eccodes_definitions) -> dict[str, str]:
+    """Environment for a subprocess that decodes with the definitions directly
+    (``ECCODES_DEFINITION_PATH``, version banner off); nothing else site-specific."""
+    return {
+        "ECCODES_DEFINITION_PATH": eccodes_definitions,
+        "ECCODES_VERSION_CHECK_OFF": "1",
+    }
+
+
+@pytest.fixture(scope="session")
 def mch_schema() -> Path:
     """varda-style FDB schema (``SMK_FDB_TEST_MCH_SCHEMA``, default in examples/)."""
     value = os.environ.get("SMK_FDB_TEST_MCH_SCHEMA")

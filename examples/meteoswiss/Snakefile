@@ -1,0 +1,51 @@
+"""MeteoSwiss example: ICON-CH2-EPS control 2 m temperature from a varda-schema FDB.
+
+Run from this directory after the setup in README.md:
+    uv run snakemake --profile profile -c1
+"""
+
+import sys
+from pathlib import Path
+
+PYTHON = sys.executable  # the interpreter running Snakemake has eccodes
+GRIB_KEYS = Path(workflow.basedir) / "grib_keys.py"
+
+
+storage mch:
+    # config, eccodes_definitions, metkit_home and env come from profile/config.yaml
+    provider="fdb"
+
+
+wildcard_constraints:  # t2m/{date}{time}.txt is ambiguous without them
+    date=r"\d{8}",
+    time=r"\d{4}",
+
+
+T2M_CONTROL = (
+    "fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date={date},"
+    "time={time},type=cf,levtype=sfc,step=6,param=500011"
+)
+# The forecasts present in FDB: date/time of every control T_2M field at step 6.
+RUNS = glob_wildcards(storage.mch(T2M_CONTROL))
+
+
+rule all:
+    input:
+        expand("t2m/{date}{time}.txt", zip, date=RUNS.date, time=RUNS.time),
+
+
+# A shell rule: the local executor runs it in the main process, where the tagged
+# profile settings apply (a run: rule is spawned and loses them, spec §2.7). The
+# COSMO definitions open /dev/stderr while decoding, which truncates a stderr
+# redirected to a shared file, so the decoder writes to its own log (spec §2.9).
+rule t2m_control:
+    input:
+        storage.mch(T2M_CONTROL),
+    output:
+        grib="t2m/{date}{time}.grib2",
+        listing="t2m/{date}{time}.txt",
+    log:
+        "logs/t2m_{date}{time}.log",
+    shell:
+        "cp {input} {output.grib} && "
+        "{PYTHON} {GRIB_KEYS} {input} > {output.listing} 2> {log}"

@@ -33,7 +33,7 @@ nothing site-specific there either; site setup commands live in `examples/meteos
 Site-suite prerequisites for local runs: `examples/meteoswiss/setup.sh`,
 `examples/meteoswiss/make_metkit_home.py`, `examples/meteoswiss/fetch_ogd_samples.py`,
 then export `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss`,
-`SMK_FDB_TEST_ECCODES_DEFINITIONS=.local/eccodes-cosmo-mars/definitions:<cosmo-resources defs>`,
+`SMK_FDB_TEST_ECCODES_DEFINITIONS=.local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions`,
 `SMK_FDB_TEST_METKIT_HOME=.local/metkit-home` (schema defaults to
 `examples/meteoswiss/realtime-varda.schema`).
 
@@ -65,9 +65,10 @@ tests/
 examples/ecmwf/                                       generic ECMWF-style example: Snakefile, config.yaml, README.md
 examples/meteoswiss/                                  everything MeteoSwiss, outside the package:
     README.md (incl. the MeteoSwiss dev-FDB command), realtime-varda.schema, profile/config.yaml, Snakefile,
+    grib_keys.py (grib_ls stand-in for the shell rule),
     fetch_ogd_samples.py (OGD STAC API -> .local/raw-full/meteoswiss/, --empty-data also -> .raw/meteoswiss/;
     stdlib urllib + eccodes),
-    setup.sh (clone eccodes-cosmo-mars, pip install eccodes-cosmo-resources-python into .local/),
+    setup.sh (clone eccodes-cosmo-mars, uv pip install --target eccodes-cosmo-resources-python into .local/),
     make_metkit_home.py (language.yaml recipe)
 docs/sites/meteoswiss.md
 scripts/init_dev_fdb.py            creates and seeds a dev FDB (generic: --root, --schema, --seed, --variants; no site flags)
@@ -82,8 +83,8 @@ scripts/fetch_ecmwf_samples.py     optional, not part of any step: re-downloads 
 
 Files: `pyproject.toml`, `README.md`, `LICENSE` (BSD-3-Clause), `src/snakemake_storage_plugin_fdb/__init__.py`
 (docstring only; provider classes arrive in step 4), `.gitignore` (add `.snakemake/`,
-`*.part`, `.local/`, `.fdb/`, `.venv/`, `__pycache__/`, `dist/`, the coverage output
-`.coverage`, `htmlcov/` (step 8), and the personal work-tracking files
+`*.part`, `.local/`, `.fdb/`, `.fdb-mch/` (step 10), `.venv/`, `__pycache__/`, `dist/`,
+the coverage output `.coverage`, `htmlcov/` (step 8), and the personal work-tracking files
 `CLAUDE.local.md`, `WORK.md`; not `.raw/`, which is committed),
 `uv.lock` (committed), `[tool.ruff]`. [done: 09c3c53]
 
@@ -585,7 +586,7 @@ Files: `scripts/init_dev_fdb.py`, `examples/ecmwf/Snakefile`, `examples/ecmwf/co
 logged subprocess runner shared by both e2e tests), `tests/sites/meteoswiss/conftest.py`
 (`run_site` uses `subprocess_env`; `mch_stamp` fixture), `tests/sites/meteoswiss/test_workflow.py`,
 `pyproject.toml` (`addopts = ["--import-mode=importlib"]`, so both suites may have a
-`test_workflow.py` without `__init__.py` files). [done: <pending commit>]
+`test_workflow.py` without `__init__.py` files). [done: d76eea2]
 
 Decided 2026-09-15 (reversible): the generic example lives in `examples/ecmwf/`, next to
 `examples/meteoswiss/` (one examples directory instead of a separate top-level one).
@@ -652,37 +653,12 @@ rule done:
 Both rules are `run:` rules, which the local executor spawns (spec §3.3), so the example
 takes the FDB as an untagged setting.
 
-`examples/meteoswiss/Snakefile` (site example, documentation + site-suite e2e when
-data is present; all values user-supplied via `examples/meteoswiss/profile/config.yaml`):
-
-```python
-storage mch:
-    provider="fdb"      # config, eccodes_definitions, metkit_home come from the profile (tag "mch")
-
-wildcard_constraints:   # t2m/{date}{time}.txt is ambiguous without them
-    date=r"\d{8}",
-    time=r"\d{4}",
-
-rule t2m_control:
-    input:
-        storage.mch("fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date={date},time={time},type=cf,levtype=sfc,step=6,param=500011")
-    output: "t2m/{date}{time}.txt"
-    shell: "grib_ls -p shortName,step,number {input} > {output}"
-```
-
-`examples/meteoswiss/profile/config.yaml`:
-
-```yaml
-storage-fdb-config: ["mch::.fdb-mch/config.yaml"]      # TAG::VALUE (spec §2.7)
-storage-fdb-eccodes-definitions: ["mch::.local/eccodes-cosmo-mars/definitions:.local/eccodes-cosmo-resources/definitions"]
-storage-fdb-metkit-home: ["mch::.local/metkit-home"]
-storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]   # silence the COSMO definitions' version banner (spec §2.9)
-```
-
-Step 10 notes from step 9: `grib_ls` is not installed by the eccodes wheels (use eccodes
-from Python in a `shell` command, or document the CLI as a prerequisite); keep
-`t2m_control` a `shell` rule, since a `run:` rule is spawned by the local executor and
-loses the tagged profile settings (spec §2.7, verified end to end in step 9).
+The MeteoSwiss example (`examples/meteoswiss/Snakefile`, `profile/config.yaml`) was
+sketched here and ships in step 10, which lists its final form. Notes step 9 handed to
+step 10: `grib_ls` is not installed by the eccodes wheels (use eccodes from Python in a
+`shell` command); keep `t2m_control` a `shell` rule, since a `run:` rule is spawned by
+the local executor and loses the tagged profile settings (spec §2.7, verified end to end
+in step 9).
 
 Run: `uv run python scripts/init_dev_fdb.py --seed --variants && cd examples/ecmwf && uv run snakemake
 --storage-fdb-config ../../.fdb/config.yaml -c1`.
@@ -721,9 +697,8 @@ into a temporary directory, and runs `snakemake --profile profile -c1 t2m/<date>
 settings: exit 0, the log shows the normalised query retrieved, the output is
 byte-identical to the sample, the shell job decodes `T_2M 6`, the local copy under
 `.snakemake/storage/mch/` is removed (`test_workflow_retrieves_control_field`); a second
-run is a no-op (`test_workflow_second_run_is_a_no_op`). Step 10 switches the test to
-copy `examples/meteoswiss/` (Snakefile, profile, schema), so that the shipped example
-is what runs.
+run is a no-op (`test_workflow_second_run_is_a_no_op`). Step 10 switched the test to a
+copy of the shipped `examples/meteoswiss/` (see there).
 
 Acceptance: `uv run pytest tests/test_workflow.py -q` green with data; manual run
 works; `SMK_FDB_TEST_REQUIRE_SITES=1 uv run pytest tests/sites/meteoswiss -m site_meteoswiss -k workflow -q` green.
@@ -733,24 +708,53 @@ Commands: `uv run pytest tests/test_workflow.py -q`;
 
 ## Step 10 — MeteoSwiss site material (outside the package) and required site suite
 
-Files (none under `src/`): `examples/meteoswiss/{README.md,realtime-varda.schema,profile/config.yaml,Snakefile,setup.sh,make_metkit_home.py,fetch_ogd_samples.py}`,
-`tests/sites/meteoswiss/{conftest.py,test_read.py,test_write.py}` (existing since steps
-2–6, extended; `test_glob.py` and `test_workflow.py` come from steps 7 and 9),
-`docs/sites/meteoswiss.md`.
+Files (none under `src/`): `examples/meteoswiss/{README.md,realtime-varda.schema,profile/config.yaml,Snakefile,grib_keys.py,setup.sh,make_metkit_home.py,fetch_ogd_samples.py}`,
+`tests/sites/meteoswiss/{test_conventions.py,test_read.py,test_workflow.py}` (existing
+since steps 2–9, extended; `test_workflow.py` switched to the shipped example),
+`tests/sites/meteoswiss/test_fetch_ogd_samples.py` (new), `docs/sites/meteoswiss.md`,
+`.gitignore` (`.fdb-mch/`). [done: <pending commit>]
 
-`setup.sh [--dest .local]`: `git clone --depth 1 --branch varda-ext
+`realtime-varda.schema`: evalml's `resources/fdb/realtime-varda.schema` (branch
+`enable_fdb`, last changed in `15cf43af69a1c5c90ab64be9deab76a94d371936`, blob
+`c64fd7e4b23683a0e9bc3052a72e6b8bd2b016ac`, 3214 B, BSD-3-Clause) behind a `#` header
+with that provenance and the license text; the body is byte-identical to the blob and to
+the copy the site suite used before.
+
+`setup.sh [--dest .local]` (idempotent): `git clone --depth 1 --branch varda-ext
 https://github.com/MeteoSwiss/eccodes-cosmo-mars.git $DEST/eccodes-cosmo-mars` (evalml
-uses the ssh URL; https works for the public repo) and `uv pip install
-"eccodes-cosmo-resources-python>=2.47.0.1,<2.48"` (or a version matching the installed
-eccodes), then prints the `eccodes_definitions` value to use
-(`$DEST/eccodes-cosmo-mars/definitions:<eccodes_cosmo_resources.get_definitions_path()>`).
+uses the ssh URL; https works for the public repo; an existing clone is updated with
+`git fetch --depth 1 origin varda-ext` and `git checkout --force --detach FETCH_HEAD`)
+and `uv pip install --target $DEST/eccodes-cosmo-resources
+"eccodes-cosmo-resources-python>=2.47.0.1,<2.48"` (run in the repository, whose
+environment supplies the Python version; another eccodes series needs the constant
+edited), then checks both directories and prints the `eccodes_definitions` value to use
+(`$DEST/eccodes-cosmo-mars/definitions:$DEST/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions`;
+`--target` puts the wheel's data files under `<target>/share`, so
+`eccodes_cosmo_resources.get_definitions_path()`, which looks in the running
+environment's data directory, does not apply). The cosmo-resources definitions are
+installed, never copied into the repository (`COSMO-ORG/eccodes-cosmo-resources` declares
+no license; the PyPI wheel declares BSD-3-Clause). [verified: run twice with `--dest` in
+a scratch directory: clone at `d04363540bb2`, second run a no-op update, both directories
+identical to the definitions the site suite used before]
 
 `make_metkit_home.py [--dest .local/metkit-home] [--models icon-ch1-eps,icon-ch2-eps]`:
-copies `metkitlib/share/metkit/*` into `<dest>/share/metkit/` and appends the models to
-the context-free `model` enum block via YAML (`d["_field"]["model"]["type"][-1]["values"]`).
-The default covers the committed samples and the MeteoSwiss example; other models
-(`varda-single`, `varda-single-g`, `kenda-ch1`, `icon-rea-l-ch1`) are passed with
-`--models`. The full list of valid model values is [assumed] until checked in this step.
+copies `metkitlib/share/metkit/*` (located via `import metkitlib`) into
+`<dest>/share/metkit/` and appends the models (stripped, lower-cased, known ones
+skipped) to the context-free `model` enum block via YAML (the one block of
+`d["_field"]["model"]["type"]` without a `context`), written back with
+`yaml.safe_dump(sort_keys=False)`; a rerun starts from a fresh copy. The default covers
+the committed samples and the MeteoSwiss example; other models are passed with
+`--models`. The user-facing list of valid values lives in `docs/sites/meteoswiss.md`
+only (README and script docstring point there). Valid model values [verified: `marsModel` concepts of
+`MeteoSwiss/eccodes-cosmo-mars` via `gh api`; metkit (metkitlib 1.18.3.23) expands each
+with a language generated with all of them, the stock language rejects each]: branch
+`varda-ext` (`d04363540bb24b1fd432dce2b1e65ba0f27ba591`) `grib2/local.215.def` maps
+`cosmo-1e`, `cosmo-2e`, `kenda-1`, `snowpolino`, `icon-ch1-eps`, `icon-ch2-eps`,
+`kenda-ch1`, `icon-rea-l-ch1`, `varda-single`, `varda-ens` (upper-case in the GRIB), and
+`grib2/local.98.def` maps `varda-single-g`; `main` and `varda` lack `varda-ens` and
+`local.98.def`. evalml's `enable_fdb` `patch_metkit_language.py` adds only
+`varda-single` and `varda-single-g`. The previously assumed extra models (`varda-single`,
+`varda-single-g`, `kenda-ch1`, `icon-rea-l-ch1`) were incomplete.
 Documented as a recipe in `docs/sites/meteoswiss.md`; the plugin only sees the resulting
 directory through the generic `metkit_home` setting.
 
@@ -760,14 +764,21 @@ Decided 2026-09-15 (reversible): `--models` defaults to `icon-ch1-eps,icon-ch2-e
 `fetch_ogd_samples.py` (needs only network access; run with `uv run python
 examples/meteoswiss/fetch_ogd_samples.py [--collection ch.meteoschweiz.ogd-forecasting-icon-ch2]
 [--reference-datetime 2026-09-15T12:00:00Z] [--horizon P0DT06H00M00S] [--members 1,2]
-[--out .local/raw-full/meteoswiss] [--empty-data [--force]]`).
-By default it writes only full-size files to the git-ignored `.local/raw-full/meteoswiss/`.
-With `--empty-data` it also writes the committed copies to `.raw/meteoswiss/`: data
-section replaced by a constant field (`grid_simple`, `bitsPerValue=0`), MARS keys
+[--out .local/raw-full/meteoswiss] [--empty-data [.raw/meteoswiss]] [--force]`).
+By default it writes only full-size files to `--out`, the git-ignored `.local/raw-full/meteoswiss/`.
+With `--empty-data [DIR]` it also writes the committed copies to DIR (default
+`.raw/meteoswiss/`; another directory to try it without touching the samples): data
+section replaced by a constant zero field (`grid_simple`, `bitsPerValue=0`), MARS keys
 verified unchanged against the full-size message; existing files are overwritten only
-with `--force`. Both sets use the committed naming scheme
-`icon-ch2-eps_<YYYYMMDDHHMM>_step<h>_<var>_<ctrl|pert_mA-B>.grib2` (e.g.
-`icon-ch2-eps_202609151200_step6_t_2m_pert_m1-2.grib2`).
+with `--force`, checked once the reference time is known and before any download. The
+reference time is the newest control T_2M item's (or `--reference-datetime`; that search
+result's asset is reused, no second search for it) and is used for all three samples.
+Both sets use the committed naming scheme
+`<model>_<YYYYMMDDHHMM>_step<h>_<var>_<ctrl|pert_mA-B>.grib2`, with the model derived
+from the collection and the step from `--horizon` (whole hours only; e.g.
+`icon-ch2-eps_202609151200_step6_t_2m_pert_m1-2.grib2`). `empty_file(bytes)` is the
+one function that turns a full-size file into its committed copy (the offline test
+calls it).
 Stdlib `urllib` + `eccodes` only, no curl/jq. Reproduces the samples of spec §2.9:
 
 ```python
@@ -815,9 +826,12 @@ Decided 2026-09-15 (reversible): the script downloads full-size files to
 copies only with `--empty-data` (overwrite only with `--force`), keeping the committed
 file names.
 
-After writing, the script prints `grib_ls -n mars`-equivalent key dumps via eccodes
-(with `ECCODES_DEFINITION_PATH` set to cosmo-mars + cosmo definitions when available)
-so the user can eyeball `class/stream/type/model/step/number/timespan`.
+The block above is a sketch; the script adds timeouts, the `FetchError` messages and the
+empty-data check. After writing, the script prints `grib_ls -n mars`-equivalent key dumps
+via eccodes (`class/stream/type/model/step/number/timespan/param` and the message size
+per message), decoded with whatever `ECCODES_DEFINITION_PATH` the user set (the README
+runs it with cosmo-mars + cosmo-resources); a message without `model` gets a note that
+the COSMO definitions are not active.
 
 Expected: 3 files, 4 messages, ≈ 2.27 MB for CH2 (`t_2m` ctrl 567 927 B, `tot_prec`
 ctrl 567 951 B, perturbed members 1–2 1 135 854 B); CH1 would be ≈ 4× larger. The
@@ -830,14 +844,61 @@ Acceptance for the script: run twice in a row → identical file set in
 written to `.raw/meteoswiss/`; with `--empty-data` → same names in `.raw/meteoswiss/`,
 175–350 B each, MARS keys equal to the full-size files; a second `--empty-data` run
 without `--force` refuses to overwrite; run with an expired `--reference-datetime` →
-clear error ("no items; OGD retains 24 h"); `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss uv run pytest
-tests/sites/meteoswiss -rs` afterwards no longer skips for "samples".
+clear error ("no items ...; OGD retains data for 24 h after publication"); `SMK_FDB_TEST_MCH_SAMPLES=.raw/meteoswiss uv run pytest
+tests/sites/meteoswiss -rs` afterwards no longer skips for "samples". [verified
+2026-09-15, live, with `--out`/`--empty-data` directories in a scratch directory and the COSMO
+definitions: reference time 2026-09-15T12:00Z, full-size 567 927 / 567 951 /
+1 135 854 B, constant-field copies 175 / 199 / 350 B and byte-identical to the committed
+samples, same MARS keys; a rerun gives identical full-size files; `--empty-data` again
+refuses; `--reference-datetime 2026-09-10T00:00:00Z` exits 1 with the message above;
+`.raw/meteoswiss/` untouched]
 
 Acceptance for `make_metkit_home.py`: the default output contains `icon-ch1-eps` and
-`icon-ch2-eps` in the `model` enum; the full list of valid model values (currently
-[assumed]: the defaults plus `varda-single`, `varda-single-g`, `kenda-ch1`,
-`icon-rea-l-ch1`) is checked against `MeteoSwiss/eccodes-cosmo-mars` and the evalml
-`enable_fdb` language patch, and the docs are corrected if they differ.
+`icon-ch2-eps` in the `model` enum and is otherwise equal to the stock `language.yaml`
+(parsed YAML); the full list of valid model values is checked against
+`MeteoSwiss/eccodes-cosmo-mars` and the evalml `enable_fdb` language patch, and the docs
+are corrected if they differ. Result: corrected to the 11 values above (spec §9.2).
+
+`examples/meteoswiss/Snakefile` (run from `examples/meteoswiss/` with
+`uv run snakemake --profile profile -c1`; tagged provider, values from the profile):
+
+```python
+PYTHON = sys.executable  # the interpreter running Snakemake has eccodes
+GRIB_KEYS = Path(workflow.basedir) / "grib_keys.py"
+
+storage mch:
+    provider="fdb"
+
+wildcard_constraints:  # t2m/{date}{time}.txt is ambiguous without them
+    date=r"\d{8}",
+    time=r"\d{4}",
+
+T2M_CONTROL = ("fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date={date},"
+               "time={time},type=cf,levtype=sfc,step=6,param=500011")
+RUNS = glob_wildcards(storage.mch(T2M_CONTROL))  # every control T_2M field at step 6
+
+rule all:
+    input: expand("t2m/{date}{time}.txt", zip, date=RUNS.date, time=RUNS.time)
+
+rule t2m_control:  # shell rule: runs in the main process, keeps the tagged settings
+    input: storage.mch(T2M_CONTROL)
+    output: grib="t2m/{date}{time}.grib2", listing="t2m/{date}{time}.txt"
+    log: "logs/t2m_{date}{time}.log"  # COSMO definitions truncate a redirected stderr
+    shell: "cp {input} {output.grib} && {PYTHON} {GRIB_KEYS} {input} > {output.listing} 2> {log}"
+```
+
+`grib_keys.py` prints `shortName step number` per message. `examples/meteoswiss/profile/config.yaml`
+(paths relative to `examples/meteoswiss/`; list values reach the plugin unchanged, so
+Snakemake does not rebase them on the profile directory):
+
+```yaml
+storage-fdb-config: ["mch::../../.fdb-mch/config.yaml"]
+storage-fdb-eccodes-definitions: ["mch::../../.local/eccodes-cosmo-mars/definitions:../../.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions"]
+storage-fdb-metkit-home: ["mch::../../.local/metkit-home"]
+storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]
+```
+
+`.fdb-mch/` (the README's dev-FDB root) is git-ignored.
 
 `tests/sites/meteoswiss/` (`conftest.py`, `test_read.py`, `test_write.py`,
 `test_glob.py`, `test_workflow.py`, `test_conventions.py`; marker `site_meteoswiss`;
@@ -854,48 +915,87 @@ part of the default `pytest` run — it skips only when prerequisites are missin
   `METKIT_HOME` with no plugin settings at all (proves goal 7's "works via generic
   means"); nothing in `src/` refers to this suite;
 - fixture: temp FDB with the schema from the env var; provider settings built from the
-  env vars; the fixture takes `date`/`time` from the sample file names
+  env vars (`site_fdb["settings"]`, reused by the `read_site` runner; `site_env` in
+  `conftest.py` is the definitions-only environment for subprocesses that decode
+  directly); the fixture takes `date`/`time` from the sample file names
   (`mch_query_base`; `test_conventions.py` checks them against the messages — the OGD
   reference time changes with every fetch) and builds queries with them;
-- (Several items below already exist under other names from steps 5/6:
-  `test_write_ctrl[native|identifier]`, `test_write_members`, `test_read_samples`
-  (members `1/to/3`, TOT_PREC without `timespan`), `test_read_model_requires_metkit_home`.
-  This step adds the remaining ones; the sizes below are those of the full-size
-  originals, tests compare against the sample file's actual size.)
-- `test_native_archive_and_read`: default `archive_mode` (`native`), store the ctrl T_2M file via
-  `fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=<d>,time=<t>,type=cf,levtype=sfc,step=6,param=500011`
-  → `exists()`, `mtime` 10-digit float, `size()` = file size (567 927 B full-size),
-  retrieve round trip byte-identical, listed keys have `domain=''`, `number=''`,
-  `timespan=none`, `model=icon-ch2-eps` [all verified in spec §2.9];
-- `test_identifier_archive`: same with `archive_mode="identifier"` set explicitly
-  (single-rule varda schema);
-- `test_members`: the 2-message perturbed file via `...,type=pf,number=1/2,step=6,param=500011`
-  → 2 fields, `size()` = file size (1 135 854 B full-size); `number=1/to/3` →
-  `exists()` False (member 3 absent);
-- `test_accumulation_needs_timespan`: `param=500041` without `timespan=fs` → `exists()`
-  False; with it → True;
-- `test_number_context`: `type=cf` with `number=0` → invalid-request error;
-- `test_model_requires_metkit_home`: provider without `metkit_home` → invalid-request
-  error mentioning `icon-ch2-eps`;
-- `test_canonical_spelling_mch`: query with `param=T_2M,model=ICON-CH2-EPS` → warning
-  lists `500011` and `icon-ch2-eps`;
-- `test_synthetic_icon` (not sample-gated, but gated on the definitions): build a GRIB2
-  message from eccodes' `GRIB2` sample with `centre=215, generatingProcessIdentifier=142,
-  typeOfGeneratingProcess=4, productDefinitionTemplateNumber=1, perturbationNumber=0,
-  discipline=0, parameterCategory=0, parameterNumber=0, typeOfFirstFixedSurface=103,
-  level=2`; assert `mars_keys` gives `class=od, stream=enfo, type=cf,
-  model=ICON-CH2-EPS, expver=0001, param=500011`; if eccodes cannot produce that
-  (a regular grid is fine), drop this test and keep the sample gating only.
-
-- `test_key_order_from_site_schema`: with the schema from the env var, a query written
-  in ECMWF order is normalised to
-  `date,time,stream,class,expver,model,type,levtype,number,step,param,levelist,timespan`
-  order without any site knowledge in the package.
+- covered by tests from steps 5–7 (sizes quoted are the full-size originals'; tests
+  compare against the sample file's actual size):
+  - native archive and read, default `archive_mode`:
+    `test_write.py::test_write_ctrl[native]` stores the ctrl T_2M file via
+    `fdb://class=od,expver=0001,stream=enfo,model=icon-ch2-eps,date=<d>,time=<t>,type=cf,levtype=sfc,step=6,param=500011`
+    → `exists()`, `mtime() >= t_start`, `size()` = file size (567 927 B full-size),
+    retrieve round trip byte-identical, listed keys have `domain=''`, `number=''`,
+    `timespan=none`, `model=icon-ch2-eps` [all verified in spec §2.9];
+    `test_read.py::test_read_samples` checks the mtime against the flush interval;
+  - identifier archive: `test_write_ctrl[identifier]` (single-rule varda schema);
+  - members: `test_write_members` (`...,type=pf,number=1/2,step=6,param=500011` → 2
+    fields, `size()` = file size, 1 135 854 B full-size) and `test_read_samples`
+    (`number=1/to/3` → `exists()` False, member 3 absent);
+  - accumulation needs timespan: `test_read_samples` (`param=500041` without
+    `timespan=fs` → `exists()` False; with it → True);
+  - model requires metkit home: `test_read_model_requires_metkit_home` (provider without
+    `metkit_home` → invalid-request error mentioning `icon-ch2-eps` and the hint);
+- added in this step:
+  - `test_read.py::test_number_context`: `type=cf` with `number=0` → invalid-request
+    error mentioning `number`;
+  - `test_read.py::test_canonical_spelling_mch`: query with `param=T_2M,model=ICON-CH2-EPS`
+    finds the field and logs one warning listing `500011` and `icon-ch2-eps` (the read
+    script collects warnings);
+  - `test_conventions.py::test_synthetic_icon` (not sample-gated, but gated on the
+    definitions; like `decoded` it runs through `run_site` with `site_env`): a GRIB2
+    message from eccodes' `GRIB2` sample (`grib.variant`) with, in this order,
+    `centre=215, tablesVersion=15, localTablesVersion=1, grib2LocalSectionPresent=1,
+    localDefinitionNumber=253, productDefinitionTemplateNumber=1,
+    generatingProcessIdentifier=142, typeOfGeneratingProcess=4, perturbationNumber=0,
+    numberOfForecastsInEnsemble=21, discipline=0, parameterCategory=0,
+    parameterNumber=0, typeOfFirstFixedSurface=103, scaleFactorOfFirstFixedSurface=0,
+    scaledValueOfFirstFixedSurface=2`; `mars_keys` gives `class=od, stream=enfo,
+    type=cf, model=ICON-CH2-EPS, expver=0001, levtype=sfc, param=500011` [verified:
+    without the local section (definition 253, as in the OGD files) cosmo-mars adds none
+    of `class/stream/type/model/expver`];
+  - `test_conventions.py::test_key_order_from_site_schema`: a provider (`make_provider`)
+    whose FDB config names the schema from `SMK_FDB_TEST_MCH_SCHEMA` normalises a query
+    written in ECMWF order to
+    `date,time,stream,class,expver,model,type,levtype,number,step,param,levelist,timespan`
+    order without any site knowledge in the package; it needs only the schema, whose
+    default path exists, so it also runs without the other variables;
+  - `test_workflow.py`: runs the shipped example (below);
+    `test_workflow_example_profile_is_tagged` (no prerequisites) checks that every
+    value of the shipped profile is `mch::`-tagged and that the two keys the e2e test
+    overrides are present;
+  - `test_fetch_ogd_samples.py` (gated on the definitions, then plain skips, also with
+    `SMK_FDB_TEST_REQUIRE_SITES=1`; the script is imported via `PYTHONPATH`, no
+    bytecode written): `test_empty_data_reproduces_committed_samples` (needs the
+    git-ignored full-size originals in `.local/raw-full/meteoswiss/`; `empty_file` on
+    each is byte-identical to the committed copy) and
+    `test_fetch_live` (only with `SMK_FDB_TEST_OGD_LIVE=1`; writes into pytest's
+    temporary directory: 3 full-size and 3 constant-field files, equal printed MARS keys,
+    copies of 175–350 B, refusal without `--force`, error for an expired reference time).
+- site e2e, `test_workflow.py`: copies `examples/meteoswiss/` to
+  `<tmp>/examples/meteoswiss/`, runs the documented dev-FDB command in `<tmp>`
+  (`init_dev_fdb.py --root .fdb-mch --schema <SMK_FDB_TEST_MCH_SCHEMA> --seed
+  <SMK_FDB_TEST_MCH_SAMPLES>` with the site env; 4 messages), then in the copy
+  `snakemake --profile profile -c1 --storage-fdb-eccodes-definitions mch::<definitions>
+  --storage-fdb-metkit-home mch::<metkit home>` without `ECCODES_DEFINITION_PATH`/
+  `METKIT_HOME`: the command-line values replace the profile's `.local/` paths, `config`
+  and `env` come from the shipped profile; `rule all` globs the control field; the
+  normalised query is retrieved, the `.grib2` output is byte-identical to the sample,
+  `grib_keys.py` prints `T_2M 6 0`, the local copy under `.snakemake/storage/mch/` is
+  removed (`test_workflow_retrieves_control_field`); the second run is a no-op.
 
 Acceptance: `uv run pytest tests/sites/meteoswiss -m site_meteoswiss -q -rs` shows the
 exact missing prerequisite when skipping locally; `SMK_FDB_TEST_REQUIRE_SITES=1 ...`
 green on a node with samples + definitions (and in CI, step 11);
 `grep -riE 'mch|meteoswiss|cosmo|icon-ch' src/` still empty.
+[verified 2026-09-15: with `SMK_FDB_TEST_REQUIRE_SITES=1` 27 passed, 1 skipped (live
+fetch) both with the earlier scratch definitions/metkit home and with the output of
+`setup.sh --dest <scratch>` and `make_metkit_home.py --dest <scratch>`; without the
+variables 2 passed (key order, profile), 26 skipped with one reason per missing
+prerequisite, and 26 errors with `SMK_FDB_TEST_REQUIRE_SITES=1`; `SMK_FDB_TEST_OGD_LIVE=1`
+live test 2 passed (before the review's simplifications; the review re-ran everything
+but the live test)]
 
 ## Step 11 — CI
 
@@ -956,7 +1056,7 @@ jobs:
         run: |
           bash examples/meteoswiss/setup.sh --dest .local        # clones eccodes-cosmo-mars (varda-ext), installs eccodes-cosmo-resources-python
           uv run python examples/meteoswiss/make_metkit_home.py --dest .local/metkit-home
-          echo "SMK_FDB_TEST_ECCODES_DEFINITIONS=$PWD/.local/eccodes-cosmo-mars/definitions:$(uv run python -c 'import eccodes_cosmo_resources as c; print(c.get_definitions_path())')" >> "$GITHUB_ENV"
+          echo "SMK_FDB_TEST_ECCODES_DEFINITIONS=$PWD/.local/eccodes-cosmo-mars/definitions:$PWD/.local/eccodes-cosmo-resources/share/eccodes-cosmo-resources/definitions" >> "$GITHUB_ENV"
           echo "SMK_FDB_TEST_METKIT_HOME=$PWD/.local/metkit-home" >> "$GITHUB_ENV"
           echo "SMK_FDB_TEST_MCH_SCHEMA=$PWD/examples/meteoswiss/realtime-varda.schema" >> "$GITHUB_ENV"
       - name: Sample data (committed empty-data samples)
@@ -992,7 +1092,8 @@ checked against the GRIB; relabelling needs `grib_set`) and the reserved
 pyfdb/eccodes version choice, how to point the plugin at *any* site's definitions and
 MARS language (`eccodes_definitions`, `metkit_home`, `env`), limitations, platform note.
 
-`docs/sites/meteoswiss.md` (site page, links to `examples/meteoswiss/`): clone
+`docs/sites/meteoswiss.md` (site page, links to `examples/meteoswiss/`; first version
+written in step 10, reviewed and completed here): clone
 `eccodes-cosmo-mars` `varda-ext` + install `eccodes-cosmo-resources-python`,
 `make_metkit_home.py` (default and extra `--models`), the profile, `realtime-varda.schema`,
 the MeteoSwiss dev-FDB command (from `examples/meteoswiss/README.md`), `timespan=fs` for

@@ -21,12 +21,22 @@ from snakemake_storage_plugin_fdb import StorageProvider, StorageProviderSetting
 from snakemake_storage_plugin_fdb.grib import split_messages
 
 job = json.loads(sys.argv[1])
+out = {"archived": [], "results": {}, "warnings": []}
+
+
+class Collect(logging.Handler):
+    def emit(self, record):
+        out["warnings"].append(record.getMessage())
+
+
+logger = logging.getLogger("site")
+logger.addHandler(Collect(logging.WARNING))
+logger.propagate = False
 provider = StorageProvider(
     local_prefix=Path(job["local_prefix"]),
-    logger=logging.getLogger("site"),
+    logger=logger,
     settings=StorageProviderSettings(**job["settings"]),
 )
-out = {"archived": [], "results": {}}
 if job.get("archive"):
     start = time.time()
     for path in job["archive"]:
@@ -70,20 +80,21 @@ def site_fdb(
     the queries addressing them (``t2m_pf_1to3`` and ``tp_cf_no_timespan`` match
     nothing: member 3 is absent, accumulations need ``timespan=fs``)."""
     tmp = tmp_path_factory.mktemp("mch-fdb")
-    config = mch_fdb_config(tmp)
     files = {name: mch_sample(pattern) for name, pattern in SAMPLES.items()}
     settings = {
-        "config": str(config),
-        "archive_mode": "native",
+        "config": str(mch_fdb_config(tmp)),
         "eccodes_definitions": eccodes_definitions,
         "metkit_home": str(metkit_home),
     }
-    job = {"settings": settings, "archive": [str(p) for p in files.values()]}
+    job = {
+        "settings": {**settings, "archive_mode": "native"},
+        "archive": [str(p) for p in files.values()],
+    }
     out = run_site(SCRIPT, job, tmp)
     assert len(out["archived"]) == 4
     base = "fdb://" + mch_query_base(files["t2m_cf"])
     return {
-        "config": str(config),
+        "settings": settings,
         "files": files,
         "flush": out["flush"],
         "queries": {
@@ -96,25 +107,26 @@ def site_fdb(
     }
 
 
+@pytest.fixture
+def read_site(site_fdb, run_site, tmp_path):
+    """``read(queries, settings=site settings, env=None)``: the script's output
+    (``results`` per query name and the ``warnings`` logged)."""
+
+    def read(queries: dict, settings: dict | None = None, env=None) -> dict:
+        job = {"settings": settings or site_fdb["settings"], "queries": queries}
+        return run_site(SCRIPT, job, tmp_path, env)
+
+    return read
+
+
 @pytest.mark.parametrize("configured_by", ["settings", "env"])
-def test_read_samples(
-    site_fdb, run_site, eccodes_definitions, metkit_home, tmp_path, configured_by
-):
+def test_read_samples(site_fdb, read_site, site_env, metkit_home, configured_by):
     if configured_by == "settings":
-        settings = {
-            "config": site_fdb["config"],
-            "eccodes_definitions": eccodes_definitions,
-            "metkit_home": str(metkit_home),
-        }
-        env = {}
+        results = read_site(site_fdb["queries"])["results"]
     else:  # plain environment variables, no site settings at all
-        settings = {"config": site_fdb["config"]}
-        env = {
-            "ECCODES_DEFINITION_PATH": eccodes_definitions,
-            "METKIT_HOME": str(metkit_home),
-        }
-    job = {"settings": settings, "queries": site_fdb["queries"]}
-    results = run_site(SCRIPT, job, tmp_path, env)["results"]
+        settings = {"config": site_fdb["settings"]["config"]}
+        env = {**site_env, "METKIT_HOME": str(metkit_home)}
+        results = read_site(site_fdb["queries"], settings, env)["results"]
     start, end = site_fdb["flush"]
     for name, path in site_fdb["files"].items():
         res = results[name]
@@ -127,18 +139,31 @@ def test_read_samples(
     assert results["tp_cf_no_timespan"] == {"exists": False}
 
 
-def test_read_model_requires_metkit_home(
-    site_fdb, run_site, eccodes_definitions, tmp_path
-):
-    settings = {
-        "config": site_fdb["config"],
-        "eccodes_definitions": eccodes_definitions,
-    }
-    job = {
-        "settings": settings,
-        "queries": {"t2m_cf": site_fdb["queries"]["t2m_cf"]},
-    }
-    error = run_site(SCRIPT, job, tmp_path)["results"]["t2m_cf"].get("error", "")
+def test_read_model_requires_metkit_home(site_fdb, read_site):
+    settings = {k: v for k, v in site_fdb["settings"].items() if k != "metkit_home"}
+    query = site_fdb["queries"]["t2m_cf"]
+    error = read_site({"t2m_cf": query}, settings)["results"]["t2m_cf"].get("error", "")
     assert error.startswith("WorkflowError: Invalid MARS request"), error
     assert "icon-ch2-eps" in error
     assert "metkit_home" in error  # the mapped hint
+
+
+def test_number_context(site_fdb, read_site):
+    # metkit accepts number only with type=pf (spec §8)
+    query = site_fdb["queries"]["t2m_cf"] + ",number=0"
+    error = read_site({"cf": query})["results"]["cf"].get("error", "")
+    assert error.startswith("WorkflowError: Invalid MARS request"), error
+    assert "number" in error
+
+
+def test_canonical_spelling_mch(site_fdb, read_site):
+    query = (
+        site_fdb["queries"]["t2m_cf"]
+        .replace("model=icon-ch2-eps", "model=ICON-CH2-EPS")
+        .replace("param=500011", "param=T_2M")
+    )
+    out = read_site({"q": query})
+    assert out["results"]["q"].get("exists") is True, out["results"]  # same field
+    (warning,) = [w for w in out["warnings"] if "non-canonical spelling" in w]
+    assert "model=ICON-CH2-EPS" in warning and "icon-ch2-eps" in warning, warning
+    assert "param=T_2M" in warning and "500011" in warning, warning

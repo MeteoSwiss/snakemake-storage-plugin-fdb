@@ -1,0 +1,143 @@
+# Provenance: verbatim copy of resources/fdb/realtime-varda.schema from
+#   https://github.com/MeteoSwiss/evalml, branch enable_fdb (tip 53e37f5cad20a67681315353630783bcdbc4d35e),
+#   last changed in commit 15cf43af69a1c5c90ab64be9deab76a94d371936 (git blob
+#   c64fd7e4b23683a0e9bc3052a72e6b8bd2b016ac, 3214 bytes). Everything after the
+#   "End of provenance header" line below is that file, unchanged.
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2025, MeteoSwiss
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# End of provenance header
+
+# * Format of the rules is:
+
+# [a1, a2, a3 ...[b1, b2, b3... [c1, c2, c3...]]]
+
+# - The first level (a) defines which attributes are used to name the top level directory
+# - The second level (b) defines which attributes are used to name the data files
+# - The third level (c) defines which attributes are used as index keys
+
+# * Rules can be grouped
+
+# [a1, a2, a3 ...
+#   [b1, b2, b3... [c1, c2, c3...]]
+#   [B1, B2, B3... [C1, C2, C3...]]
+# ]
+
+# * A list of values can be given for an attribute
+# [ ..., stream=enfo/efov, ... ]
+# This will be used when matching rules.
+
+# * Attributes can be typed
+#   Globally, at the begining of this file:
+
+#   refdate: Date;
+
+#   or in the context of a rule:
+#   [type=cl, ... [date:ClimateMonth, ...]]
+
+# Typing attributes is done when the user's requests or the GRIB values need to be modified before directories, files and indexes are created. For example, ClimateMonth will transform 2010-04-01 to 'may' internally.
+
+# * Attributes can be optional
+# [ step, levelist?, param ]
+# They will be replaced internally by an empty value. It is also posiible to provide a default subtitution value: e.g. [domain?g] will consider the domain to be 'g' if missing.
+
+# * Attributes can be removed:
+# [grid-]
+# This is useful to remove attributes present in the GRIB that should not be ignored
+
+# * Rules are matched:
+
+# - If the attributes are present in the GRIB/Request, or marked optional or ignored
+# - If a list of possible value is provided, one of them must match, for example
+#   [ class, expver, stream=enfo/efov, date, time, domain ]
+#   will match either stream=enfo or stream=efov, all other attributes will be matched if they exist in the GRIB or user's request
+
+# * On archive:
+# - Attributes are extracted from the GRIB (namespace 'mars'), possibly modified by the attribute type
+# - Only the first rule is used, so order is important
+# - All GRIB attributes must be used by the rules, otherwise an error is raised
+
+# * On retrieve:
+# - Attributes are extracted from the user's request, possibly modified by the attribute type (e.g. for handling of U/V)
+# - All the matching rules are considered
+# - Only attributes listed in the rules are used to extract values from the user's request
+
+
+# Default types
+
+param:      Param;
+step:       Step;
+date:       Date;
+hdate:      Date;
+refdate:    Date;
+latitude:   Double;
+longitude:  Double;
+level:      Double;
+levelist:   Double;
+grid:       Grid;
+expver:     Expver;
+
+time:       Time;
+fcmonth:    Integer;
+
+number:     Integer;
+frequency:  Integer;
+direction:  Integer;
+channel:    Integer;
+
+instrument: Integer;
+ident:      Integer;
+
+diagnostic: Integer;
+iteration:  Integer;
+system:     Integer;
+method:     Integer;
+
+# ???????
+
+# reference:  Integer;
+# fcperiod:   Integer;
+
+# opttime:    Integer;
+# leadtime:   Integer;
+
+# quantile:   ??????
+# range:      ??????
+
+# band:       Integer;
+
+
+########################################################
+# These rules must be first, otherwise fields of These
+# classes will be index with the default rule for oper #expver?, model?, type?
+
+[ date, time, stream, class, expver, model, type, domain-
+    [ levtype, number?
+        [ step, param, levelist?, timespan?none ]]]
