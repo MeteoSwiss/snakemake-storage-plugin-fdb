@@ -7,6 +7,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-16
+
+First release.
+
 ### Added
 
 - `fdb` storage provider for Snakemake: `fdb://key=value,...` queries address one or
@@ -32,3 +36,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/sites/meteoswiss.md`.
 - Documentation: a user guide, a reference and contributing notes under `docs/`, and a
   rewritten README with a quick start.
+
+[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/releases/tag/v0.1.0
