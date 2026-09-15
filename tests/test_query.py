@@ -267,6 +267,13 @@ def test_list_wildcard_value_does_not_commute():
         ("param", "70.131", 131070),
         ("param", "2t", None),
         ("step", "10m", "10m"),
+        ("time", "0000", 0),
+        ("time", "00", 0),
+        ("time", "12", 1200),
+        ("time", "1200", 1200),
+        ("date", "20200101", 20200101),
+        ("date", "-1", None),
+        ("date", "2020-01-01", None),
     ],
 )
 def test_comparable(key, value, expected):

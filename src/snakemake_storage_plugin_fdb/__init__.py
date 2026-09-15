@@ -115,10 +115,12 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         },
     )
     archive_mode: Optional[str] = field(  # noqa: UP045
-        default="identifier",
+        default="native",
         metadata={
-            "help": "How outputs are archived: 'identifier' (the plugin builds the "
-            "FDB key of every message) or 'native' (FDB derives keys from the GRIB).",
+            "help": "How outputs are archived: 'native' (default; FDB derives the keys "
+            "from the GRIB) or 'identifier' (the plugin builds the FDB key of every "
+            "message; use it only with schemas whose rules share one key set, or "
+            "supply the other keys in the query).",
         },
     )
     identifier_check: Optional[str] = field(  # noqa: UP045
@@ -507,6 +509,11 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                 expanded = self.provider.backend.expand(request)
             self._check_spelling(expanded)
             if expanded is None:
+                self.provider.logger.debug(
+                    f"FDB storage: {self.query}: no metkit expansion; query values are "
+                    "used as written (spelling check skipped, identifier values from "
+                    "the query archived verbatim)"
+                )
                 expanded = fallback_expand(request)
             self._expansion, self._expansion_for = expanded, self.query
         return self._expansion
@@ -521,8 +528,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         if policy == "ignore":
             return
         if expanded is None:
-            self.provider.logger.debug("canonical-spelling check skipped: no expansion")
-            return
+            return  # _expanded() logs the missing expansion
         diffs = self.provider.backend.spelling_diffs(self.parsed, expanded)
         if not diffs:
             return
@@ -712,9 +718,9 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         self, messages: list[GribMessage], local: Path
     ) -> list[dict[str, str]]:
         """FDB identifiers of ``messages`` (numbered from 1), each pre-checked against
-        the query's value lists and passed to the guard (spec §7.7)."""
+        the query's values and passed to the guard (spec §7.7)."""
         parsed = self.parsed
-        single = parsed.single_valued()
+        single = self._canonical_single_values()
         allowed = self._allowed_values()
         info = self.provider.schema_info
         identifiers = []
@@ -749,17 +755,26 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             identifiers.append(identifier)
         return identifiers
 
+    def _canonical_single_values(self) -> dict[str, str]:
+        """Single-valued query keys spelled as in the expansion (spec §7.7): FDB's
+        canonical spelling with metkit, the value as written with the fallback."""
+        expanded = self._expanded()
+        return {
+            key: expanded[key][0] if len(expanded.get(key, ())) == 1 else value
+            for key, value in self.parsed.single_valued().items()
+        }
+
     def _allowed_values(self) -> dict[str, list[int | str]]:
-        """Pre-check lists: the comparable items of every query key with several
-        literal values; keys with ``to``/``by`` or an incomparable item are skipped."""
+        """Pre-check values: the comparable items of every constant query key, single-
+        or multi-valued. Keys with ``to``/``by`` are skipped, as are keys whose items
+        are not all comparable and of one kind (all integers or all strings)."""
         parsed = self.parsed
         allowed = {}
-        for key in parsed.keys():
-            items = parsed.items(key)
-            if len(items) < 2 or parsed.has_range(key):
+        for key in parsed.constant_pairs():
+            if parsed.has_range(key):
                 continue
-            comparables = [comparable(key, item) for item in items]
-            if None not in comparables:
+            comparables = [comparable(key, item) for item in parsed.items(key)]
+            if None not in comparables and len({type(c) for c in comparables}) == 1:
                 allowed[key] = comparables
         return allowed
 
@@ -770,21 +785,27 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         allowed: Mapping[str, list[int | str]],
         local: Path,
     ) -> None:
-        """Message values of the keys in ``allowed`` must be one of the listed ones."""
+        """Message values of the keys in ``allowed`` must be one of the listed ones.
+
+        Keys the message does not carry are not checked: the query value labels it.
+        """
         for key, items in allowed.items():
             if key not in values:
                 continue
             given = comparable(key, values[key])
-            if given is None:
+            # given is None or of the other kind: an alias such as step=0 vs 0m
+            if given is None or type(given) is not type(items[0]) or given in items:
                 continue
-            if isinstance(given, int) and not all(isinstance(a, int) for a in items):
-                continue  # non-numeric alias of a numeric value
-            if given not in items:
-                raise WorkflowError(
-                    f"{self.query}: message {index} of {local} has {key}="
-                    f"{values[key]}, not one of {self.parsed.value(key)}; nothing was "
-                    "archived"
-                )
+            query_value = self.parsed.value(key)
+            expected = (
+                f"but the query has {key}={query_value}"
+                if len(items) == 1
+                else f"not one of {query_value}"
+            )
+            raise WorkflowError(
+                f"{self.query}: message {index} of {local} has {key}={values[key]}, "
+                f"{expected}; nothing was archived"
+            )
 
     def _archive(
         self, batch: list[tuple[bytes, dict[str, str] | None]], local: Path

@@ -146,6 +146,18 @@ def test_write_strict_rejects_foreign_member(write_job, archive_mode):
         assert res["found"] == 1
 
 
+def test_write_identifier_param_mismatch(write_job):
+    # single-valued query keys are checked against the GRIB (spec §7.7)
+    fields = "type=cf,param=500041"  # the file holds T_2M (500011)
+    out = write_job("identifier", {"t2m_cf": ("*_step6_t_2m_ctrl.grib2", fields, {})})
+    res = out["results"]["t2m_cf"]
+    assert (
+        "has param=500011, but the query has param=500041; nothing was archived"
+        in res["error"]
+    )
+    assert res["found"] == 0
+
+
 def test_write_remove_policy_warn(write_job):
     extra = {"remove": 2}
     out = write_job(

@@ -39,6 +39,7 @@ ECMWF_PARAM_TABLE = 128  # table whose paramIds carry no table prefix
 _KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _ICHAR_RE = re.compile(r"[A-Za-z0-9.\-:_]")
 _PARAM_TABLE_RE = re.compile(r"(\d+)\.(\d+)")  # e.g. 167.128, 70.131
+_DATE_RE = re.compile(r"\d{8}")  # YYYYMMDD
 # eckit::StreamParser (used by fdb5 SchemaParser) skips "#" to end of line anywhere.
 _SCHEMA_COMMENT_RE = re.compile(r"#[^\n]*")
 
@@ -104,12 +105,18 @@ def _replace_literal(value: str, old: str, new: str) -> str:
 
 def comparable(key: str, value: str) -> int | str | None:
     """Light normalisation of a MARS value for comparisons (spec §7.7): integers
-    compare numerically, ``param`` as a paramId (``N.T`` -> ``N`` for table 128, else
-    ``T*1000+N``; ``None`` for other spellings), everything else case-insensitively."""
+    compare numerically (``time`` of one or two digits as hours, ``12`` -> ``1200``),
+    ``param`` as a paramId (``N.T`` -> ``N`` for table 128, else ``T*1000+N``),
+    everything else case-insensitively. ``None`` (not comparable) for other ``param``
+    spellings and for ``date`` values other than ``YYYYMMDD`` (relative dates)."""
     if key == "param" and (m := _PARAM_TABLE_RE.fullmatch(value)):
         number, table = int(m.group(1)), int(m.group(2))
         return number if table == ECMWF_PARAM_TABLE else table * 1000 + number
+    if key == "date":
+        return int(value) if _DATE_RE.fullmatch(value) else None
     if INT_RE.fullmatch(value):
+        if key == "time" and len(value) <= 2:
+            return int(value) * 100
         return int(value)
     return None if key == "param" else value.lower()
 

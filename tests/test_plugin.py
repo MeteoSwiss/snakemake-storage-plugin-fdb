@@ -34,6 +34,11 @@ from snakemake_storage_plugin_fdb.query import NAME_MAX
 REPO = Path(__file__).resolve().parents[1]
 RAW = REPO / ".raw"
 TEST_SCHEMA = Path(__file__).resolve().parent / "data" / "schema"
+ECMWF_SCHEMA = TEST_SCHEMA.with_name("ecmwf-fdb-tests.schema")  # multi-rule
+SYNTH11_QUERY = (  # .raw/synth11.grib as is (spec §2.1)
+    "fdb://class=od,expver=0001,stream=oper,date=20230508,time=1200,domain=g,"
+    "type=fc,levtype=sfc,step=1,param=151130"
+)
 BASE = "class=od,expver=0001,stream=oper,date=20240101,time=0000,type=fc,levtype=sfc"
 # class=ea,stream=oper variants of template.grib seeded by conftest.seeded_fdb
 EA = (
@@ -526,6 +531,12 @@ def _in_fdb(provider: StorageProvider, query: str) -> int:
     return len(provider.backend.inspect(provider.object(query).parsed.to_request()))
 
 
+def _stored_key(provider: StorageProvider) -> dict[str, str]:
+    """Key of the only field stored by the test (in the ``expver=0002`` variants)."""
+    (field,) = provider.backend.list({"class": "ea", "expver": "0002"})
+    return field.key
+
+
 @needs_raw
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
 def test_store_roundtrip(make_provider, archive_mode):
@@ -618,6 +629,104 @@ def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
 
 
 @needs_raw
+def test_store_default_native_under_multi_rule_schema(make_provider):
+    """Native is the default (spec §7.7): identifier mode needs a value for every key
+    that is mandatory in any rule of a multi-rule schema."""
+    provider = make_provider(schema=ECMWF_SCHEMA)
+    data = (RAW / "synth11.grib").read_bytes()
+    obj = _store(provider, SYNTH11_QUERY, data)
+    assert obj.exists() is True
+    obj.local_path().unlink()
+    obj.retrieve_object()
+    assert obj.local_path().read_bytes() == data  # unpadded single message
+
+    identifier = make_provider(schema=ECMWF_SCHEMA, archive_mode="identifier")
+    with pytest.raises(
+        WorkflowError,
+        match=r"cannot determine \w+ for message 1 of .*; nothing was archived",
+    ):
+        _store(identifier, SYNTH11_QUERY, data)
+
+
+@needs_raw
+@pytest.mark.parametrize(
+    "fields, messages, error",  # message 1 matches, message 2 contradicts the query
+    [
+        (
+            "step=6,param=167/165",
+            [(6, 167), (0, 165)],
+            "step=0, but the query has step=6",
+        ),
+        (
+            "step=0/6,param=165",
+            [(0, 165), (6, 167)],
+            "param=167, but the query has param=165",
+        ),
+    ],
+    ids=["step", "param"],
+)
+def test_store_identifier_single_value_mismatch(make_provider, fields, messages, error):
+    provider = make_provider(archive_mode="identifier")
+    query = f"fdb://{EA2},{fields}"
+    data = b"".join(_grib((step,), (param,)) for step, param in messages)
+    with pytest.raises(
+        WorkflowError, match=f"message 2 of .* has {error}; nothing was archived"
+    ):
+        _store(provider, query, data)
+    assert _in_fdb(provider, query) == 0
+
+
+@needs_raw
+@pytest.mark.parametrize(
+    "key, given, canonical",
+    [
+        ("param", "167", "167"),
+        ("param", "167.128", "167"),  # FDB would store it verbatim (spec §2.4)
+        ("time", "0", "0000"),  # FDB would reject it as not canonical
+        ("time", "00", "0000"),
+    ],
+)
+def test_store_identifier_archives_canonical_spelling(
+    make_provider, key, given, canonical
+):
+    # the GRIB says param=167.128 (paramId 167), time=0000: the pre-check passes and
+    # the identifier uses the canonical spelling (spec §7.7)
+    provider = make_provider(archive_mode="identifier")
+    canonical_query = f"fdb://{EA2},step=0,param=167"
+    query = canonical_query.replace(f"{key}={canonical}", f"{key}={given}")
+    _store(provider, query, _grib((0,)))  # includes the post-check
+    assert _stored_key(provider)[key] == canonical
+    obj = provider.object(canonical_query)
+    assert obj.exists() is True
+    obj.retrieve_object()
+    (message,) = split_messages(obj.local_path())
+    assert (message.param_id, message.mars["time"]) == ("167", "0000")
+
+
+@needs_raw
+def test_store_identifier_verbatim_without_expansion(
+    make_provider, monkeypatch, caplog
+):
+    provider = make_provider(archive_mode="identifier")
+    monkeypatch.setattr(provider.backend, "expand", lambda request: None)
+    with caplog.at_level(logging.DEBUG, logger="fdb-test"):
+        obj = _store(provider, f"fdb://{EA2},step=0,param=167.128", _grib((0,)))
+    assert obj.exists() is True
+    assert _stored_key(provider)["param"] == "167.128"
+    assert "archived verbatim" in caplog.text
+
+
+@needs_raw
+def test_store_identifier_key_absent_from_message_takes_query_value(make_provider):
+    # the variants carry no quantile (an optional key of tests/data/schema)
+    provider = make_provider(archive_mode="identifier")
+    query = f"fdb://{EA2},step=0,quantile=1:10,param=167"
+    obj = _store(provider, query, _grib((0,)))
+    assert obj.exists() is True
+    assert _stored_key(provider)["quantile"] == "1:10"
+
+
+@needs_raw
 def test_store_wildcard_query_rejected(make_provider):
     with pytest.raises(WorkflowError, match="unresolved wildcards"):
         _store(make_provider(), f"fdb://{EA2},step={{step}},param=167", _grib((0,)))
@@ -625,7 +734,7 @@ def test_store_wildcard_query_rejected(make_provider):
 
 @needs_raw
 def test_store_partial_archive_failure_says_fields_stay(make_provider, monkeypatch):
-    provider = make_provider()
+    provider = make_provider(archive_mode="identifier")  # one archive call per message
     real, calls = provider.backend.archive, []
 
     def failing(data, identifier=None):
@@ -658,7 +767,7 @@ class RecordingGuard:
 
 @needs_raw
 def test_store_guard_sees_every_message_before_archive(make_provider, monkeypatch):
-    provider = make_provider()
+    provider = make_provider(archive_mode="identifier")  # the guard runs only there
     events: list = []
     provider.guard = RecordingGuard(events)
     real = provider.backend.archive
@@ -684,7 +793,7 @@ def test_store_guard_sees_every_message_before_archive(make_provider, monkeypatc
 
 @needs_raw
 def test_store_guard_mismatch_leaves_fdb_unchanged(make_provider, monkeypatch):
-    provider = make_provider()
+    provider = make_provider(archive_mode="identifier")
     provider.guard = RecordingGuard([], fail_on=2)
     archived = []
     monkeypatch.setattr(provider.backend, "archive", lambda *a: archived.append(a))

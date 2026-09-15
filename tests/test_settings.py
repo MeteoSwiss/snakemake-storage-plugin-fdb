@@ -27,7 +27,7 @@ from snakemake_storage_plugin_fdb.query import parse
 SETTINGS = {
     "config": None,
     "user_config": None,
-    "archive_mode": "identifier",
+    "archive_mode": "native",  # spec §7.7 decision
     "identifier_check": "none",
     "store_check": "strict",
     "canonical_spelling": "warn",
@@ -71,7 +71,7 @@ def test_settings_fields():
 
 def test_settings_defaults_construct(make_provider):
     provider = make_provider()
-    assert provider.archive_mode == "identifier"
+    assert provider.archive_mode == "native"
     assert provider.store_check == "strict"
     assert provider.canonical_spelling == "warn"
     assert provider.remove_policy == "warn"
@@ -81,7 +81,7 @@ def test_settings_defaults_construct(make_provider):
 
 def test_settings_none_means_default(make_provider):
     provider = make_provider(archive_mode=None, store_check=None, remove_policy=None)
-    assert (provider.archive_mode, provider.store_check) == ("identifier", "strict")
+    assert (provider.archive_mode, provider.store_check) == ("native", "strict")
     assert provider.remove_policy == "warn"
 
 
@@ -102,13 +102,13 @@ def test_settings_invalid_choice(make_provider, name, value):
 
 def test_settings_other_choices(make_provider):
     provider = make_provider(
-        archive_mode="native",
+        archive_mode="identifier",
         store_check="warn",
         canonical_spelling="error",
         remove_policy="ignore",
         glob_required_keys=" class , Stream ",
     )
-    assert (provider.archive_mode, provider.store_check) == ("native", "warn")
+    assert (provider.archive_mode, provider.store_check) == ("identifier", "warn")
     assert (provider.canonical_spelling, provider.remove_policy) == ("error", "ignore")
     assert provider.glob_required_keys == ("class", "stream")
     assert make_provider(glob_required_keys="").glob_required_keys == ()
