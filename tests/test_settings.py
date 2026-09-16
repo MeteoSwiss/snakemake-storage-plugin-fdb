@@ -31,6 +31,7 @@ SETTINGS = {
     "identifier_check": "none",
     "canonical_spelling": "warn",
     "remove_policy": "warn",
+    "input_tracking": "lookup",  # FR-RERUN-002
     "glob_required_keys": "class",
     "eccodes_definitions": None,
     "metkit_home": None,
@@ -96,6 +97,7 @@ def test_settings_defaults_construct(make_provider):
     assert provider.canonical_spelling == "warn"
     assert provider.remove_policy == "warn"
     assert provider.glob_required_keys == ("class",)
+    assert provider.input_tracking == "lookup"
     assert isinstance(provider.guard, NoGuard)
 
 
@@ -112,6 +114,7 @@ def test_settings_none_means_default(make_provider):
         ("canonical_spelling", "fix"),
         ("remove_policy", "wipe"),
         ("identifier_check", "loose"),
+        ("input_tracking", "text"),
     ],
 )
 def test_settings_invalid_choice(make_provider, name, value):

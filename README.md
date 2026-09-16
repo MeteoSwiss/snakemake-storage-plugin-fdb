@@ -22,9 +22,9 @@ fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,le
 - **Multi-field queries:** `/` lists, `to`/`by` ranges and Snakemake wildcards. One
   query maps to one local file.
 - **Snakemake semantics:** an input exists only when all its fields are in FDB.
-  Modification times come from FDB index timestamps. Retrieval is atomic; transient
-  errors are retried and permanent ones fail at once, with a message that says what to
-  fix.
+  Modification times come from FDB index timestamps, and reruns follow the FDB
+  lookup, not the text of the query. Retrieval is atomic; transient errors are
+  retried and permanent ones fail at once, with a message that says what to fix.
 - **Safe archiving:** field count, GRIB structure, duplicates and every message's MARS
   keys are checked against the query before anything is archived, and the result is
   verified afterwards.
@@ -119,6 +119,7 @@ src/snakemake_storage_plugin_fdb/
     backend.py           pyfdb access: configuration and schema, reads, archives, error mapping
     grib.py              GRIB message splitting and MARS keys (eccodes)
     guard.py             identifier guard hook (reserved)
+    rerun.py             input tracking by lookup (rerun triggers)
 scripts/init_dev_fdb.py  creates and seeds a local development FDB
 examples/ecmwf/          generic example workflow
 examples/meteoswiss/     MeteoSwiss schema, profile, workflow and setup scripts

@@ -9,6 +9,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `input_tracking` setting (`lookup`, the default, or `query`) choosing whether FDB
+  inputs take part in Snakemake's input-set rerun trigger.
 - The settings `config`, `user_config`, `eccodes_definitions`, `metkit_home`,
   `key_order`, `env` and `glob_required_keys` can be given as the environment variables
   `SNAKEMAKE_STORAGE_FDB_CONFIG` and friends; a command-line flag still wins.
@@ -24,6 +26,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reruns of rules with FDB inputs now follow the FDB lookup alone (the fields exist and
+  their index timestamps): editing a query (narrowing, widening, reordering values or
+  writing a range) no longer reruns a job by itself. Local inputs are unaffected; set
+  `input_tracking=query` for the previous behaviour. The first run after upgrading
+  reruns rules with FDB inputs once, because the recorded input set changes.
 - `archive_mode=native` now validates every message before archiving anything: its MARS
   keys must agree with the constant keys of the query, and every query key FDB indexes
   must be present in the message. Previously FDB archived the messages under their own

@@ -1,5 +1,5 @@
 """Provider and storage object: settings, read, write, glob and interface conformance
-(requirements.md §2.1–§2.11).
+(requirements.md §2.1–§2.10, §2.12).
 """
 
 import asyncio

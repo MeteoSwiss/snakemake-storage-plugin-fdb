@@ -24,6 +24,7 @@ the variable over the default.
 | `identifier_check` | `--storage-fdb-identifier-check` | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
 | `canonical_spelling` | `--storage-fdb-canonical-spelling` | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
 | `remove_policy` | `--storage-fdb-remove-policy` | `warn` | `warn`, `ignore`, `error` | FDB cannot delete fields; what removing an output does: no-op with a warning, silent no-op, or error. |
+| `input_tracking` | `--storage-fdb-input-tracking` | `lookup` | `lookup`, `query` | What makes a rule with FDB inputs rerun: `lookup` (only the FDB lookup, so editing a query does not trigger a rerun by itself; see [Methods](#methods)) or `query` (Snakemake's default: the recorded set of input queries too). |
 | `glob_required_keys` | `--storage-fdb-glob-required-keys` (env) | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
 | `eccodes_definitions` | `--storage-fdb-eccodes-definitions` (env) | unset | colon list of existing directories (made absolute; empty entries skipped; `/MEMFS/...` entries passed as is) | Prepended in order to `ECCODES_DEFINITION_PATH`. |
 | `metkit_home` | `--storage-fdb-metkit-home` (env) | unset | directory containing `share/metkit/language.yaml` (made absolute) | Exported as `METKIT_HOME` for a custom MARS language. |
@@ -165,6 +166,7 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `cleanup` | No-op. |
 | `rate_limiter_key`, `default_max_requests_per_second`, `use_rate_limiter` | `"fdb"`, `10.0`, `False`. |
 | `safe_print` | Identity. |
+| `tracks_input_changes` | `False`, or `True` with `input_tracking=query`: whether the object's query takes part in Snakemake's input-set rerun trigger. |
 
 `exists`, `mtime`, `size`, `inventory`, `retrieve_object` and `store_object` expand the
 request with metkit first (once per object and query), which runs the canonical-spelling
@@ -174,6 +176,14 @@ raise `FDB query <query> has unresolved wildcards`. The FDB `inspect`, `retrieve
 from 3 s) unless the failure is one of the mapped permanent ones below (invalid MARS
 request, not GRIB, GRIB keys against the schema, configuration error, I/O error), which
 is raised on the first attempt.
+
+With `input_tracking=lookup` (the default), constructing the first provider of a process
+also patches Snakemake's private `snakemake.persistence.PersistenceBase._input`, so that
+inputs whose `tracks_input_changes` is `False` are left out of the input set Snakemake
+records for the `input` rerun trigger
+([architecture ADR-031](design/architecture.md#adr-031-interim-patch-of-persistencebase_input-for-fdb-inputs)).
+Nothing else in Snakemake is modified. If the attribute is missing or has an unexpected
+signature, the plugin logs the warning below and leaves the trigger alone.
 
 ## Errors and messages
 
@@ -247,6 +257,7 @@ characters with `…`; the full text is logged at debug level.
 | warning | `FDB storage: <query>: <n> of <E> fields found in FDB; missing: ...` (once per query per process, when FDB holds some but not all fields) |
 | warning | `FDB storage: a field of <query> has no index timestamp and no local data file; its mtime is taken as 0` |
 | warning | `FDB storage: providers in one process use different <VARIABLE> settings (<a> vs <b>); the last one wins` |
+| warning | `FDB storage: input tracking by lookup is unavailable with snakemake <version> (<reason>); falling back to query tracking. Set input_tracking=query to silence this warning.` (per provider with `input_tracking=lookup`) |
 | info | `FDB storage: metkit_home overrides METKIT_HOME=<old> with <new>` |
 | debug | `FDB storage: <query>: 0 of <E> fields found in FDB ...` (nothing found; includes the optional-schema-key hint) |
 | debug | `FDB storage: full error text: <full pyfdb message>` (for every error mapped to a `WorkflowError`) |

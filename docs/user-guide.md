@@ -9,6 +9,7 @@ Exact settings, messages and method behaviour are in the [reference](reference.m
 - [Writing queries](#writing-queries)
 - [Reading inputs](#reading-inputs)
 - [Writing outputs](#writing-outputs)
+- [Reruns](#reruns)
 - [Globbing](#globbing)
 - [Canonical spelling](#canonical-spelling)
 - [Removing outputs](#removing-outputs)
@@ -342,11 +343,43 @@ streams).
 
 `identifier_check` is reserved for a stricter identifier check; only `none` is accepted.
 
-### Reruns
+## Reruns
 
-When Snakemake reruns a job, the new fields mask the old ones in FDB: the output still
-exists, its modification time advances and reads return the new data. Masked fields use
-disk space until an FDB administrator runs `fdb purge`.
+Whether a rule with FDB inputs reruns is decided by the FDB lookup: whether the fields
+of its queries are there, and whether any of them is newer than the output. The text of
+a query is not part of that decision — editing it does not rerun anything by itself.
+
+| change | rerun? |
+|---|---|
+| query narrowed (`param=167/165` → `param=167`) | no: the remaining fields are unchanged |
+| query widened, all fields older than the output | no |
+| query widened to a field archived after the output | yes, because that field is newer |
+| values reordered, or `0/6/12` written as `0/to/12/by/6` | no |
+| a field of the query re-archived in FDB | yes: the index timestamp advances |
+| an FDB input added to or removed from the rule | only if the lookup says so (a newer or missing field) |
+| the output re-archived by someone else | no: only consumers of that output rerun |
+| a local input of the same rule changed or added | yes, as always in Snakemake |
+
+The `params`, `code` and `software-env` triggers are untouched: they describe the rule,
+not its inputs.
+
+The consequence: when an edit changes which fields a query names but all of them are
+older than the output, nothing reruns and the output keeps what the old query produced
+(extra fields after narrowing, missing fields after widening, the old fields after
+swapping `param=167` for `param=165`). Nothing flags this. Force the rule
+(`snakemake -R <rule>` or `--force <target>`) after such an edit if the output must
+match the new query.
+
+`--storage-fdb-input-tracking query` restores Snakemake's default behaviour, in which
+any change to the set of input queries reruns the job. The plugin needs a private
+Snakemake API for the default (`lookup`); when that is unavailable it logs
+`input tracking by lookup is unavailable with snakemake <version> ...` and behaves like
+`query`. After upgrading from 0.1.0, rules with FDB inputs rerun once, because the
+recorded input set changes.
+
+When a job does rerun and writes an FDB output, the new fields mask the old ones: the
+output still exists, its modification time advances and reads return the new data.
+Masked fields use disk space until an FDB administrator runs `fdb purge`.
 
 ## Globbing
 
@@ -525,6 +558,7 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 | `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
 | `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
 | "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
+| A rule reruns after a query edit although the fields are unchanged | Input tracking by lookup is off; see the warning in the log and [Reruns](#reruns). |
 
 ## Limitations
 
@@ -532,6 +566,7 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
   whole workflow); FDB queries cannot be command-line targets.
 - No deletion; reruns mask old fields.
 - Modification times have one-second resolution.
+- A query edited to fields older than the output does not rerun (see [Reruns](#reruns)).
 - Remote FDB backends are untested.
 - Tagged settings are lost in spawned jobs (Snakemake 9.27).
 - An unreadable database directory inside an FDB root looks like missing data.

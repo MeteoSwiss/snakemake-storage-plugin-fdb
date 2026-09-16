@@ -61,10 +61,12 @@ from .query import (
     parse,
 )
 from .query import validate as _validate_query
+from .rerun import install_lookup_input_tracking
 
 ARCHIVE_MODES = ("identifier", "native")
 CANONICAL_SPELLINGS = ("warn", "error", "ignore")
 REMOVE_POLICIES = ("warn", "ignore", "error")
+INPUT_TRACKINGS = ("lookup", "query")
 LANGUAGE_FILE = Path("share", "metkit", "language.yaml")
 MEMFS_PREFIX = "/MEMFS/"  # eccodes' in-memory definitions (bundled with the wheels)
 
@@ -163,6 +165,15 @@ class StorageProviderSettings(StorageProviderSettingsBase):
             "help": "FDB cannot delete fields; what removing an output does: 'warn' "
             "(no-op with a warning), 'ignore' (silent no-op) or 'error'. "
             "(default: warn)",
+        },
+    )
+    input_tracking: Optional[str] = field(  # noqa: UP045
+        default="lookup",
+        metadata={
+            "help": "What makes a rule with FDB inputs rerun: 'lookup' (only the FDB "
+            "lookup, so editing a query does not trigger a rerun by itself) or 'query' "
+            "(Snakemake's default: the recorded set of input queries too). "
+            "(default: lookup)",
         },
     )
     glob_required_keys: Optional[str] = field(  # noqa: UP045
@@ -280,6 +291,9 @@ class StorageProvider(StorageProviderBase):
         self.glob_required_keys = _key_list(
             "glob_required_keys", settings.glob_required_keys
         )
+        self.input_tracking = _choice(settings, "input_tracking", INPUT_TRACKINGS)
+        if self.input_tracking == "lookup":  # FR-RERUN-001, before the DAG is built
+            install_lookup_input_tracking(self.logger)
         self._normalised: set[str] = set()  # queries seen by postprocess_query
 
         self._prepare_environment(settings)  # before anything reads the environment
@@ -444,6 +458,13 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     """One query: a MARS request mapped to one local GRIB file (FR-QUERY-002)."""
 
     provider: StorageProvider
+
+    @property
+    def tracks_input_changes(self) -> bool:
+        """Whether this query takes part in Snakemake's input-set rerun trigger
+        (FR-RERUN-002). Name and meaning of the upstream hook proposed in
+        requirements.md D-011; until it exists, ``rerun.py`` reads it (ADR-031)."""
+        return self.provider.input_tracking == "query"
 
     def __post_init__(self) -> None:
         self._parsed_for: str | None = None
