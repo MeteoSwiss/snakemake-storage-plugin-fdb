@@ -9,6 +9,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Direct FDB access from `run:` and `script:` rules, without any local GRIB file: mark an
+  input `storage.fdb(query, retrieve=False)` and read its fields with the new `api`
+  module (`api.messages`, `api.open`, `api.request`, `api.retrieve`, `api.earthkit`), one
+  message at a time. `api.archive(output, messages)` archives a rule's fields straight
+  into FDB, running the same checks as a file-based store, and leaves a small archive
+  marker at the output's local path that the store step recognises. See the user guide's
+  "Direct access from run and script rules" and the new patterns.
+- A provider with a `config` setting now exports it as `FDB_CONFIG_FILE` (a file) or
+  `FDB_CONFIG` (inline YAML), so plain `pyfdb.FDB()` and earthkit's `fdb` source find the
+  same FDB inside a job. Nothing is exported when the environment already names an FDB
+  configuration or when providers of one process disagree.
 - `docs/patterns.md`, a usage-patterns guide with complete workflows for query shapes,
   rule directives, writing outputs, reruns and site setup; every example in it is
   executed by `tests/test_patterns.py`.
@@ -20,6 +31,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `archive_mode`, `identifier_check` and `canonical_spelling` are now also read from
+  `SNAKEMAKE_STORAGE_FDB_ARCHIVE_MODE`, `..._IDENTIFIER_CHECK` and
+  `..._CANONICAL_SPELLING`, and Snakemake carries them into every job, so a direct
+  archive from a `run:` or `script:` rule uses the workflow's archive mode.
 - Reruns of rules with FDB inputs follow the *fields* of their queries, not the text: a
   query naming the same fields or fewer (narrowed, reordered, a range for a list,
   `param=2t` for `param=167`, split into per-field queries) reruns nothing, while a

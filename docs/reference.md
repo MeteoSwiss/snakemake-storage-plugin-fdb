@@ -20,9 +20,9 @@ the variable over the default.
 |---|---|---|---|---|
 | `config` | `--storage-fdb-config` (env) | unset: FDB's own environment (`FDB_CONFIG`, `FDB_CONFIG_FILE`, `FDB_HOME`) | path to an existing file (made absolute), or inline YAML/JSON text that parses as a mapping | FDB configuration, passed to `pyfdb.FDB(config, ...)`. |
 | `user_config` | `--storage-fdb-user-config` (env) | unset | as `config` | FDB user configuration (e.g. `useSubToc: true`). |
-| `archive_mode` | `--storage-fdb-archive-mode` | `native` | `native`, `identifier` | How outputs are archived: `native` (FDB derives the keys from the GRIB) or `identifier` (the plugin builds each message's FDB key; use it only with schemas whose rules share one key set, or supply the other keys in the query). |
-| `identifier_check` | `--storage-fdb-identifier-check` | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
-| `canonical_spelling` | `--storage-fdb-canonical-spelling` | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
+| `archive_mode` | `--storage-fdb-archive-mode` (env) | `native` | `native`, `identifier` | How outputs are archived: `native` (FDB derives the keys from the GRIB) or `identifier` (the plugin builds each message's FDB key; use it only with schemas whose rules share one key set, or supply the other keys in the query). |
+| `identifier_check` | `--storage-fdb-identifier-check` (env) | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
+| `canonical_spelling` | `--storage-fdb-canonical-spelling` (env) | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
 | `remove_policy` | `--storage-fdb-remove-policy` | `warn` | `warn`, `ignore`, `error` | FDB cannot delete fields; what removing an output does: no-op with a warning, silent no-op, or error. |
 | `input_tracking` | `--storage-fdb-input-tracking` | `lookup` | `lookup`, `query` | What makes a rule with FDB inputs rerun: `lookup` (the FDB lookup and the fields of the queries, so a query that names the same fields or fewer does not trigger a rerun; see [Methods](#methods)) or `query` (Snakemake's default: the recorded text of the input queries too). |
 | `glob_required_keys` | `--storage-fdb-glob-required-keys` (env) | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
@@ -36,12 +36,12 @@ the variable over the default.
 
 | variable | plugin behaviour |
 |---|---|
-| `SNAKEMAKE_STORAGE_FDB_CONFIG`, `..._USER_CONFIG`, `..._ECCODES_DEFINITIONS`, `..._METKIT_HOME`, `..._KEY_ORDER`, `..._ENV`, `..._GLOB_REQUIRED_KEYS` | Read by Snakemake's argument parser as the value of the matching setting; the CLI flag wins, then the variable, then the default. One value per variable, optionally tagged `TAG::VALUE`. |
+| `SNAKEMAKE_STORAGE_FDB_CONFIG`, `..._USER_CONFIG`, `..._ARCHIVE_MODE`, `..._IDENTIFIER_CHECK`, `..._CANONICAL_SPELLING`, `..._ECCODES_DEFINITIONS`, `..._METKIT_HOME`, `..._KEY_ORDER`, `..._ENV`, `..._GLOB_REQUIRED_KEYS` | Read by Snakemake's argument parser as the value of the matching setting; the CLI flag wins, then the variable, then the default. One value per variable, optionally tagged `TAG::VALUE`. Snakemake exports them into every spawned job, where the [direct access API](#direct-access-api) reads them. |
 | `ECCODES_DEFINITION_PATH` | Read and prepended to with `eccodes_definitions` (skipped if it already starts with those directories). Read by eccodes, metkit and FDB. |
 | `METKIT_HOME` | Set from `metkit_home` (overriding a different existing value is logged at info level). Its effective value, from any source, must contain `share/metkit/language.yaml`. Read by metkit. |
 | `ECKIT_EXCEPTION_IS_SILENT` | Set to `1` if unset. `scripts/init_dev_fdb.py` and `tests/conftest.py` default it too. |
-| `FDB_CONFIG`, `FDB5_CONFIG` | Read (YAML text) to find the schema when `config` is unset; never set. |
-| `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE` | Read (config path) likewise; never set. |
+| `FDB_CONFIG`, `FDB5_CONFIG` | Read (YAML text) to find the schema when `config` is unset. `FDB_CONFIG` is *set* to an inline `config` setting for direct access, but only if none of these four variables is set and no other provider of the process exported a different configuration. |
+| `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE` | Read (config path) likewise. `FDB_CONFIG_FILE` is *set* to a `config` setting that is a file, under the same conditions. |
 | `FDB_HOME` | Read for `$FDB_HOME/etc/fdb/config.{yaml,json}` and `~fdb` expansion; never set. |
 | `FDB_SCHEMA_FILE` | Read when the config has no `schema`; never set. |
 | any name in `env` | Set to the given value. |
@@ -49,7 +49,11 @@ the variable over the default.
 | `SMK_FDB_TEST_*` | Read only by the test suites; see [contributing](contributing.md#site-suite). |
 
 Order within a provider: `env` first, then `eccodes_definitions`, then `metkit_home`,
-then the `METKIT_HOME` check, then `ECKIT_EXCEPTION_IS_SILENT`. Everything is validated
+then the `METKIT_HOME` check, then `ECKIT_EXCEPTION_IS_SILENT`, then the export of
+`FDB_CONFIG_FILE`/`FDB_CONFIG` ([direct access](#direct-access-api)). FDB has no
+variable for a user configuration, so `user_config` is never exported for FDB itself
+(Snakemake carries it into jobs as `SNAKEMAKE_STORAGE_FDB_USER_CONFIG`, which the
+direct API reads). Everything is validated
 before anything is exported, and exported before `pyfdb` and `eccodes` are imported
 ([architecture §8.3](design/architecture.md#83-environment-precedence-and-lazy-imports)).
 
@@ -160,7 +164,7 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `inventory` | One `inspect`; fills existence, and for existing objects mtime and size, for `cache_key()`; no-op if already cached. Warns like `exists`. |
 | `get_inventory_parent` | `None`. |
 | `retrieve_object` | Requires `exists`; streams `retrieve` into `<local>.part` in 8 MiB chunks, fsyncs, checks the byte count, renames over the local path; removes the part file on any error. |
-| `store_object` | Expands the query, splits the local file into GRIB messages, requires exactly `E` of them, pre-checks every message's MARS keys against the query (both modes), builds identifiers (`identifier` mode) or requires every indexed query key to be present in the message (`native` mode), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store, naming the offending messages if not. Never retried. |
+| `store_object` | If the local file is an [archive marker](#direct-access-api), archives nothing and only post-checks with the marker's field count and timestamp (errors if the marker names another query or a field count other than `E`). Otherwise: expands the query, splits the local file into GRIB messages, requires exactly `E` of them, pre-checks every message's MARS keys against the query (both modes), builds identifiers (`identifier` mode) or requires every indexed query key to be present in the message (`native` mode), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store, naming the offending messages if not. Never retried. |
 | `remove` | Never deletes; applies `remove_policy`. Snakemake 9.27 calls it only for `--delete-all-output`: not before a rerun, not on failed-job cleanup (its "Removing output files of failed job" line removes nothing from FDB), and never for `temp()`, which cannot be combined with storage. |
 | `list_candidate_matches` | Checks `glob_required_keys`; one `list` of the pattern's constant pairs; returns the sorted unique pattern texts with wildcard-bearing values replaced by listed values, skipping fields that lack them. |
 | `cleanup` | No-op. |
@@ -187,6 +191,52 @@ the recorded queries do not cover its fields
 What Snakemake records is unchanged, and so is the comparison of every other input.
 If the attribute is missing or has an unexpected signature, the plugin logs the warning
 below and leaves the trigger alone.
+
+## Direct access API
+
+`from snakemake_storage_plugin_fdb import api` — the calls a `run:`, `script:` or
+`notebook:` body uses to read from and write to FDB without a local GRIB file
+([user guide](user-guide.md#direct-access-from-run-and-script-rules)). Every function
+takes the query text (what Snakemake hands the job for an input flagged
+`retrieve=False`) and, optionally, `config=` and `user_config=` (same values as the
+settings). Without them the API builds its provider from the plugin's environment
+settings (`SNAKEMAKE_STORAGE_FDB_CONFIG`, `..._USER_CONFIG`, `..._ARCHIVE_MODE`,
+`..._IDENTIFIER_CHECK`, `..._CANONICAL_SPELLING`, `..._KEY_ORDER`, ... — the settings
+marked "env" [above](#settings), which Snakemake exports into every job it spawns;
+tagged values are ignored) and then from FDB's own environment, which a provider fills
+with its configuration. A job thus reads, spells and archives as the workflow does. All
+errors are `WorkflowError`s, with the same texts as the corresponding input or output
+would give.
+
+| call | returns / raises |
+|---|---|
+| `request(query, *, config=None, user_config=None) -> dict[str, list[str]]` | the expanded MARS request in canonical spelling, one list of values per key; ready for `pyfdb.FDB().retrieve(...)` or `earthkit.data.from_source("fdb", ...)`. Raises for an invalid request, unresolved wildcards or (with `canonical_spelling=error`) a non-canonical value. |
+| `open(query, ...) -> BinaryIO` | a readable binary stream (`io.RawIOBase`) of the fields FDB returns, streamed from a fresh FDB handle; close it, or use it as a context manager. No field count check: a query whose fields are not all in FDB gives a short stream. |
+| `messages(query, ...) -> Iterator[bytes]` | complete GRIB messages, one at a time, in request order. Checks first that all `E` fields are in FDB, raising the missing-field report of a retrieval otherwise (`<query>: <n> of <E> fields found in FDB; missing: ...`), and raises at the end if the stream held a different number of messages. |
+| `retrieve(query, path, ...) -> Path` | the retrieval Snakemake performs for an input, into `path` (atomic, all fields required); returns `path`. |
+| `earthkit(query, *, config=None, user_config=None, **kwargs) -> earthkit.data.FieldList` | `earthkit.data.from_source("fdb", request(query), **kwargs)`. earthkit-data is optional and not a dependency; without it the call raises `earthkit-data is not installed, so earthkit() cannot be used: ...`. earthkit opens its own FDB from the environment. |
+| `archive(output, messages, *, query=None, config=None, user_config=None, archive_mode=None) -> Marker` | archives complete GRIB `messages` (an iterable of `bytes`, or one `bytes` holding them all) under the query of the output path `output` (or `query`), then writes the marker at `output` and returns it. Runs the checks of `store_object` before the first archive call, so a failure archives nothing (`...; nothing was archived`, with `the archive() input` where a file-based store names the file), and its post-check after. `archive_mode` defaults to the workflow's setting (`SNAKEMAKE_STORAGE_FDB_ARCHIVE_MODE` in the job); pass it to override. |
+| `query_of(path) -> str` | the query of a local storage path (the inverse of the [local path mapping](#local-path-mapping)); raises for a path that is not one of the plugin's or has a hashed component. |
+| `read_marker(path) -> Marker \| None` | the marker at `path`, `None` if the file is not one (missing file included); raises for a file with the marker header that cannot be parsed. |
+| `Marker(query, fields, time)` | dataclass; `write(path)` writes it atomically (via `<path>.part`). |
+
+The archive marker written at an FDB output's local path is a text file:
+
+```text
+# snakemake-storage-plugin-fdb archived
+query: fdb://class=ea,expver=0002,stream=oper,date=20200101,time=0000,domain=g,type=an,levtype=sfc,step=0/6/12,param=167
+fields: 3
+time: 1789581415
+```
+
+The first line is the fixed header `store_object` recognises; `fields` is the number of
+archived messages and `time` the FDB clock second read before the first `archive()`
+call, which the post-check compares the index timestamps with. Snakemake removes the
+marker with the other local copies unless `--keep-storage-local-copies` is given.
+
+`snakemake_storage_plugin_fdb.grib.stream_messages(source, label=...)` is public too: it
+yields complete GRIB messages from any binary stream with `readinto` (an opened pyfdb
+data handle, a file, a `BytesIO`), holding one message at a time.
 
 ## Errors and messages
 
@@ -250,6 +300,12 @@ characters with `…`; the full text is logged at debug level.
 | `GRIB keys do not match the FDB schema for <query> (<local>): <detail>` | `Keywords not used`, `Could not find [...]`, `Could not find a rule` |
 | `<query>: <local> has <n> fields, the query expands to <E>; <k> landed outside the query or are duplicates: message <i> (<keys>)[, ...][ and <k> more] (they stay in FDB until the next successful store masks them)` | post-check; the named messages are those no fresh field matches (at most three) |
 | `<error> (<k> of <m> archive calls succeeded before the failure; they stay in FDB until the next successful store masks them)` | archive failure after a successful call |
+| `<query>: the job archived <n> fields directly, the query expands to <E>` | an archive marker whose field count is not `E` |
+| `<query>: <local> is an archive marker for <other query>; the job archived fields of another query (they stay in FDB until the next successful store masks them)` | `api.archive` was called with another query for this output |
+| `<local> is a malformed FDB archive marker: <detail>` | a file with the marker header but without `query`, `fields` or `time` |
+| `<path> is not an FDB storage path (<reason>); pass query= to archive()` | `api.archive`/`api.query_of` on a path that does not map back to a query; `<reason>` is `no .grib suffix`, `hashed component <key>=~...` or the query parser's message |
+| `<query>: FDB returned <n> messages, the query expands to <E> fields` | `api.messages`: the stream held a different number of messages |
+| `the FDB stream for <query>: non-GRIB bytes where a message was expected` / `...: truncated GRIB message (<n> of <m> bytes)` | a stream that is not a sequence of GRIB messages |
 | `remove_policy=error: FDB cannot delete individual fields; ...` | `remove()` with `remove_policy=error` |
 
 ### Log messages

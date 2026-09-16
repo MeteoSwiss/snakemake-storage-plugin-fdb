@@ -16,7 +16,7 @@ them at work.
   - [Discovering what is in FDB](#discovering-what-is-in-fdb): `glob_wildcards`
   - [Queries from an input function](#queries-from-an-input-function)
 - [Execution directives](#execution-directives): the same input in `shell`, `run` and
-  `script` rules
+  `script` rules, and [direct access](#direct-access-no-local-files) without local files
 - [Writing outputs](#writing-outputs)
   - [One rule, one query](#one-rule-one-query)
   - [One field, one rule](#one-field-one-rule): per-step jobs instead of overlapping
@@ -334,7 +334,9 @@ Named inputs work the same way with `unpack()` of a dict.
 
 ## Execution directives
 
-The same FDB input reaches every kind of rule body as a local file path.
+The same FDB input reaches every kind of rule body as a local file path — unless the rule
+asks for the query instead and reads FDB itself, which is the
+[last pattern of this section](#direct-access-no-local-files).
 
 ### `shell`
 
@@ -420,7 +422,8 @@ rule steps:
 A `script:` rule keeps the code in a file of its own, testable outside Snakemake, and is
 not affected by the `run:` caveat above. The script sees the retrieved local path in
 `snakemake.input`. A `notebook:` rule receives its input the same way (not exercised by
-the patterns test).
+the patterns test). Both can also read FDB directly instead
+([below](#direct-access-no-local-files)).
 
 <!-- pattern: script-directive -->
 ```snakemake
@@ -452,6 +455,144 @@ with open(snakemake.input[0], "rb") as fi, open(snakemake.output[0], "w") as fo:
         print(f"{values.mean():.3f}", file=fo)
         eccodes.codes_release(handle)
 ```
+
+### Direct access: no local files
+
+A `run:` or `script:` body can read the fields straight from FDB. Flag the input
+`retrieve=False` — the job then gets the **query string** instead of a path — and read it
+with the plugin's `api` module ([user
+guide](user-guide.md#direct-access-from-run-and-script-rules)). Nothing is written under
+`.snakemake/storage`, which the rule below prints (`STAGED: 0`).
+
+<!-- pattern: run-direct; expect: STEPS: 0 6 12; expect: STAGED: 0 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+rule steps:
+    input:
+        storage.fdb(
+            "fdb://class=ea,expver=0001,stream=oper,date=20200101,time=0000,domain=g,"
+            "type=an,levtype=sfc,step=0/6/12,param=167",
+            retrieve=False,
+        ),
+    output:
+        "steps.txt",
+    run:
+        import sys
+        from pathlib import Path
+
+        import eccodes
+
+        from snakemake_storage_plugin_fdb import api
+
+        steps = []
+        for message in api.messages(input[0]):  # input[0] is the query text
+            handle = eccodes.codes_new_from_message(message)
+            steps.append(eccodes.codes_get_string(handle, "step"))
+            eccodes.codes_release(handle)
+        Path(output[0]).write_text(" ".join(steps) + "\n")
+
+        staged = [p for p in Path(".snakemake/storage").rglob("*") if p.is_file()]
+        print("STEPS:", *steps, file=sys.stderr)
+        print("STAGED:", len(staged), file=sys.stderr)
+```
+
+A `script:` rule gets the query in `snakemake.input[0]`. The provider also puts its FDB
+configuration in the environment, so plain `pyfdb` works without being configured:
+
+<!-- pattern: script-direct; expect: MEANS: 3 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+rule mean:
+    input:
+        storage.fdb(
+            "fdb://class=ea,expver=0001,stream=oper,date=20200101,time=0000,domain=g,"
+            "type=an,levtype=sfc,step=0/6/12,param=167",
+            retrieve=False,
+        ),
+    output:
+        "mean.txt",
+    script:
+        "scripts/direct_mean.py"
+```
+
+<!-- pattern: script-direct; file: scripts/direct_mean.py -->
+```python
+"""The mean of every field of the query, read straight from FDB with pyfdb."""
+
+import sys
+
+import eccodes
+import pyfdb
+
+from snakemake_storage_plugin_fdb import api
+from snakemake_storage_plugin_fdb.grib import stream_messages
+
+request = api.request(snakemake.input[0])  # the expanded MARS request
+means = []
+with pyfdb.FDB().retrieve(request) as data:
+    for message in stream_messages(data):
+        handle = eccodes.codes_new_from_message(message)
+        means.append(f"{eccodes.codes_get_values(handle).mean():.3f}")
+        eccodes.codes_release(handle)
+
+with open(snakemake.output[0], "w") as f:
+    print("\n".join(means), file=f)
+print("MEANS:", len(means), file=sys.stderr)
+```
+
+Outputs work the same way: `api.archive` archives the messages and leaves a small marker
+at the output's local path, which the plugin's store step recognises. This is the
+[first write pattern](#one-rule-one-query) without a GRIB file anywhere.
+
+<!-- pattern: run-direct-archive; rerun: nothing; expect: Storing in storage: fdb://class=ea,expver=0022; expect: STAGED: 1 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+QUERY = (
+    "fdb://class=ea,expver={expver},stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule shift_expver:
+    input:
+        storage.fdb(QUERY.format(expver="0001"), retrieve=False),
+    output:
+        storage.fdb(QUERY.format(expver="0022")),
+    run:
+        import sys
+        from pathlib import Path
+
+        import eccodes
+
+        from snakemake_storage_plugin_fdb import api
+
+        def shifted():
+            """One message at a time: nothing is held but the message in hand."""
+            for message in api.messages(input[0]):
+                handle = eccodes.codes_new_from_message(message)
+                eccodes.codes_set(handle, "expver", "0022")
+                yield eccodes.codes_get_message(handle)
+                eccodes.codes_release(handle)
+
+        marker = api.archive(output[0], shifted())  # checks, archives, writes the marker
+
+        staged = [p for p in Path(".snakemake/storage").rglob("*") if p.is_file()]
+        print("STAGED:", len(staged), "->", marker.fields, "fields", file=sys.stderr)
+```
+
+The only file under `.snakemake/storage` is the marker of the output (`STAGED: 1`), and
+Snakemake removes it with the other local copies at the end of the run. Where a job needs
+a real file after all — a `shell:` rule calling an external program — leave the input
+retrieved, or write it with `api.retrieve(query, path)`.
 
 ## Writing outputs
 

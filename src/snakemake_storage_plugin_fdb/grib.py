@@ -10,6 +10,7 @@ definitions the process has.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ from typing import Any
 MARS_NAMESPACE = "mars"
 _INDICATOR = b"GRIB"
 _END = b"7777"
+_HEADER = 16  # section 0 of a GRIB2 message; GRIB1 needs the first 8 bytes
+_GRIB1_LARGE = 0x800000  # ECMWF large-message convention of GRIB edition 1
 
 
 class GribError(ValueError):
@@ -98,6 +101,76 @@ def split_messages(path: str | os.PathLike[str]) -> list[GribMessage]:
     return messages
 
 
+def _readinto_exactly(source: Any, view: memoryview) -> int:
+    """Fill ``view`` from ``source.readinto``; the byte count, short at the end.
+
+    ``readinto`` rather than ``read``: a pyfdb data handle's ``read(n)`` zero-pads a
+    short result to ``n`` bytes, ``readinto`` reports the count (architecture.md §13.4).
+    """
+    got = 0
+    while got < len(view) and (n := source.readinto(view[got:])):
+        got += n
+    return got
+
+
+def _read_exactly(source: Any, size: int) -> bytes:
+    buffer = bytearray(size)
+    return bytes(buffer[: _readinto_exactly(source, memoryview(buffer))])
+
+
+def _message_length(header: bytes, label: str) -> int:
+    """Total message length from section 0 (``GRIB`` indicator + length + edition)."""
+    if len(header) < 8:
+        raise GribError(f"{label}: truncated GRIB message header")
+    edition = header[7]
+    if edition == 1:
+        length = int.from_bytes(header[4:7], "big")
+        # Large GRIB1 messages carry the length in units of 120 bytes.
+        if length >= _GRIB1_LARGE:
+            length = (length & (_GRIB1_LARGE - 1)) * 120
+        return length
+    if edition == 2:
+        if len(header) < _HEADER:
+            raise GribError(f"{label}: truncated GRIB2 message header")
+        return int.from_bytes(header[8:_HEADER], "big")
+    raise GribError(f"{label}: unsupported GRIB edition {edition}")
+
+
+def stream_messages(source: Any, label: str = "the FDB stream") -> Iterator[bytes]:
+    """Yield the complete GRIB messages of a binary ``source`` with ``readinto`` (an
+    opened pyfdb data handle, a file, a ``BytesIO``), one at a time.
+
+    Memory is bounded by one message: the length is taken from section 0 and only that
+    message is held (FR-DIRECT-001). NUL padding between and after messages is
+    allowed, as in ``split_messages``; any other byte outside a message, and a message
+    without its final ``7777``, raise ``GribError``. Nothing is decoded (no eccodes).
+    """
+    head = b""  # bytes read past the previous message
+    while True:
+        # Section 0 of the next message, skipping NUL padding; empty at the end.
+        while len(head := head.lstrip(b"\0")) < _HEADER:
+            more = _read_exactly(source, _HEADER - len(head))
+            if not more:
+                break
+            head += more
+        if not head:
+            return
+        if not head.startswith(_INDICATOR):
+            raise GribError(f"{label}: non-GRIB bytes where a message was expected")
+        length = _message_length(head, label)
+        message = bytearray(length)
+        view = memoryview(message)
+        n = min(len(head), length)
+        view[:n] = head[:n]
+        got = n + _readinto_exactly(source, view[n:])
+        if got != length or not message.endswith(_END):
+            raise GribError(
+                f"{label}: truncated GRIB message ({got} of {length} bytes)"
+            )
+        head = head[n:]
+        yield bytes(message)
+
+
 def _handle(ec: Any, msg: bytes) -> Any:
     if not msg.startswith(_INDICATOR):
         raise GribError("not a GRIB message (no 'GRIB' indicator)")
@@ -123,6 +196,12 @@ def mars_keys(msg: bytes) -> tuple[dict[str, str], str]:
         return _keys(ec, handle)
     finally:
         ec.codes_release(handle)
+
+
+def message_of(data: bytes) -> GribMessage:
+    """One in-memory GRIB message as ``GribMessage`` (offset 0), keys decoded."""
+    mars, param_id = mars_keys(data)
+    return GribMessage(0, len(data), data, mars, param_id)
 
 
 def variant(template: bytes, zero_values: bool = True, **keys: Any) -> bytes:

@@ -15,8 +15,10 @@ otherwise, "source" refers to `snakemake-interface-storage-plugins` 4.4.1, `snak
 
 The plugin lets Snakemake rules read GRIB fields from FDB and write rule outputs into
 FDB, addressed by one-line MARS-style queries (`fdb://class=od,...,step=0/6/12,...`).
-One query may address several fields and maps to one local file. The requirements, with
-IDs and verification, are in [`requirements.md`](requirements.md).
+One query may address several fields and maps to one local file. `run:` and `script:`
+rules can instead read and write the fields directly, without any local data file
+(FR-DIRECT-*). The requirements, with IDs and verification, are in
+[`requirements.md`](requirements.md).
 
 ### 1.2 Quality goals
 
@@ -26,6 +28,7 @@ IDs and verification, are in [`requirements.md`](requirements.md).
 | 2 | Site neutrality: generic package, sites configured from outside | NFR-NEUTRAL-001, NFR-NEUTRAL-002 |
 | 3 | Fail early and clearly; never leave half-written state silently | NFR-REL-001, FR-ERR-* |
 | 4 | Cheap DAG building without native libraries | NFR-PERF-001 |
+| 5 | Keep data out of the filesystem where the job does not need a file | NFR-PERF-005, FR-DIRECT-* |
 
 ### 1.3 Stakeholders
 
@@ -83,6 +86,8 @@ docs. Site material never enters the package (ADR-017).
 - **Store = check everything checkable before archiving, then post-check** through a
   fresh read (§6.4, §8.6).
 - **Never delete** (ADR-008); reruns mask.
+- **No local copy where a job does not need one**: query-string inputs and an archive
+  marker for outputs, sharing the store path's checks (ADR-035, §5.7).
 - **Generic settings and environment pass-throughs** instead of site code (ADR-016,
   ADR-017).
 
@@ -96,10 +101,12 @@ flowchart TB
         init["__init__.py<br/>StorageProviderSettings, StorageProvider, StorageObject"]
         query["query.py<br/>grammar, KeyOrder, ParsedQuery, local path"]
         backend["backend.py<br/>config/schema resolution, Backend, expansion, error mapping, fdb_time"]
-        grib["grib.py<br/>split_messages, mars_keys, variant"]
+        grib["grib.py<br/>split_messages, stream_messages, mars_keys, variant"]
+        apimod["api.py<br/>direct reads, archive, marker (FR-DIRECT-*)"]
         guard["guard.py<br/>IdentifierGuard, NoGuard, StrictGuard (reserved)"]
         rerun["rerun.py<br/>install_lookup_input_tracking"]
     end
+    init --> apimod
     init --> query
     init --> backend
     init --> grib
@@ -107,6 +114,9 @@ flowchart TB
     init --> rerun
     backend --> query
     backend --> grib
+    apimod --> query
+    apimod --> grib
+    apimod -. lazily .-> init
     scripts["scripts/init_dev_fdb.py"] --> backend
     scripts --> grib
 ```
@@ -114,7 +124,9 @@ flowchart TB
 Dependencies point one way: `query.py`, `grib.py` and `rerun.py` import nothing from the
 package (`guard.py` imports types only; `rerun.py` imports Snakemake lazily);
 `backend.py` uses `query` and `grib`; `__init__.py`
-composes all of them.
+composes all of them. `api.py` is the one back edge: it needs a provider and a storage
+object, which it imports inside its functions, and `__init__.py` re-exports it as
+`snakemake_storage_plugin_fdb.api` and uses its marker helpers.
 
 ### 5.2 `query.py` — query language
 
@@ -127,7 +139,8 @@ Pure Python; imports no `pyfdb`, `eccodes` or metkit (NFR-PERF-001).
   interface's `WILDCARD_REGEX`), so `,`, `/` and `=` split only literal text.
 - `KeyOrder` is the canonical key order (§8.1). `ParsedQuery` holds the pairs in that
   order and derives the request, the local suffix and oversized components
-  (FR-PATH-001…004).
+  (FR-PATH-001…004); `query_of_path` is the inverse of the local suffix, for the direct
+  write API (FR-DIRECT-002), and fails on a hashed component.
 - `comparable(key, value)` normalises values for the identifier pre-check
   (FR-STORE-005).
 
@@ -140,8 +153,14 @@ reads or changes `ECCODES_DEFINITION_PATH`.
 - `split_messages(path)` returns `GribMessage`s (offset, length, bytes, `mars` keys,
   paramId) and raises `GribError` (a `ValueError`) for anything but NUL padding outside
   messages (FR-STORE-001).
-- `mars_keys(bytes)`, and `variant(template, **keys)` for zeroed copies with changed keys
-  (tests and the dev FDB script).
+- `stream_messages(source)` yields complete messages from a stream with `readinto` (an
+  open pyfdb data handle, a file, a `BytesIO`), taking each length from section 0 and
+  checking the final `7777`; it decodes nothing and holds one message at a time, read
+  straight into one buffer (FR-DIRECT-001). It uses `readinto`, never `read`, whose
+  pyfdb implementation zero-pads short reads (§13.4).
+- `mars_keys(bytes)`, `message_of(bytes)` (a `GribMessage` for an in-memory message),
+  and `variant(template, **keys)` for zeroed copies with changed keys (tests and the dev
+  FDB script).
 
 ### 5.4 `backend.py` — pyfdb access layer
 
@@ -176,12 +195,34 @@ its object's `covered_by()` says that the recorded queries do not cover its fiel
 (FR-RERUN-001, ADR-034, §8.10). `decide(objects, current, recorded)` holds that
 comparison; the import of Snakemake happens inside the installer.
 
-### 5.7 `__init__.py` — Snakemake integration
+### 5.7 `api.py` — direct access from rule bodies
+
+The API a `run:` or `script:` body calls (`from snakemake_storage_plugin_fdb import
+api`). It builds a `StorageProvider` of its own — from its `config`/`user_config`
+arguments, else the plugin's `SNAKEMAKE_STORAGE_FDB_*` variables, else FDB's environment
+(FR-DIRECT-003) — cached per settings for the process, with `input_tracking=query` so no
+job installs the rerun patch, and a storage object per query. It therefore reuses the
+provider's expansion, spelling check, key order, error mapping and store-path checks
+rather than repeating them.
+
+- Reads: `request`, `open` (a `RawIOBase` wrapper over an opened pyfdb data handle that
+  keeps the FDB handle alive), `messages` (completeness check, then `stream_messages`,
+  then a count check), `retrieve` (the storage object's `retrieve_object` with an
+  overwritten local path) and `earthkit` (FR-DIRECT-001).
+- Writes: `query_of(path)` wraps `query.query_of_path`, the inverse of the local path
+  mapping (§5.2); `archive(output, messages)` decodes the messages, runs
+  `StorageObject.archive_messages` (checks, archive, flush, post-check) and writes the
+  `Marker` atomically (FR-DIRECT-002). `read_marker(path)` returns the marker of a
+  local file or `None`; `store_object` uses it (§6.4).
+
+### 5.8 `__init__.py` — Snakemake integration
 
 - `StorageProviderSettings`: the plugin settings, all `Optional[str]`
   ([reference](../reference.md#settings)).
 - `StorageProvider.__post_init__` runs: choice settings and `identifier_check` →
-  `glob_required_keys` → `input_tracking` (§8.10) → environment (§8.3) → `config`/`user_config` → schema path and
+  `glob_required_keys` → `input_tracking` (§8.10) → `config`/`user_config` →
+  environment, including the export of the FDB configuration (§8.3, FR-DIRECT-003) →
+  schema path and
   `SchemaInfo` → `key_order` → lazy import of `eccodes` and `pyfdb` → `Backend` →
   guard. `postprocess_query` records its results for `is_normalised` (FR-PATH-004), and
   `field_set(query)` caches the fields of a query for the rerun decision (§8.10).
@@ -192,10 +233,11 @@ comparison; the import of Snakemake happens inside the installer.
   methods, `store_object` (§6.4), `remove` and `list_candidate_matches` build on them;
   `covered_by` (§8.10) asks the provider's `field_set` instead.
 - Module-level state, each lock-protected: `_APPLIED` (values applied by providers, to
-  warn on disagreement), `_SPELLING_WARNED` and `_REMOVE_WARNED` (once-per-process
-  warnings).
+  warn on disagreement), `_FDB_EXPORTED` and `_FDB_EXPORT_CONFLICT` (the FDB
+  configuration exported for direct access, §8.3), `_SPELLING_WARNED` and `_REMOVE_WARNED`
+  (once-per-process warnings).
 
-### 5.8 Outside the package
+### 5.9 Outside the package
 
 | path | role |
 |---|---|
@@ -296,6 +338,10 @@ sequenceDiagram
     O->>O: fresh = fields with time >= t_start, require len(fresh) >= n
 ```
 
+0. If the local file is an archive marker (`api.read_marker`), the job archived the
+   fields itself (FR-DIRECT-002): nothing is archived here. The marker's query must be
+   this query and its field count the expansion's, and step 6 runs with the marker's
+   count and timestamp.
 1. `_expected()` fails early for wildcards, invalid requests and spelling errors.
 2. `split_messages` (GRIB errors mapped, FR-STORE-001); count check (FR-STORE-002).
 3. Per message `values = mars + {param: paramId}`, pre-checked against
@@ -317,6 +363,10 @@ sequenceDiagram
    fields stay in FDB (FR-STORE-009).
 7. Snakemake then touches the local file with `mtime()` and checks `exists_in_storage`
    (§13.8).
+
+The count check of step 2 and steps 3 to 6 are `StorageObject.archive_messages`, which
+`api.archive` calls for a direct archive (§5.7); the direct path shares it so that a
+job's archive is checked and verified exactly as a file's.
 
 ### 6.5 Glob
 
@@ -396,7 +446,7 @@ imported. All values are validated and computed first, then exported under a loc
 |---|---|---|---|
 | `ECCODES_DEFINITION_PATH` | kept | `eccodes_definitions` | `<setting dirs>:<existing>`; if unset, `<setting dirs>` only (the wheel appends `/MEMFS/definitions` itself [verified: `codes_definition_path()`]) |
 | `METKIT_HOME` | kept, validated | `metkit_home` | setting wins; logged at info level |
-| `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE`, `FDB_HOME` | kept; the plugin never sets them | `config`, `user_config` | passed to `FDB(config, user_config)`, which takes precedence inside FDB [verified] |
+| `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE`, `FDB_HOME` | kept | `config`, `user_config` | passed to `FDB(config, user_config)`, which takes precedence inside FDB [verified]; with none of the five set, `config` is exported as `FDB_CONFIG_FILE` (a file) or `FDB_CONFIG` (inline YAML) for direct access (FR-DIRECT-003) |
 | `ECKIT_EXCEPTION_IS_SILENT` | kept | – | set to `1` if unset |
 | any | kept | `env` | explicit override |
 
@@ -409,6 +459,16 @@ Providers applying different definitions or homes log a warning; for `METKIT_HOM
 last value is exported, for `ECCODES_DEFINITION_PATH` the last provider's directories
 end up first.
 
+The export for direct access (`_export_fdb_config`, the last step of the export under
+the lock) is the one variable the plugin adds on its own: only when the environment
+names no FDB configuration at all, only the provider's own `config`, and never a second,
+different one — providers that disagree (tagged providers) remove what this process
+exported (never a value found in the environment) and export nothing for the rest of
+the process, since one process has one environment. fdb5 has no variable for the user
+configuration (§13.7), so a `user_config` reaches a job only through
+`SNAKEMAKE_STORAGE_FDB_USER_CONFIG` (which Snakemake sets in spawned jobs, §13.8) or the
+API's argument.
+
 Lazy imports keep `snakemake --help`, `is_valid_query` and `postprocess_query` free of
 native libraries (NFR-PERF-001): `query.py` imports none; `grib.py` imports eccodes
 inside functions; `backend.py` imports pyfdb in `_open()` and `expand()`; the provider
@@ -416,7 +476,9 @@ imports both at the end of `__post_init__`. Caveat: a Snakefile that imports `ec
 at top level loads it earlier; eccodes usually reads the definition path when
 definitions are first needed [assumed], and `METKIT_HOME` is read at first expansion
 [verified]. Recommended: set such variables in the profile or shell before Snakemake
-starts. No setting uses the interface's `env_var` mechanism.
+starts. The settings marked "env" in the reference use the interface's `env_var`
+mechanism (`SNAKEMAKE_STORAGE_FDB_*`), which also carries them into spawned jobs
+(§13.8) — how a job's direct API archives as the workflow does (FR-DIRECT-003).
 
 ### 8.4 Error mapping
 
@@ -1008,6 +1070,37 @@ design round, provided requirements, architecture and code are updated together.
   (`COVERAGE_MAX`, L-21); a widened query now reruns even when its new fields are older
   than the output, which is what the user requires.
 
+### ADR-035 Direct access: query-string inputs, marker outputs
+
+- Context: the reason to keep fields in FDB is to keep them out of the filesystem, yet
+  the plugin's default path stages every input and every output as a GRIB file under
+  `.snakemake/storage`. For `run:` and `script:` rules, whose bodies are Python, that
+  copy is pure overhead. Snakemake supports `storage.fdb(query, retrieve=False)` per
+  object — the job then receives the query string and no file is retrieved (§13.8) — but
+  it has no counterpart for outputs: after the job it requires the output's local path to
+  exist, calls `store_object` and removes the copy.
+- Decision: supply the reading side as a small public API (`api.request`, `api.open`,
+  `api.messages`, `api.retrieve`, `api.earthkit`) that streams from FDB with the
+  plugin's own guarantees, and the writing side as `api.archive(output, messages)`,
+  which runs the store path's checks, archives, flushes and leaves an *archive marker*
+  at the output's local path. `store_object` recognises the marker, archives nothing and
+  keeps the post-check (FR-DIRECT-002). The provider exports its FDB configuration into
+  the environment so that jobs can also use plain pyfdb or earthkit (FR-DIRECT-003).
+- Alternatives: a FIFO between job and store step (rejected: a storage object cannot
+  carry `pipe()`, §13.8, and it would serialise the store with the job); an upstream
+  "no local output" flag (the target state, requirements.md D-015 — the marker is the
+  interim); letting `archive` skip the marker and the post-check entirely (rejected: the
+  post-check is what proves the fields landed under the query); a full earthkit-data
+  dependency (rejected: optional, the plugin's reads are pyfdb and eccodes only).
+- Status: accepted (reversible), 2026-09-16.
+- Consequences: `run:`/`script:` workflows can run without a single local GRIB file
+  (NFR-PERF-005); the marker is a convention between the job and the store step, so a
+  file written by an older or foreign process at that path is either GRIB (archived as
+  before) or a malformed marker (an error), never silently accepted (R-17); `shell:`
+  rules that call external programs keep the file-based path (L-29); the API needs a
+  provider of its own in a job process, which costs one schema parse and one pyfdb import
+  per settings combination.
+
 ## 10. Quality requirements
 
 Quality scenarios are the non-functional requirements in
@@ -1034,6 +1127,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-14 | **Private Snakemake API.** Input tracking by lookup patches `PersistenceBase._input_changed` (ADR-034); a rename, a signature change, an override in a subclass, a changed format-version gate or a change of the recorded form of storage inputs (today `storage_object.query` verbatim, from `_input`) would silently restore query tracking or break the patch. The patch is independent of the provenance backend, because `_input_changed` and `_input` are defined on `PersistenceBase` and `FilePersistence`/`DbPersistence` override only the storage of a record (§13.8); an override of the hook in a subclass would defeat it. | Guarded installation with a warning and a fallback (L-21); the signature of the hook and the recorded form are asserted by `tests/test_rerun.py::test_persistence_private_api_is_stable`; the end-to-end tests check the behaviour on both backends; `input_tracking=query` as an escape hatch; upstream hook (requirements.md D-011). |
 | R-15 | FDB request semantics: `inspect`/`retrieve` match through query keys the indexed fields lack while `list` does not (§13.4, L-22); the plugin's own key check (FR-READ-001) depends on that asymmetry not changing meaning across FDB versions. | `test_exists_does_not_match_through_absent_key` pins both behaviours; the `pyfdb-latest` canary runs it on 5.23; report upstream (requirements.md D-012). |
 | R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
+| R-17 | **The archive marker is a convention.** A direct archive leaves a small text file where Snakemake expects the output's GRIB (ADR-035, FR-DIRECT-002); `store_object` decides by the header line. A future Snakemake that inspects or hashes a storage output's local copy, or a workflow whose rule writes both a marker and real GRIB messages, would see something that is not GRIB. | The header is distinctive, the marker names its query and field count and is rejected if either disagrees; the post-check (FR-STORE-009) still proves the fields are in FDB; `tests/test_direct.py` covers the accepted and the rejected cases. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
 | TD-2 | No ECMWF sample fetch script. | D-008. |
 
@@ -1157,6 +1251,12 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   one field are not de-duplicated (`param=2t/167` → `167/167`); minute steps expand to
   mixed forms (`0/to/60/by/10m` → `0/10m/20m/.../50m/1/1h10m/.../60`).
 - pyfdb splits a string value on `/` (`pyfdb_type.py:65-68`).
+- `DataHandle` must be opened before reading (`open()` or `with`), otherwise `read`/
+  `readinto` raise `RuntimeError: DataHandle: Read occured before the handle was
+  opened`. `read(n)` returns a buffer of `min(n, size())` bytes **zero-padded** when
+  fewer bytes were available, while `readinto(memoryview)` returns the byte count
+  (`pyfdb_type.py:245-330`), so streaming uses `readinto` [verified: source, pyfdb
+  5.21.4.23; `grib.stream_messages` and `api.open`].
 
 ### 13.5 Archive and handles
 
@@ -1205,6 +1305,14 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   fails with `Cannot open .../fdb5lib/etc/fdb/schema` (the marker of the
   no-configuration hint, §8.4) [verified: pyfdb 5.21.4 wheel; `FDB_CONFIG_FILE` and
   `FDB5_CONFIG_FILE` are both honoured].
+- fdb5 reads the configuration from `FDB_CONFIG`/`FDB5_CONFIG` (YAML text),
+  `FDB_CONFIG_FILE`/`FDB5_CONFIG_FILE`, `FDB_HOME` and the schema from
+  `FDB_SCHEMA_FILE`; there is **no** environment variable for the *user* configuration
+  (no `FDB_USER_CONFIG`/`FDB_USER_CONFIG_FILE`) [verified 2026-09-16: `strings
+  fdb5lib/lib64/libfdb5.so` of the pinned wheel lists `FDB_CONFIG`, `FDB5_CONFIG`,
+  `fdbConfigFile;$FDB_CONFIG_FILE`, `fdb5ConfigFile;$FDB5_CONFIG_FILE`, `FDB_HOME`,
+  `fdbSchemaFile;$FDB_SCHEMA_FILE` and nothing matching `userconfig`]. Hence FR-DIRECT-003
+  exports only the configuration.
 - `FDB(config)` does not validate: a missing schema fails at first use with
   `Cannot open <path>  (No such file or directory)`, a missing root with
   `Unexpected state: No writable roots available. Configured roots: [...]` (also for
@@ -1262,6 +1370,20 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   unless `--keep-storage-local-copies`.
 - `store_object`/`retrieve_object` run synchronously inside coroutines; jobs may run in
   different threads or processes.
+- `storage.fdb(query, retrieve=False)` is supported per object
+  (`storage.py:163-215` → `provider.object(query, retrieve=..., keep_local=...)`):
+  `retrieve_object` is never called, the job does not wait for a local file
+  (`io/__init__.py:1197`), and in a `run:` body `input[0]` is the query string itself
+  (a plain `str`, no flags), while nothing is written under `.snakemake/storage`.
+  `exists`/`mtime`/`inventory` and the rerun triggers still run; `is_checksum_eligible`
+  needs a local copy (`io/__init__.py:667-672`), so such an input is compared by mtime.
+  In a spawned `run:` job and in a `script:` process, `input` and `output` entries are
+  plain strings: an FDB output is its local path with no `storage_object` flag, so the
+  direct write API maps the path back to the query [verified 2026-09-16, snakemake
+  9.27.0, local executor, against the playground FDB].
+- Outputs have no `retrieve=False` counterpart: after the job Snakemake requires the
+  output's local path to exist, calls `store_object` and removes the local copy unless
+  `--keep-storage-local-copies` (ADR-035, requirements.md D-015).
 - Checksums are consulted only with a local copy, against `.snakemake/metadata`; `None`
   means "hash the local file" (`io/__init__.py:674-750`).
 - `Mtime.storage` takes priority over local mtime, compared as POSIX seconds
@@ -1324,6 +1446,16 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   `nargs="+"` that tagged values use, so it carries one (possibly `TAG::`-tagged) value
   [verified: `convert_item_to_command_line_arg`; end to end with
   `SNAKEMAKE_STORAGE_FDB_CONFIG` in `tests/test_workflow.py`].
+- Spawned jobs get the workflow's plugin settings two ways: fields with `env_var: True`
+  as an `export SNAKEMAKE_STORAGE_FDB_<NAME>=... &&` prefix of the job command
+  (`spawn_jobs.py get_storage_provider_envvars`, enabled for the local executor by
+  `pass_envvar_declarations_to_cmd=True`), the others as `--storage-fdb-*` arguments
+  (`get_storage_provider_args`). A `script:` subprocess inherits that environment, a
+  `run:` body executes inside the spawned Snakemake process. Only the environment
+  reaches the direct API, which is why `archive_mode`, `identifier_check` and
+  `canonical_spelling` are `env_var` settings (FR-CONF-008, FR-DIRECT-003) [verified
+  2026-09-16: `spawn_jobs.py:80-100`, snakemake 9.27.0; end to end in
+  `tests/test_direct.py::test_direct_workflow_inherits_the_archive_mode`].
 - Plugin settings' help texts get no automatic `(default: ...)`: the defaults shown by
   `snakemake --help` are the ones written into the help strings [verified: `snakemake
   --help` on 9.27.0 before this was added].

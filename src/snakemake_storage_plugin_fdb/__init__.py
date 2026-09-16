@@ -36,6 +36,8 @@ from snakemake_interface_storage_plugins.storage_provider import (
 )
 from tenacity import retry_if_exception
 
+from . import api as api  # the direct-access API (FR-DIRECT-001/002)
+from .api import Marker, read_marker
 from .backend import (
     Backend,
     Field,
@@ -83,6 +85,11 @@ _APPLIED: dict[str, str] = {}
 _SPELLING_WARNED: set[str] = set()
 _REMOVE_WARNED: set[str] = set()
 _PARTIAL_WARNED: set[str] = set()
+# The FDB configuration this process exported for direct access (FR-DIRECT-003), as
+# (variable, value), and whether providers disagreed on it (then nothing is exported).
+FDB_CONFIG_VARS = ("FDB_CONFIG", "FDB5_CONFIG", "FDB_CONFIG_FILE", "FDB5_CONFIG_FILE")
+_FDB_EXPORTED: tuple[str, str] | None = None
+_FDB_EXPORT_CONFLICT = False
 _WARNED_LOCK = threading.Lock()
 FieldId = tuple[tuple[str, str], ...]  # one field of a query: its key=value pairs
 COVERAGE_MAX = 100_000  # fields enumerated for the input-set trigger (§8.10)
@@ -145,6 +152,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
             "GRIB) or 'identifier' (the plugin builds the FDB key of every message; "
             "use it only with schemas whose rules share one key set, or supply the "
             "other keys in the query). (default: native)",
+            "env_var": True,  # reaches jobs for the direct API (FR-DIRECT-003)
         },
     )
     identifier_check: Optional[str] = field(  # noqa: UP045
@@ -153,6 +161,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
             "help": "Check of identifiers against GRIB metadata before archiving: "
             "'none'. 'strict' is reserved and not implemented in this version. "
             "(default: none)",
+            "env_var": True,
         },
     )
     canonical_spelling: Optional[str] = field(  # noqa: UP045
@@ -160,6 +169,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         metadata={
             "help": "Query values FDB spells differently (e.g. param=2t vs 167): "
             "'warn', 'error' or 'ignore'. (default: warn)",
+            "env_var": True,
         },
     )
     remove_policy: Optional[str] = field(  # noqa: UP045
@@ -300,10 +310,9 @@ class StorageProvider(StorageProviderBase):
         self._normalised: set[str] = set()  # queries seen by postprocess_query
         self._field_sets: dict[str, frozenset[FieldId] | None] = {}
 
-        self._prepare_environment(settings)  # before anything reads the environment
-
         self.config = self._absolute(resolve_config(settings.config))
         self.user_config = self._absolute(resolve_config(settings.user_config))
+        self._prepare_environment(settings)  # before anything reads the environment
         self.schema_path = _resolve_schema_path(self.config)
         self.schema_info = self._read_schema(self.schema_path)
         if settings.key_order:
@@ -378,6 +387,46 @@ class StorageProvider(StorageProviderBase):
                     )
                 _APPLIED[name] = value
             os.environ.update(planned)
+            if self.config is not None:
+                self._export_fdb_config()
+
+    def _export_fdb_config(self) -> None:
+        """Put this provider's FDB configuration in the environment (FR-DIRECT-003);
+        called under ``_ENV_LOCK`` after the other variables are exported.
+
+        ``FDB_CONFIG_FILE`` for a configuration file, ``FDB_CONFIG`` for inline YAML, so
+        that ``pyfdb.FDB()`` and earthkit's ``fdb`` source open the same FDB in a
+        ``run:`` or ``script:`` job without being configured (fdb5 has no variable for
+        the user configuration, architecture.md §13.7). A configuration the environment
+        already names is never overwritten, and providers with different
+        configurations (tagged providers) export nothing at all: one process has one
+        environment (architecture.md §8.3).
+        """
+        global _FDB_EXPORTED, _FDB_EXPORT_CONFLICT
+        name = "FDB_CONFIG_FILE" if isinstance(self.config, Path) else "FDB_CONFIG"
+        value = str(self.config)
+        if _FDB_EXPORT_CONFLICT or os.environ.get(name) == value:
+            return  # nothing to do: a spawned job, or the same configuration again
+        if _FDB_EXPORTED is not None and _FDB_EXPORTED != (name, value):
+            exported, before = _FDB_EXPORTED
+            if os.environ.get(exported) == before:
+                del os.environ[exported]
+            _FDB_EXPORTED, _FDB_EXPORT_CONFLICT = None, True
+            self.logger.debug(
+                "FDB storage: providers in one process use different FDB "
+                "configurations; none is exported for direct access, pass config= "
+                "to the direct API"
+            )
+            return
+        if foreign := [n for n in FDB_CONFIG_VARS if n in os.environ]:
+            self.logger.debug(
+                f"FDB storage: {', '.join(foreign)} already set; not exporting {name} "
+                "for direct access"
+            )
+            return
+        os.environ[name] = value
+        _FDB_EXPORTED = (name, value)
+        self.logger.debug(f"FDB storage: exported {name} for direct FDB access")
 
     @staticmethod
     def _absolute(value: Path | str | None) -> Path | str | None:
@@ -829,22 +878,41 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         before the first ``archive()`` (ADR-032); a post-check ``inspect`` then
         requires every message to be reachable by the query with a timestamp from this
         store.
+
+        A local file that is an archive marker means the job archived the fields itself
+        (FR-DIRECT-002): nothing is archived here, only the post-check runs.
         """
-        expected = self._expected()  # wildcards, invalid request, spelling check
         local = self.local_path()
+        marker = read_marker(local)
+        if marker is not None:
+            self._post_check_marker(marker, local)
+            return
+        self._expected()  # wildcards, invalid request, spelling check before the file
         with self._mapping_errors(local):
             messages = split_messages(local)
-        n = len(messages)
-        counts = f"{local} has {n} fields, the query expands to {expected}"
-        if n != expected:
-            raise WorkflowError(f"{self.query}: {counts}; nothing was archived")
+        self.archive_messages(messages, local)
 
-        values = self._checked_values(messages, local)
+    def archive_messages(
+        self, messages: list[GribMessage], source: str | os.PathLike[str]
+    ) -> int:
+        """Check, archive, flush and post-check ``messages`` under the query: steps 2
+        to 6 of architecture.md §6.4, shared with ``api.archive`` (FR-DIRECT-002).
+
+        The field count, every message's keys against the query, the identifiers and
+        duplicates are checked before the first ``archive()`` (ADR-032). ``source``
+        names the messages in error texts (the local file, or the direct API's input).
+        Returns the FDB clock second read before the first ``archive()`` (§8.7).
+        """
+        n = len(messages)
+        counts = f"{source} has {n} fields, the query expands to {self._expected()}"
+        if n != self._expected():
+            raise WorkflowError(f"{self.query}: {counts}; nothing was archived")
+        values = self._checked_values(messages, source)
         if self.provider.archive_mode == "identifier":
-            keyed = self._identifiers(messages, values, local)
+            keyed = self._identifiers(messages, values, source)
             batch = list(zip((msg.data for msg in messages), keyed, strict=True))
         else:  # native: FDB derives the keys, the guard is not consulted
-            self._require_indexed_keys(values, local)
+            self._require_indexed_keys(values, source)
             keyed = values
             batch = [(b"".join(msg.data for msg in messages), None)]
         first_index: dict[tuple[tuple[str, str], ...], int] = {}
@@ -852,38 +920,70 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             first = first_index.setdefault(tuple(sorted(key.items())), i)
             if first != i:
                 raise WorkflowError(
-                    f"{self.query}: {local} holds duplicate fields (messages {first} "
+                    f"{self.query}: {source} holds duplicate fields (messages {first} "
                     f"and {i}); nothing was archived"
                 )
 
         t_start = fdb_time()  # FDB's index clock (architecture.md §8.7)
-        self._archive(batch, local)
+        self._archive(batch, source)
+        self._post_check(n, t_start, counts, keyed)
+        return t_start
+
+    def _post_check(
+        self,
+        n: int,
+        t_start: int,
+        counts: str,
+        keyed: list[dict[str, str]] | None = None,
+    ) -> None:
+        """FR-STORE-009: every archived message must be reachable by the query with a
+        timestamp from this store. ``keyed`` (absent for a marker) names the offenders.
+        """
         fresh = [f for f in self._fields() if self._field_time(f) >= t_start]
         if len(fresh) < n:
             raise WorkflowError(
                 f"{self.query}: {counts}; {n - len(fresh)} landed outside the query "
-                f"or are duplicates{self._offenders(keyed, fresh)} ({STAY_NOTE})"
+                f"or are duplicates{self._offenders(keyed or [], fresh)} ({STAY_NOTE})"
             )
 
+    def _post_check_marker(self, marker: Marker, local: Path) -> None:
+        """Post-check of fields a job archived itself (FR-DIRECT-002): the marker must
+        name this query (normalised, FR-QUERY-007) and the expansion's field count."""
+        normalise = self.provider.postprocess_query
+        if normalise(marker.query) != normalise(self.query):
+            raise WorkflowError(
+                f"{self.query}: {local} is an archive marker for {marker.query}; the "
+                f"job archived fields of another query ({STAY_NOTE})"
+            )
+        counts = (
+            f"the job archived {marker.fields} fields directly, the query expands to "
+            f"{self._expected()}"
+        )
+        if marker.fields != self._expected():
+            raise WorkflowError(f"{self.query}: {counts}")
+        self._post_check(marker.fields, marker.time, counts)
+
     def _checked_values(
-        self, messages: list[GribMessage], local: Path
+        self, messages: list[GribMessage], source: str | os.PathLike[str]
     ) -> list[dict[str, str]]:
         """MARS keys (``param`` from ``paramId``) of ``messages``, each pre-checked
         against the query (FR-STORE-005, both archive modes)."""
         allowed = self._allowed_values()
         values = [{**msg.mars, "param": msg.param_id} for msg in messages]
         for index, message in enumerate(values, 1):
-            self._precheck(index, message, allowed, local)
+            self._precheck(index, message, allowed, source)
         return values
 
-    def _require_indexed_keys(self, values: list[dict[str, str]], local: Path) -> None:
+    def _require_indexed_keys(
+        self, values: list[dict[str, str]], source: str | os.PathLike[str]
+    ) -> None:
         """Native archiving takes every key from the message, so a query key FDB
         indexes that a message lacks cannot be honoured (FR-STORE-003, L-23)."""
         required = self._indexed_keys()
         for index, message in enumerate(values, 1):
             if absent := next((k for k in required if not message.get(k)), None):
                 raise WorkflowError(
-                    f"{self.query}: message {index} of {local} lacks {absent}, which "
+                    f"{self.query}: message {index} of {source} lacks {absent}, which "
                     "native archiving takes from the message; use "
                     "archive_mode=identifier to label it, or drop the key from the "
                     "query; nothing was archived"
@@ -919,7 +1019,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return ": " + ", ".join(names) + (f" and {more} more" if more else "")
 
     def _identifiers(
-        self, messages: list[GribMessage], mars: list[dict[str, str]], local: Path
+        self,
+        messages: list[GribMessage],
+        mars: list[dict[str, str]],
+        source: str | os.PathLike[str],
     ) -> list[dict[str, str]]:
         """FDB identifiers of ``messages`` (numbered from 1) from their pre-checked
         MARS keys ``mars``, each passed to the guard (FR-STORE-004, FR-STORE-008)."""
@@ -944,13 +1047,13 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                 elif key not in optional:
                     raise WorkflowError(
                         f"{self.query}: cannot determine {key} for message {index} of "
-                        f"{local}; nothing was archived"
+                        f"{source}; nothing was archived"
                     )
             try:
                 self.provider.guard.check(message, identifier, parsed)
             except IdentifierMismatch as e:
                 raise WorkflowError(
-                    f"{self.query}: identifier check failed for {local}: {e}; nothing "
+                    f"{self.query}: identifier check failed for {source}: {e}; nothing "
                     "was archived"
                 ) from e
             identifiers.append(identifier)
@@ -984,7 +1087,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         index: int,
         values: Mapping[str, str],
         allowed: Mapping[str, list[int | str]],
-        local: Path,
+        source: str | os.PathLike[str],
     ) -> None:
         """Message values of the keys in ``allowed`` must be one of the listed ones
         (FR-STORE-005), in both archive modes.
@@ -1003,19 +1106,21 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                 else f"not one of {query_value}"
             )
             raise WorkflowError(
-                f"{self.query}: message {index} of {local} has {key}={values[key]}, "
+                f"{self.query}: message {index} of {source} has {key}={values[key]}, "
                 f"{expected}; nothing was archived"
             )
 
     def _archive(
-        self, batch: list[tuple[bytes, dict[str, str] | None]], local: Path
+        self,
+        batch: list[tuple[bytes, dict[str, str] | None]],
+        source: str | os.PathLike[str],
     ) -> None:
         """Archive and flush once; a failure after an ``archive()`` succeeded says
         that those fields stay in FDB (FR-STORE-010)."""
         backend = self.provider.backend
         archived = 0
         try:
-            with self._mapping_errors(local):
+            with self._mapping_errors(source):
                 for data, identifier in batch:
                     backend.archive(data, identifier)
                     archived += 1

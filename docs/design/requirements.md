@@ -22,6 +22,8 @@ The product is the Python package `snakemake_storage_plugin_fdb` (distribution
 
 - retrieves rule inputs from FDB into one local GRIB file per query;
 - archives rule outputs (GRIB files) into FDB;
+- offers `run:` and `script:` rules an API that reads fields from and writes fields to
+  FDB with no local data file (§2.15);
 - answers Snakemake's existence, modification-time, size and inventory questions;
 - lists candidates for `glob_wildcards`.
 
@@ -390,15 +392,20 @@ If `pyfdb` or `eccodes` cannot be imported at provider construction, the provide
 
 #### FR-CONF-008 Settings from environment variables
 
-`config`, `user_config`, `eccodes_definitions`, `metkit_home`, `key_order`, `env` and
-`glob_required_keys` are also read from `SNAKEMAKE_STORAGE_FDB_<NAME>` (upper case), the
-interface's environment-variable mechanism: the CLI flag wins, then the variable, then
-the default. The variable holds one value and may be tagged (`TAG::VALUE`). The choice
-settings are deliberately excluded: they express workflow policy, not site setup.
+`config`, `user_config`, `eccodes_definitions`, `metkit_home`, `key_order`, `env`,
+`glob_required_keys`, `archive_mode`, `identifier_check` and `canonical_spelling` are
+also read from `SNAKEMAKE_STORAGE_FDB_<NAME>` (upper case), the interface's
+environment-variable mechanism: the CLI flag wins, then the variable, then the default.
+The variable holds one value and may be tagged (`TAG::VALUE`). Snakemake exports these
+variables into every job it spawns, so the direct API (FR-DIRECT-003) sees the
+workflow's values. `remove_policy` and `input_tracking` act only in the scheduling
+process and are not environment settings.
 
 - Rationale: site setup belongs in the environment of a site's login profile or
   container, next to `ECCODES_DEFINITION_PATH` and `METKIT_HOME`, not in every command
-  line (NFR-NEUTRAL-002).
+  line (NFR-NEUTRAL-002). The three archiving and spelling settings are workflow policy
+  rather than site setup, but a job must archive as the workflow does, and the
+  environment is the one channel Snakemake carries into rule bodies (FR-DIRECT-003).
 - Verification: test `tests/test_settings.py::test_settings_fields`,
   `tests/test_workflow.py::test_workflow_config_from_environment_variable`.
 
@@ -434,15 +441,19 @@ environment), an effective `METKIT_HOME` without `share/metkit/language.yaml` ra
 
 #### FR-ENV-003 FDB environment untouched
 
-The plugin never sets or clears `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`,
-`FDB5_CONFIG_FILE`, `FDB_HOME` or `FDB_SCHEMA_FILE` (except through `env`). Without the
-two dedicated settings, `ECCODES_DEFINITION_PATH` and `METKIT_HOME` are left as they
-are.
+The plugin never clears or overwrites `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`,
+`FDB5_CONFIG_FILE`, `FDB_HOME` or `FDB_SCHEMA_FILE`, and never sets `FDB5_*`,
+`FDB_HOME` or `FDB_SCHEMA_FILE` at all (except through `env`). The single exception is
+FR-DIRECT-003: where none of these variables is set, the provider's own `config` is
+exported as `FDB_CONFIG_FILE` or `FDB_CONFIG` so that jobs reach the same FDB.
+Without the two dedicated settings, `ECCODES_DEFINITION_PATH` and `METKIT_HOME` are left
+as they are.
 
 - Rationale: explicit `config` takes precedence inside FDB; the ambient setup of other
-  tools must keep working.
+  tools must keep working, so the plugin only fills a gap, never changes an answer.
 - Verification: test `tests/test_settings.py::test_settings_config_leaves_fdb_env_untouched`,
-  `::test_settings_no_env_settings_leave_env_untouched`.
+  `::test_settings_no_env_settings_leave_env_untouched`,
+  `tests/test_direct.py::test_provider_keeps_a_configuration_in_the_environment`.
 
 #### FR-ENV-004 Explicit environment overrides
 
@@ -1127,6 +1138,101 @@ fetcher (`fetch_ogd_samples.py`); `docs/sites/meteoswiss.md` documents them.
   `tests/sites/meteoswiss/test_fetch_ogd_samples.py::test_empty_data_reproduces_committed_samples`,
   `::test_fetch_live`.
 
+### 2.15 Direct access from rule bodies
+
+#### FR-DIRECT-001 Direct reads
+
+A rule that names an input `storage.fdb(query, retrieve=False)` receives the query text
+instead of a local file, and the package's `api` module reads its fields from FDB:
+`request(query)` (the expanded MARS request, as pyfdb and earthkit-data take it),
+`open(query)` (a readable binary stream of the fields), `messages(query)` (an iterator of
+complete GRIB messages, one at a time), `retrieve(query, path)` (the retrieval Snakemake
+would do, where a job needs a file after all) and `earthkit(query)`
+(`earthkit.data.from_source("fdb", request)`, if the optional earthkit-data is
+installed). No GRIB file is written under `.snakemake/storage` for such an input.
+`messages` keeps the guarantees of a retrieval: all fields of the query must be in FDB,
+otherwise it raises the missing-field report of FR-READ-008 before reading, and a stream
+that ends early is an error; `open` streams whatever FDB returns. Existence, modification
+times, the inventory and the rerun decision are unaffected: they come from FDB, not from
+a local copy (FR-READ-001, FR-READ-004, FR-RERUN-001).
+
+- Rationale: the point of an FDB workflow is to keep fields out of the filesystem;
+  copying every input into `.snakemake/storage` doubles the I/O and the space for jobs
+  that only read the fields once. Snakemake already offers the per-object flag; the
+  plugin supplies the reading side (ADR-035).
+- Verification: test `tests/test_direct.py` (`test_request_expands_the_query`,
+  `test_messages_equal_a_retrieval`, `test_open_streams_the_same_bytes`,
+  `test_messages_reports_missing_fields`, `test_retrieve_writes_the_file`,
+  `test_earthkit_from_source`, `test_direct_workflow_runs`,
+  `test_direct_workflow_writes_no_data_file`); `docs/patterns.md` (`run-direct`,
+  `script-direct`).
+
+#### FR-DIRECT-002 Direct archives and the archive marker
+
+`api.archive(output, messages)` archives GRIB messages under the query of an FDB output
+and writes an archive marker at the output's local path. `output` is what the job holds
+for an FDB output, the local path, which the plugin maps back to its query (the inverse
+of FR-PATH-001; a hashed component or a foreign path is an error naming the `query=`
+argument). Before the first `archive()` call it runs the checks of the store path on the
+messages — field count, message keys against the query, identifiers, duplicates
+(FR-STORE-002 to FR-STORE-007) — so a failure archives nothing; an iterator is consumed
+into memory for that. After archiving and flushing it runs the post-check of FR-STORE-009
+in the job, naming any offending message, and writes the marker atomically: the header line
+`# snakemake-storage-plugin-fdb archived`, the query, the number of archived fields and
+the FDB clock second read before the first `archive()`. `store_object` recognises a
+marker at the local path, archives nothing, and runs the post-check of FR-STORE-009 with
+the marker's field count and timestamp; a marker for another query, or one whose field
+count differs from the expansion, is an error. The marker is an ordinary local copy for
+Snakemake: it is removed after the run unless `--keep-storage-local-copies` is given.
+
+- Rationale: Snakemake has no "no local output" flag — after the job it requires the
+  output's local path to exist and then calls `store_object` — so a direct archive needs
+  something at that path; a marker is small, self-describing and lets the store step keep
+  the post-check that proves the fields are reachable by the query (ADR-035, D-015).
+- Verification: test `tests/test_direct.py`
+  (`test_archive_puts_the_fields_in_fdb_and_writes_a_marker`,
+  `test_archive_accepts_bytes_and_iterators`,
+  `test_archive_uses_the_query_of_the_output_path`,
+  `test_archive_rejects_a_wrong_field_count`,
+  `test_archive_rejects_a_message_that_contradicts_the_query`,
+  `test_archive_rejects_duplicates`, `test_store_object_accepts_the_marker`,
+  `test_store_object_marker_with_a_wrong_count`,
+  `test_store_object_marker_of_another_query`,
+  `test_store_object_marker_without_the_fields`, `test_marker_round_trip`,
+  `test_direct_workflow_archives_into_fdb`); `docs/patterns.md` (`run-direct-archive`).
+
+#### FR-DIRECT-003 The FDB configuration in the job environment
+
+A provider with a `config` setting exports it into the process environment before the FDB
+libraries load: `FDB_CONFIG_FILE` for a configuration file, `FDB_CONFIG` for inline YAML.
+A job then reaches the same FDB with an unconfigured `pyfdb.FDB()` or earthkit
+`from_source("fdb", ...)`: spawned `run:` jobs re-create the provider, `script:`
+subprocesses inherit the environment. A value the environment already carries is never
+overwritten, and providers of one process that disagree (tagged providers) export
+nothing and remove what they exported (never a value found in the environment). fdb5 has
+no environment variable for the user configuration, so the direct API takes
+`config`/`user_config` arguments and otherwise reads the plugin's own settings variables
+(`SNAKEMAKE_STORAGE_FDB_*`, ignoring tagged values) — which Snakemake sets in every job
+it spawns for the settings of FR-CONF-008 — before falling back to FDB's environment.
+A job therefore reads, spells and archives as the workflow does: `archive_mode`,
+`identifier_check`, `canonical_spelling` and `key_order` are taken from those variables
+(explicit arguments of the API, such as `archive_mode=`, still win).
+
+- Rationale: without it, direct access would need every job to repeat the configuration;
+  with it, `run:` and `script:` bodies are plain pyfdb or earthkit code. The precedence
+  follows FR-ENV-003/FR-ENV-004: the plugin adds what is missing, never overrides the
+  user.
+- Verification: test `tests/test_direct.py`
+  (`test_provider_exports_the_configuration_file`,
+  `test_provider_exports_inline_configuration`,
+  `test_provider_keeps_a_configuration_in_the_environment`,
+  `test_providers_with_different_configurations_export_nothing`,
+  `test_conflicting_providers_leave_a_user_configuration`,
+  `test_api_uses_the_exported_configuration`,
+  `test_archive_takes_the_archive_mode_from_the_environment`,
+  `test_direct_workflow_inherits_the_archive_mode`, `test_direct_workflow_runs` — the
+  `script:` rule uses plain `pyfdb.FDB()`).
+
 ---
 
 ## 3. Non-functional requirements
@@ -1198,6 +1304,20 @@ Test FDBs live in pytest's temporary directories.
 
 - Rationale: fast tests and a small repository.
 - Verification: inspection; test `tests/test_grib.py::test_variant_zeroed`.
+
+#### NFR-PERF-005 No local data copies for direct jobs
+
+A workflow whose `run:` and `script:` rules use direct reads (FR-DIRECT-001) and direct
+archives (FR-DIRECT-002) writes no GRIB file under `.snakemake/storage`: the only file
+that appears there for such a rule is the archive marker of an output, a few hundred
+bytes, and only until the local copies are cleaned up. Reads stream one message at a
+time, so job memory does not grow with the size of the query.
+
+- Rationale: the reason for an FDB workflow is to keep the pressure off the filesystem;
+  a plugin that always stages GRIB through `.snakemake/storage` gives that up.
+- Verification: test
+  `tests/test_direct.py::test_direct_workflow_writes_no_data_file`; inspection
+  (`grib.stream_messages`).
 
 ### 3.3 Compatibility and platforms
 
@@ -1356,6 +1476,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
 | L-28 | Relative dates (`date=-1`) expand at run time, but the local path keeps the text, so a copy kept with `--keep-storage-local-copies` goes stale. |
+| L-29 | Direct access (FR-DIRECT-001/002) is for rule bodies written in Python (`run:`, `script:`, `notebook:`). A `shell:` rule that hands the fields to an external program still needs a file: leave the input retrieved, or call `api.retrieve` in a `run:` rule. A directly archived output leaves its marker at the local path, and `--keep-storage-local-copies` keeps markers like any other local copy; `--delete-all-output` deletes neither the FDB fields (FR-REMOVE-001) nor kept local copies. |
 
 ---
 
@@ -1395,3 +1516,4 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-012 | Report the `inspect` vs `list` discrepancy upstream | `inspect`/`retrieve` match through query keys absent from the indexed fields while `list` does not (L-22, architecture.md §13.4); same behaviour on pyfdb 5.21.4.23 and 5.23.2. Open an issue on `ecmwf/fdb` asking whether this is intended; drop the plugin-side key check (FR-READ-001) if it is ever fixed. |
 | D-013 | Report the `{provider}` formatting of invalid-query messages upstream | `snakemake/storage.py:205-209` (snakemake 9.27.0) formats the provider object into the catalogue URL of an invalid query, so a plugin without `__str__` produces `.../plugins/storage/<...StorageProvider object at 0x...>.html`. The plugin works around it with `StorageProvider.__str__` (FR-IFACE-002); upstream should use the plugin name. |
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |
+| D-015 | An upstream "no local output" flag for storage outputs | Snakemake requires an FDB output's local path to exist after the job and then calls `store_object`, so a job that archived the fields itself must leave something there; the plugin writes an archive marker (ADR-035, FR-DIRECT-002). Propose the output-side counterpart of `retrieve=False` (e.g. `storage.fdb(query, store=False)` or a `StorageObjectWrite.stored_by_job` hook) so that no file is needed at all. FIFOs (`pipe()`) were considered and rejected: a storage object cannot carry `pipe()` (architecture.md §13.8). |

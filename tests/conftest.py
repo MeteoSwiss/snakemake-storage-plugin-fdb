@@ -161,14 +161,19 @@ def run_logged() -> Callable[[Path], Callable[..., Run]]:
 def clean_env(monkeypatch) -> pytest.MonkeyPatch:
     """Unset the provider's environment variables; monkeypatch restores them.
 
-    Also resets the plugin's per-process records (applied settings, queries warned
-    about spelling), so tests do not see each other's warnings.
+    Also resets the plugin's per-process records (applied settings, the exported FDB
+    configuration, the providers the direct API cached, queries warned about spelling),
+    so tests do not see each other's warnings or environment.
     """
     import snakemake_storage_plugin_fdb as plugin
+    from snakemake_storage_plugin_fdb import api
 
     for name in PROVIDER_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(plugin, "_APPLIED", {})
+    monkeypatch.setattr(plugin, "_FDB_EXPORTED", None)
+    monkeypatch.setattr(plugin, "_FDB_EXPORT_CONFLICT", False)
+    api._cached_provider.cache_clear()
     monkeypatch.setattr(plugin, "_SPELLING_WARNED", set())
     monkeypatch.setattr(plugin, "_REMOVE_WARNED", set())
     monkeypatch.setattr(plugin, "_PARTIAL_WARNED", set())

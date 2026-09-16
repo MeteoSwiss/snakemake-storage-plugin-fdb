@@ -40,10 +40,13 @@ SETTINGS = {
 }
 
 # reference.md "Environment variables": settings the interface reads from
-# SNAKEMAKE_STORAGE_FDB_<NAME> (FR-CONF-008).
+# SNAKEMAKE_STORAGE_FDB_<NAME> and carries into spawned jobs (FR-CONF-008).
 ENV_VAR_SETTINGS = {
     "config",
     "user_config",
+    "archive_mode",
+    "identifier_check",
+    "canonical_spelling",
     "eccodes_definitions",
     "metkit_home",
     "key_order",

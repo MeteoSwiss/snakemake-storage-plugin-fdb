@@ -10,6 +10,7 @@ complete, runnable workflows for the usual cases are in the
 - [Configuration](#configuration)
 - [Writing queries](#writing-queries)
 - [Reading inputs](#reading-inputs)
+- [Direct access from run and script rules](#direct-access-from-run-and-script-rules)
 - [Writing outputs](#writing-outputs)
 - [Reruns](#reruns)
 - [Globbing](#globbing)
@@ -27,7 +28,9 @@ complete, runnable workflows for the usual cases are in the
   address several fields with `/` lists and `to`/`by` ranges.
 - Each query maps to **one local GRIB file** under `.snakemake/storage/`. As an input,
   Snakemake retrieves all fields of the query into it; as an output, your rule writes the
-  fields into it and the plugin archives them into FDB.
+  fields into it and the plugin archives them into FDB. `run:` and `script:` rules can
+  skip that file and work
+  [directly on FDB](#direct-access-from-run-and-script-rules).
 - A query **exists** only if FDB holds every field the query expands to.
 - FDB never deletes single fields. Archiving the same fields again **masks** the old ones.
 - The plugin is **site-neutral**: an FDB with its own schema, eccodes definitions or MARS
@@ -254,10 +257,147 @@ wildcards`, and a first rule that is not the collecting rule builds only itself.
   (an invalid MARS request, a broken configuration, a permission or disk problem) fail
   at once.
 
+A `run:` or `script:` rule does not need that local copy at all: see
+[direct access](#direct-access-from-run-and-script-rules).
+
+## Direct access from run and script rules
+
+A rule whose body is Python can read the fields straight from FDB and archive straight
+into FDB, with no GRIB file on the local filesystem. That is the point of keeping data
+in FDB: nothing is staged under `.snakemake/storage`, and jobs stream one message at a
+time instead of writing and re-reading a file.
+
+Mark the input `retrieve=False` — Snakemake then hands the job the **query string**
+instead of a local path — and use the plugin's `api` module:
+
+```snakemake
+storage:
+    provider="fdb"
+
+
+QUERY = (
+    "fdb://class=ea,expver=0001,stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule steps:
+    input:
+        storage.fdb(QUERY, retrieve=False),
+    output:
+        "steps.txt",
+    run:
+        import eccodes
+        from snakemake_storage_plugin_fdb import api
+
+        with open(output[0], "w") as f:
+            for message in api.messages(input[0]):  # input[0] is the query
+                handle = eccodes.codes_new_from_message(message)
+                print(eccodes.codes_get_string(handle, "step"), file=f)
+                eccodes.codes_release(handle)
+```
+
+Reading (all take the query text; the [reference](reference.md#direct-access-api) has the
+signatures):
+
+| call | gives |
+|---|---|
+| `api.messages(query)` | an iterator of complete GRIB messages, one at a time |
+| `api.open(query)` | a readable binary stream of the fields |
+| `api.request(query)` | the expanded MARS request, ready for `pyfdb` or earthkit-data |
+| `api.retrieve(query, path)` | a local GRIB file after all (for an external program) |
+| `api.earthkit(query)` | `earthkit.data.from_source("fdb", ...)`, if earthkit-data is installed |
+
+`api.messages` keeps the guarantees of a normal input: all fields of the query must be in
+FDB, otherwise it raises the same missing-field error as a retrieval. Existence,
+modification times and the rerun decision are unchanged — they come from FDB, not from a
+local copy — so `retrieve=False` changes nothing about *when* a job runs.
+
+Writing works the same way, with one wrinkle: Snakemake requires a local file at an
+output's path after the job. `api.archive` archives the messages and writes a small
+**archive marker** there; the plugin's store step recognises it, archives nothing and
+only verifies that the fields are in FDB:
+
+```snakemake
+rule shift_expver:
+    input:
+        storage.fdb(QUERY, retrieve=False),
+    output:
+        storage.fdb(QUERY.replace("expver=0001", "expver=0002")),
+    run:
+        import eccodes
+        from snakemake_storage_plugin_fdb import api
+
+        def shifted():
+            for message in api.messages(input[0]):
+                handle = eccodes.codes_new_from_message(message)
+                eccodes.codes_set(handle, "expver", "0002")
+                yield eccodes.codes_get_message(handle)
+                eccodes.codes_release(handle)
+
+        api.archive(output[0], shifted())
+```
+
+- `api.archive(output, messages)` takes the job's output path (it maps back to the
+  query; pass `query=` if you archive somewhere else) and complete GRIB messages, as an
+  iterable or as one `bytes`.
+- The same checks as a file-based store run **before** anything is archived: field count,
+  every message's keys against the query, duplicates. A failure archives nothing. An
+  iterator is consumed into memory for that, so a job's memory is about two copies of
+  its output (the messages and the archive batch), not the four that archiving a file
+  costs. The post-check of a store (every field reachable by the query) runs here too,
+  so a mistake fails in the job, naming the offending messages.
+- The job archives as the workflow does: `archive_mode`, `identifier_check`,
+  `canonical_spelling` and `key_order` reach it, like `config` and `user_config`,
+  because Snakemake exports the plugin's settings into every job as
+  `SNAKEMAKE_STORAGE_FDB_*`. A workflow run with `--storage-fdb-archive-mode identifier`
+  labels its direct archives in identifier mode too; `api.archive(..., archive_mode=...)`
+  overrides it for one call.
+- The marker is a text file of a few hundred bytes:
+
+  ```text
+  # snakemake-storage-plugin-fdb archived
+  query: fdb://class=ea,expver=0002,...,step=0/6/12,param=167
+  fields: 3
+  time: 1789581415
+  ```
+
+  Snakemake removes it with the other local copies at the end of the run, unless you pass
+  `--keep-storage-local-copies`.
+
+In `script:` (and `notebook:`) rules the same calls work: `snakemake.input[0]` is the
+query string, `snakemake.output[0]` the output path. The provider also puts its FDB
+configuration in the environment (`FDB_CONFIG_FILE`, or `FDB_CONFIG` for inline YAML),
+so plain `pyfdb.FDB()` and earthkit's `fdb` source find the same FDB without being
+configured:
+
+```python
+import pyfdb
+
+from snakemake_storage_plugin_fdb import api
+from snakemake_storage_plugin_fdb.grib import stream_messages
+
+with pyfdb.FDB().retrieve(api.request(snakemake.input[0])) as data:
+    for message in stream_messages(data):
+        ...
+```
+
+A configuration the environment already carries is never overwritten, and providers of
+one process with different configurations (tagged providers) export nothing — pass
+`config=` to the API calls then. FDB has no variable for a `user_config`, so plain
+`pyfdb.FDB()` does not see it; the `api` calls do (Snakemake carries it into jobs as
+`SNAKEMAKE_STORAGE_FDB_USER_CONFIG`).
+
+When you still need a file: `shell:` rules that hand the fields to an external program
+(leave the input retrieved, or call `api.retrieve` in a `run:` rule), and anything
+outside Python. Both styles mix freely in one rule — one retrieved input and one direct
+input is fine.
+
 ## Writing outputs
 
 A rule output is a query; the rule writes a GRIB file with exactly those fields, and the
-plugin archives it:
+plugin archives it (a `run:` or `script:` rule can skip the file and archive the fields
+itself, see [direct access](#direct-access-from-run-and-script-rules)):
 
 ```snakemake
 rule shift_expver:
@@ -497,7 +637,10 @@ Most of Snakemake works unchanged with FDB objects; these are the exceptions.
   empty output files`: Snakemake asks the storage object for its size, which is 0 before
   the store, instead of measuring the local file the rule just wrote.
 - **`--not-retrieve-storage`** hands the job the local path of the input without
-  retrieving it, so the job fails on a file that does not exist.
+  retrieving it, so the job fails on a file that does not exist. The per-object flag
+  `storage.fdb(query, retrieve=False)` is a different thing: it hands the job the query
+  itself, which is what
+  [direct access](#direct-access-from-run-and-script-rules) builds on.
 - `touch()`, `ancient()` and `report()` work on FDB objects; `temp()`, `protected()`,
   `directory()` and `pipe()` are rejected (see
   [Removing outputs](#removing-outputs)), and `multiext()` silently drops the storage
@@ -594,5 +737,7 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 - Remote FDB backends are untested.
 - Tagged settings are lost in spawned jobs (Snakemake 9.27).
 - An unreadable database directory inside an FDB root looks like missing data.
+- Direct access is for Python rule bodies; `shell:` rules calling external programs still
+  need a retrieved file.
 
 The full list is in [`design/requirements.md`](design/requirements.md) §5.

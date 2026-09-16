@@ -17,6 +17,7 @@ SCHEME = "fdb://"
 SUFFIX = ".grib"
 NAME_MAX = 255  # bytes per path component (ext4/xfs/lustre)
 HASH_CHARS = 24
+HASH_MARK = "~"  # first character of a hashed path component (FR-PATH-003)
 
 GENERIC_ORDER = [
     "class",
@@ -270,11 +271,40 @@ class ParsedQuery:
                         "and contains a wildcard (cannot be hashed)"
                     )
                 digest = hashlib.sha256(v.encode()).hexdigest()[:HASH_CHARS]
-                comp = f"{k}=~{digest}{ext}"
+                comp = f"{k}={HASH_MARK}{digest}{ext}"
                 if len(comp.encode()) > NAME_MAX:
                     raise QueryError(f"key name too long for a path component: {k!r}")
             parts.append(comp)
         return "/".join(parts)
+
+
+_COMPONENT_RE = re.compile(rf"({_KEY_RE.pattern})=(.+)")
+
+
+def query_of_path(path: str) -> str:
+    """The query whose ``local_suffix`` ends ``path``: the inverse of the mapping.
+
+    ``<prefix>/class=ea/.../step=0+6+12/param=167.grib`` gives
+    ``fdb://class=ea,...,step=0/6/12,param=167``. ``QueryError`` for a path without
+    the suffix, with a hashed component (the value is lost) or whose pairs are not a
+    valid query.
+    """
+    parts = path.replace("\\", "/").split("/")
+    if not parts[-1].endswith(SUFFIX):
+        raise QueryError(f"no {SUFFIX} suffix")
+    parts[-1] = parts[-1][: -len(SUFFIX)]
+    pairs: list[str] = []
+    for part in reversed(parts):  # the prefix ends at the first non key=value part
+        match = _COMPONENT_RE.fullmatch(part)
+        if not match:
+            break
+        key, value = match.groups()
+        if value.startswith(HASH_MARK):
+            raise QueryError(f"hashed component {key}={HASH_MARK}...")
+        pairs.append(f"{key}={value.replace('+', '/')}")
+    query = SCHEME + ",".join(reversed(pairs))
+    parse(query)
+    return query
 
 
 def _parse_value(key: str, pieces: list[_Piece]) -> str:
