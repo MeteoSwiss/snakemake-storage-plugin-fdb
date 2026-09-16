@@ -765,7 +765,10 @@ def test_direct_workflow_runs(direct):
     assert len(texts["mean.txt"].splitlines()) == 3
     # The script read with earthkit-data where it is installed, through the exported
     # FDB5_CONFIG and with no argument (FR-DIRECT-003), with plain pyfdb otherwise.
-    reader = "earthkit" if importlib.util.find_spec("earthkit.data") else "pyfdb"
+    # find_spec("earthkit.data") raises when the "earthkit" namespace is absent
+    reader = "earthkit" if importlib.util.find_spec("earthkit") else "pyfdb"
+    if reader == "earthkit" and not importlib.util.find_spec("earthkit.data"):
+        reader = "pyfdb"
     assert f"READER: {reader}" in log
     local, streamed = texts["mixed.txt"].split()
     assert local == streamed  # the retrieved file and the streamed messages agree
