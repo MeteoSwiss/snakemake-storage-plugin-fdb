@@ -7,6 +7,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-16
+
+Jobs use plain pyfdb, eccodes and earthkit-data; the plugin stays in the Snakefile.
+
 ### Added
 
 - Jobs no longer need the plugin: a `run:` or `script:` body parses its MARS request
@@ -185,7 +189,8 @@ First release.
 - Documentation: a user guide, a reference and contributing notes under `docs/`, and a
   rewritten README with a quick start.
 
-[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/releases/tag/v0.1.0
