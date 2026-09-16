@@ -22,8 +22,8 @@ fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,le
 - **Multi-field queries:** `/` lists, `to`/`by` ranges and Snakemake wildcards. One
   query maps to one local file.
 - **Snakemake semantics:** an input exists only when all its fields are in FDB.
-  Modification times come from FDB index timestamps, and reruns follow the FDB
-  lookup, not the text of the query. Retrieval is atomic; transient errors are
+  Modification times come from FDB index timestamps, and reruns follow the fields a
+  query names, not its text. Retrieval is atomic; transient errors are
   retried and permanent ones fail at once, with a message that says what to fix.
 - **Safe archiving:** field count, GRIB structure, duplicates and every message's MARS
   keys are checked against the query before anything is archived, and the result is

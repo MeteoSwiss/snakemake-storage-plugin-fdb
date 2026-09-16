@@ -325,6 +325,14 @@ def count_fields(expanded: Mapping[str, list[str]]) -> int:
     return math.prod(len(set(values)) for values in expanded.values())
 
 
+def distinct_values(
+    expanded: Mapping[str, list[str]], keys: list[str]
+) -> list[list[str]]:
+    """The distinct values of each of ``keys`` in an expanded request, in first-seen
+    order; their product enumerates the fields ``count_fields`` counts."""
+    return [list(dict.fromkeys(expanded[k])) for k in keys]
+
+
 def _detail(exc: BaseException) -> str:
     """The short detail of a pyfdb failure (architecture.md §8.4): the first non-empty
     line without the ``UserError: ``/``Serious bug: `` prefixes and a trailing

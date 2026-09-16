@@ -953,37 +953,55 @@ Configuration errors carry a hint where the cause is known:
 
 ### 2.11 Reruns
 
-#### FR-RERUN-001 Reruns of FDB inputs follow the lookup
+#### FR-RERUN-001 Reruns of FDB inputs follow the fields, not the query text
 
-Whether a rule with FDB inputs reruns follows from the FDB lookup alone: whether the
-fields of its queries are there, and how their index timestamps compare with the outputs
-(besides Snakemake's `params`, `code` and `software-env` triggers, which describe the
-rule, not the input). Editing the query text — narrowing `param=167/165` to `param=167`,
-widening it, reordering values, writing `0/to/12/by/6` for `0/6/12` — never triggers a
-rerun by itself, and neither does adding or removing an FDB input. Inputs that are not
-this plugin's keep Snakemake's input-set trigger.
+An FDB input of a job counts as changed for Snakemake's input-set rerun trigger exactly
+when the fields its query expands to are not all covered by the fields of the FDB queries
+recorded for that job's outputs. Everything else about the rerun follows from the FDB
+lookup: whether the fields are there (FR-READ-001) and how their index timestamps compare
+with the outputs (FR-READ-004), besides Snakemake's `params`, `code` and `software-env`
+triggers, which describe the rule, not the input. Fields are compared on the expanded
+(canonical) values of every key, and a key that one query names and the other does not
+makes the fields differ. Inputs that are not this plugin's keep Snakemake's input-set
+comparison.
 
-- Rationale: a query names fields, it is not the state of the input; that state is in FDB
-  (FR-READ-001, FR-READ-004). A query edit that selects the same or older fields must not
-  invalidate outputs, and a widened query must rerun only if it names a field newer than
-  the output. Snakemake's input-set trigger records the query text of storage inputs and
-  has no per-rule or per-file opt-out (architecture.md §13.8), so the plugin removes its
-  own inputs from that record (ADR-031, L-21).
-- Verification: test `tests/test_rerun.py::test_rerun_narrowed_query_is_up_to_date`,
-  `::test_rerun_widened_query_with_newer_field`,
+| edit | rerun |
+|---|---|
+| a parameter or a step removed (narrowing) | no |
+| values reordered, a range for a list, non-canonical spellings of the same fields | no |
+| one multi-field query split into per-field queries, or the other way round | no |
+| a parameter or a step added (widening), whether the new fields exist or must be produced | yes |
+| a field re-archived later than the output | yes (the `mtime` trigger) |
+| a local (non-FDB) input added or removed | yes (Snakemake's comparison) |
+| no FDB input recorded for the job (records written by 0.2.0) | yes, once |
+
+- Rationale: a query names fields, it is not the state of the input; that state is in FDB.
+  An edit that selects the same or fewer fields must not invalidate outputs, while fields
+  the job never had must reach it, even when they are older than the output or do not
+  exist yet — a new field of an up-to-date consumer is pulled into the DAG only through
+  the input-set trigger (architecture.md §13.8). Snakemake compares the recorded query
+  text and has no per-rule or per-file opt-out, so the plugin decides the comparison for
+  its own inputs (ADR-034, L-21).
+- Verification: test `tests/test_rerun.py::test_rerun_same_or_fewer_fields_is_up_to_date`
+  (narrowed, reordered, a range, split and merged queries),
+  `::test_rerun_widened_query_with_older_fields`,
+  `::test_rerun_rearchived_field_uses_the_mtime_trigger`,
   `::test_rerun_local_input_set_still_triggers`,
-  `::test_install_hides_only_opted_out_inputs`.
+  `::test_rerun_record_without_fdb_inputs`,
+  `::test_chain_added_parameter_is_planned`,
+  `::test_chain_added_parameter_is_archived`, and the `covered_by`/`decide` unit tests.
 
 #### FR-RERUN-002 `input_tracking` setting
 
 `input_tracking` decides how FDB inputs take part in Snakemake's input-set rerun trigger:
-`lookup` (default) hides them from it (FR-RERUN-001); `query` restores Snakemake's
-default behaviour, in which a changed set of input queries reruns the job. The setting is
-read when the provider is constructed; the first provider with `lookup` installs the
-interim patch for the process, further providers reuse it, and a failed installation is
-a warning, never an error (L-21). The setting applies per provider: the patch skips an
-input only if its storage object's `tracks_input_changes` is false, which is the name and
-meaning of the proposed upstream hook (D-011).
+`lookup` (default) decides them by field coverage (FR-RERUN-001); `query` restores
+Snakemake's default behaviour, in which any change of the recorded query text reruns the
+job. The setting is read when the provider is constructed; the first provider with
+`lookup` installs the interim patch for the process, further providers reuse it, and a
+failed installation is a warning, never an error (L-21). The setting applies per
+provider: the patch decides an input by coverage only if its storage object's
+`tracks_input_changes` is false, which is the name and meaning of the proposed upstream
+hook (D-011).
 
 - Rationale: an escape hatch if the interim patch misbehaves, and a name for the
   behaviour in logs and documentation.
@@ -991,6 +1009,7 @@ meaning of the proposed upstream hook (D-011).
   `tests/test_rerun.py::test_rerun_input_tracking_query_restores_the_trigger`,
   `::test_provider_setting_query_does_not_patch`, `::test_install_is_idempotent`,
   `::test_fallback_when_attribute_is_missing`, `::test_fallback_on_unexpected_signature`,
+  `::test_patched_input_changed_without_fdb_inputs`,
   `tests/test_settings.py::test_settings_fields`, `::test_settings_invalid_choice`.
 
 ### 2.12 Snakemake integration
@@ -1312,7 +1331,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-18 | Identifier mode cannot relabel GRIB that contradicts a single-valued query key; fix the GRIB first (e.g. `grib_set`). |
 | L-19 | Tagged settings (`TAG::VALUE`) do not reach spawned job processes (upstream Snakemake issue, architecture.md §11): `run:` rules under the local executor and every job under cluster or remote executors see the untagged value `TAG:VALUE`. Use untagged settings for such workflows, or `shell` rules with the local executor. |
 | L-20 | eccodes-cosmo-resources prints a definitions version warning per decoded message unless `ECCODES_VERSION_CHECK_OFF=1`, and decoding with the COSMO definitions truncates a stderr redirected to a shared file. |
-| L-21 | Input tracking by lookup (FR-RERUN-001) patches the private `snakemake.persistence.PersistenceBase._input`, verified for snakemake 9.27 (architecture.md ADR-031, R-14). Where the attribute is missing or its signature differs, the plugin warns and falls back to query tracking, so query edits trigger reruns again. One residual effect is not covered by any check: a query edited to name different fields that are all older than the output does not rerun, and the output keeps what the old query produced (extra fields after narrowing, missing fields after widening, the old fields after a swap). |
+| L-21 | Input tracking by lookup (FR-RERUN-001) patches the private `snakemake.persistence.PersistenceBase._input_changed`, verified for snakemake 9.27 (architecture.md ADR-034, R-14). Where the attribute is missing or its signature differs, the plugin warns and falls back to query tracking, so any query edit triggers a rerun again. Residual effects, none of them flagged: a narrowed query does not rerun, so the output keeps the extra fields the wider query produced; a query that cannot be expanded (metkit rejects it) or names more than `COVERAGE_MAX` (100 000) fields covers nothing but its own text, so such a query reruns its job whenever its text changes, as under `input_tracking=query`. |
 | L-22 | `inspect`/`retrieve` match through query keys the indexed fields do not have (`quantile=1:10` finds quantile-less fields), unlike `list` (architecture.md §13.4). Mitigated by the key check of FR-READ-001; a retrieval whose `inspect` returns matching and non-matching fields together fails on the byte count instead (FR-READ-007). |
 | L-23 | Native mode cannot label a key the message does not carry: naming such a key in the query is an error (FR-STORE-003). Use `archive_mode=identifier`, set the key in the GRIB, or drop it from the query. |
 | L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error on every FDB version, because the plugin checks the configured roots itself (FR-ERR-004). |
@@ -1355,7 +1374,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
 | D-009 | qubed | Not useful for v1; revisit for compressed summaries of large FDB listings (architecture.md §13.12). |
 | D-010 | Withdrawn | Snakemake plugin catalogue pages will not be included (decided 2026-09-15); see §6.1. |
-| D-011 | Upstream hook instead of the interim patch | Snakemake decides input changes from the recorded query text of storage inputs; propose that a storage object can opt out (e.g. `tracks_input_changes`, consulted in `PersistenceBase._input`, defaulting to `True` in `StorageObjectRead` of `snakemake-interface-storage-plugins`). Issue and PR drafts, with a patch against `main`, are prepared but not posted. Remove `rerun.py`'s patch once a released Snakemake offers the hook (ADR-031, L-21, architecture.md R-14). |
+| D-011 | Upstream hook instead of the interim patch | Snakemake decides input changes from the recorded query text of storage inputs; propose that a storage object decides it for itself (e.g. `tracks_input_changes` plus `input_changed(recorded)` on `StorageObjectRead` of `snakemake-interface-storage-plugins`, defaulting to `self.query not in recorded`, consulted in `PersistenceBase._input_changed`). Issue and PR drafts, with a patch against `main`, are prepared but not posted. Remove `rerun.py`'s patch once a released Snakemake offers the hook (ADR-034, L-21, architecture.md R-14). |
 | D-012 | Report the `inspect` vs `list` discrepancy upstream | `inspect`/`retrieve` match through query keys absent from the indexed fields while `list` does not (L-22, architecture.md §13.4); same behaviour on pyfdb 5.21.4.23 and 5.23.2. Open an issue on `ecmwf/fdb` asking whether this is intended; drop the plugin-side key check (FR-READ-001) if it is ever fixed. |
 | D-013 | Report the `{provider}` formatting of invalid-query messages upstream | `snakemake/storage.py:205-209` (snakemake 9.27.0) formats the provider object into the catalogue URL of an invalid query, so a plugin without `__str__` produces `.../plugins/storage/<...StorageProvider object at 0x...>.html`. The plugin works around it with `StorageProvider.__str__` (FR-IFACE-002); upstream should use the plugin name. |
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |

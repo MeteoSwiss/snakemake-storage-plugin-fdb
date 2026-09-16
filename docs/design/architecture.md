@@ -170,9 +170,11 @@ requirements.md D-001.
 ### 5.6 `rerun.py` — input tracking by lookup
 
 `install_lookup_input_tracking(logger)` patches
-`snakemake.persistence.PersistenceBase._input` once per process so that storage inputs
-whose object declares `tracks_input_changes = False` are left out of the recorded input
-set (FR-RERUN-001, ADR-031, §8.10); the import of Snakemake happens inside the installer.
+`snakemake.persistence.PersistenceBase._input_changed` once per process so that a storage
+input whose object declares `tracks_input_changes = False` counts as changed only when
+its object's `covered_by()` says that the recorded queries do not cover its fields
+(FR-RERUN-001, ADR-034, §8.10). `decide(objects, current, recorded)` holds that
+comparison; the import of Snakemake happens inside the installer.
 
 ### 5.7 `__init__.py` — Snakemake integration
 
@@ -181,12 +183,14 @@ set (FR-RERUN-001, ADR-031, §8.10); the import of Snakemake happens inside the 
 - `StorageProvider.__post_init__` runs: choice settings and `identifier_check` →
   `glob_required_keys` → `input_tracking` (§8.10) → environment (§8.3) → `config`/`user_config` → schema path and
   `SchemaInfo` → `key_order` → lazy import of `eccodes` and `pyfdb` → `Backend` →
-  guard. `postprocess_query` records its results for `is_normalised` (FR-PATH-004).
+  guard. `postprocess_query` records its results for `is_normalised` (FR-PATH-004), and
+  `field_set(query)` caches the fields of a query for the rerun decision (§8.10).
 - `StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob)`: the parse
   result and the request expansion are cached per query text (FR-PATH-005, §8.2);
   `_fields()` is one retried `inspect`, never cached (FR-READ-010), keeping only the
   fields whose key contains every query key FDB indexes (`_indexed_keys()`, §13.4). Read
-  methods, `store_object` (§6.4), `remove` and `list_candidate_matches` build on them.
+  methods, `store_object` (§6.4), `remove` and `list_candidate_matches` build on them;
+  `covered_by` (§8.10) asks the provider's `field_set` instead.
 - Module-level state, each lock-protected: `_APPLIED` (values applied by providers, to
   warn on disagreement), `_SPELLING_WARNED` and `_REMOVE_WARNED` (once-per-process
   warnings).
@@ -533,28 +537,49 @@ runs at all (FR-READ-001). The `input` trigger, in contrast, compares the *text*
 recorded input queries (§13.8), which changes whenever a query is edited, even when it
 selects the same fields.
 
-`input_tracking=lookup` (the default) therefore hides this plugin's inputs from the
-`input` trigger: `rerun.py` wraps `PersistenceBase._input` and removes from its result
-the queries of the storage inputs whose object declares `tracks_input_changes = False`,
-one entry per such input (ADR-031). That attribute is decided per object:
+Hiding FDB inputs from the `input` trigger is not enough, because that trigger is also
+what brings *new* work into an up-to-date part of the DAG: only target jobs evaluate
+their missing outputs directly, other producers are pulled in by a consumer that already
+needs to run (`dag.py:1468-1535`, `1622-1665`, §13.8). A parameter added to an up-to-date
+consumer would then produce nothing at all.
+
+`input_tracking=lookup` (the default) therefore decides the trigger for this plugin's
+inputs by **field coverage**: `rerun.py` wraps `PersistenceBase._input_changed` and, when
+the original reports a change, re-decides it (ADR-034). Snakemake records storage inputs
+by query text as it does for every plugin, so the metadata records are unchanged.
+
+The decision (`rerun.decide`) partitions both lists. The current FDB entries are the
+job's inputs whose storage object declares `tracks_input_changes = False`:
 `StorageObject.tracks_input_changes` is false unless the object's provider has
-`input_tracking=query`, so two tagged providers can differ; objects of other plugins have
-no such attribute and stay tracked. Name and meaning are those of the proposed upstream
-hook (requirements.md D-011), so the wrapper does what the upstream change would do. The
-original is called with the real job, so its `lru_cache` is untouched; both `finished()`
-(recording) and `_input_changed()` (comparing) go through the wrapper, so records and
-comparisons agree. Inputs are dropped, not replaced by a placeholder: adding or removing
-an FDB input must not trigger a rerun either, because the lookup already sees the
-difference. Everything else — local files, other plugins' storage objects, `<pipe>`,
-`<service>` — is recorded as before, and the `params`, `code` and `software-env` triggers
-are untouched.
+`input_tracking=query`, so two tagged providers can differ, and objects of other plugins
+have no such attribute and keep the text comparison. Everything else is compared as the
+original does (the same entries with the same multiplicities): a current entry no record
+matches, or an unmatched recorded entry that no tracked object's provider accepts as a
+query (`is_valid_query`), is a change; the remaining unmatched recorded entries are the
+pool, and the input set changed iff some object is not `covered_by` it.
+
+`StorageObject.covered_by(recorded)` is true at once when its own text is in the pool.
+Otherwise it expands every query with metkit (§8.8) and compares **fields**: one field
+is the tuple of `key=value` pairs of one element of the product of the expanded values,
+so the order of keys and values, list or range notation and non-canonical spellings do
+not matter, while a key that only one query names makes their fields differ (the pair is
+part of the field's identity). Recorded queries are expanded from their text alone, not
+through a storage object, so a stale record triggers no spelling warning. The expansions
+are cached per query text on the provider (`field_set`), because a job's recorded
+queries repeat across its outputs and across jobs; a query that metkit rejects, or that
+names more than `COVERAGE_MAX` fields, covers nothing (debug log, L-21). A job whose
+record holds no FDB query at all — a record written by 0.2.0, which hid them — is
+therefore rerun once.
+The `params`, `code` and `software-env` triggers are untouched, and a failure inside the
+decision falls back to Snakemake's answer.
 
 The patch is installed once per process, by the first provider constructed with
 `input_tracking=lookup`, which happens while the Snakefile is parsed and thus before the
 DAG is built. Spawned job processes (`run:` rules under the local executor, cluster
-jobs) construct the provider too, but the record is written by the main process only
-(§13.8). The patch is guarded: a missing attribute or an unexpected signature gives a
-warning and Snakemake's behaviour (L-21, R-14). `input_tracking=query` skips it.
+jobs) construct the provider too, but records are written and compared by the main
+process only (§13.8). The patch is guarded: a missing attribute or an unexpected
+signature gives a warning and Snakemake's behaviour (L-21, R-14). `input_tracking=query`
+skips it.
 
 ## 9. Architecture decisions
 
@@ -901,7 +926,8 @@ design round, provided requirements, architecture and code are updated together.
   and would rerun on every re-archive of an unrelated field of the query); doing nothing
   and documenting it (rejected: the user requires lookup-decided reruns); an upstream
   hook (the target state, requirements.md D-011).
-- Status: accepted (reversible), 2026-09-16; interim until D-011 lands.
+- Status: superseded by ADR-034 (2026-09-16) in its mechanism; the `input_tracking`
+  setting and `tracks_input_changes` remain.
 - Consequences: a private API is patched (L-21, R-14) and a new module `rerun.py` carries
   it; the wrapper has the semantics of the proposed upstream hook, so it can be dropped
   when D-011 lands; the first run after upgrading reruns rules with FDB inputs once,
@@ -947,6 +973,36 @@ design round, provided requirements, architecture and code are updated together.
   intended coupling; an unmapped permanent error is still retried three times, which is
   the safe direction. The predicate is pure and builds no message.
 
+### ADR-034 Field coverage instead of hidden inputs
+
+- Context: ADR-031 hid FDB inputs from the recorded input set. That makes narrowing a
+  query harmless, but it also removes the only trigger that brings new work into an
+  up-to-date part of the DAG: a producer that is not a target runs only when a consumer
+  needs to run (§13.8), and a consumer with existing outputs becomes needrun for a new
+  input through the input-set trigger alone. Adding a parameter to a workflow whose
+  outputs exist therefore reported "Nothing to be done" and produced nothing [verified
+  2026-09-16 with the playground pipeline].
+- Decision: record storage inputs as Snakemake does and decide the comparison instead:
+  wrap `PersistenceBase._input_changed` and, for inputs whose object declares
+  `tracks_input_changes = False`, report a change only when the fields of the input's
+  query are not all covered by the fields of the recorded FDB queries (`covered_by`,
+  §8.10). Non-FDB entries keep Snakemake's comparison. The patch is guarded and degrades
+  to a warning; `input_tracking=query` disables it.
+- Alternatives: keeping ADR-031 and asking users to force reruns after widening
+  (rejected: silent under-production is the worst failure mode); making every FDB input a
+  target (rejected: not the plugin's decision, and it changes job scheduling); comparing
+  the recorded field *lookup* instead of the query's fields (rejected: it duplicates the
+  `mtime` trigger); an upstream hook that lets the object decide (the target state,
+  requirements.md D-011, whose draft now proposes `input_changed(recorded)`).
+- Status: accepted (reversible), 2026-09-16; supersedes the mechanism of ADR-031;
+  interim until D-011 lands.
+- Consequences: metadata records are identical to stock Snakemake's, so
+  `input_tracking=query` and a removed patch need no migration, while a record written by
+  0.2.0 reruns its job once; the comparison costs one metkit expansion per distinct query
+  (cached per process) and enumerates the fields of a query, which is capped
+  (`COVERAGE_MAX`, L-21); a widened query now reruns even when its new fields are older
+  than the output, which is what the user requires.
+
 ## 10. Quality requirements
 
 Quality scenarios are the non-functional requirements in
@@ -970,7 +1026,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-11 | COSMO definitions open `/dev/stderr` as a file, truncating a stderr redirected to a regular file (also with `ECCODES_VERSION_CHECK_OFF=1`) [verified: eccodes 2.47.3 + cosmo-mars + cosmo-resources 2.47.0.1]. | Decoding jobs log stderr to their own file (MeteoSwiss example). |
 | R-12 | eckit `SeriousBug` backtraces are printed regardless of environment settings (L-7). | Accepted. |
 | R-13 | `fdb_time()` uses `ctypes.CDLL(None)`, Linux/glibc-specific. | Fallback to `int(time.time())`. |
-| R-14 | **Private Snakemake API.** Input tracking by lookup patches `PersistenceBase._input` (ADR-031); a rename, a signature change, an override in a subclass or a change of the recorded form of storage inputs (today `storage_object.query` verbatim) would silently restore query tracking or break the patch. | Guarded installation with a warning and a fallback (L-21); the signature is asserted by `tests/test_rerun.py::test_persistence_input_signature_is_stable`; the end-to-end tests check the behaviour; `input_tracking=query` as an escape hatch; upstream hook (requirements.md D-011). |
+| R-14 | **Private Snakemake API.** Input tracking by lookup patches `PersistenceBase._input_changed` (ADR-034); a rename, a signature change, an override in a subclass, a changed format-version gate or a change of the recorded form of storage inputs (today `storage_object.query` verbatim, from `_input`) would silently restore query tracking or break the patch. | Guarded installation with a warning and a fallback (L-21); the signature of the hook and the recorded form are asserted by `tests/test_rerun.py::test_persistence_private_api_is_stable`; the end-to-end tests check the behaviour; `input_tracking=query` as an escape hatch; upstream hook (requirements.md D-011). |
 | R-15 | FDB request semantics: `inspect`/`retrieve` match through query keys the indexed fields lack while `list` does not (§13.4, L-22); the plugin's own key check (FR-READ-001) depends on that asymmetry not changing meaning across FDB versions. | `test_exists_does_not_match_through_absent_key` pins both behaviours; the `pyfdb-latest` canary runs it on 5.23; report upstream (requirements.md D-012). |
 | R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
@@ -1284,6 +1340,18 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   reruns the rule with the reason "Set of input files has changed since last execution",
   while `--rerun-triggers mtime` reports "Nothing to be done" [verified: snakemake
   9.27.0, narrowing `param=167/165` to `param=167` against a dev FDB].
+- `update_needrun` (`dag.py:1468-1535`) evaluates `missing_output` directly only for the
+  jobs of the target files; every other producer becomes needrun only through the
+  propagation from a consumer that is already needrun (`:1622-1665`). A consumer whose
+  own outputs exist therefore becomes needrun for a newly named input only through the
+  `input` trigger ("Set of input files has changed since last execution"); without it,
+  adding an input that has to be produced plans nothing and `--summary` shows the new
+  outputs as `missing` / `no update` [verified: snakemake 9.27.0, a parameter added to
+  the playground pipeline with 0.2.0's hidden inputs].
+- `_input_changed(self, job, file=None)` (`persistence/__init__.py:667-672`) is called
+  once per output file (`_bool_or_gen`, `:116-120`), returns `False` for records older
+  than format version 4, and otherwise compares `self.input(file)` with `self._input(job)`
+  [verified: snakemake 9.27.0].
 
 ### 13.9 MeteoSwiss conventions (`eccodes-cosmo-mars`, evalml)
 

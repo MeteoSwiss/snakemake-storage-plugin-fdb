@@ -24,7 +24,7 @@ the variable over the default.
 | `identifier_check` | `--storage-fdb-identifier-check` | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
 | `canonical_spelling` | `--storage-fdb-canonical-spelling` | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
 | `remove_policy` | `--storage-fdb-remove-policy` | `warn` | `warn`, `ignore`, `error` | FDB cannot delete fields; what removing an output does: no-op with a warning, silent no-op, or error. |
-| `input_tracking` | `--storage-fdb-input-tracking` | `lookup` | `lookup`, `query` | What makes a rule with FDB inputs rerun: `lookup` (only the FDB lookup, so editing a query does not trigger a rerun by itself; see [Methods](#methods)) or `query` (Snakemake's default: the recorded set of input queries too). |
+| `input_tracking` | `--storage-fdb-input-tracking` | `lookup` | `lookup`, `query` | What makes a rule with FDB inputs rerun: `lookup` (the FDB lookup and the fields of the queries, so a query that names the same fields or fewer does not trigger a rerun; see [Methods](#methods)) or `query` (Snakemake's default: the recorded text of the input queries too). |
 | `glob_required_keys` | `--storage-fdb-glob-required-keys` (env) | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
 | `eccodes_definitions` | `--storage-fdb-eccodes-definitions` (env) | unset | colon list of existing directories (made absolute; empty entries skipped; `/MEMFS/...` entries passed as is) | Prepended in order to `ECCODES_DEFINITION_PATH`. |
 | `metkit_home` | `--storage-fdb-metkit-home` (env) | unset | directory containing `share/metkit/language.yaml` (made absolute) | Exported as `METKIT_HOME` for a custom MARS language. |
@@ -166,7 +166,8 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `cleanup` | No-op. |
 | `rate_limiter_key`, `default_max_requests_per_second`, `use_rate_limiter` | `"fdb"`, `10.0`, `False`. |
 | `safe_print` | Identity. |
-| `tracks_input_changes` | `False`, or `True` with `input_tracking=query`: whether the object's query takes part in Snakemake's input-set rerun trigger. |
+| `tracks_input_changes` | `False`, or `True` with `input_tracking=query`: whether the *text* of the object's query takes part in Snakemake's input-set rerun trigger. `False` means the trigger asks `covered_by` instead. |
+| `covered_by(recorded)` | Whether every field of this query is a field of one of the `recorded` queries. A recorded query with the same text covers it outright; otherwise fields are compared on the expanded (canonical) `key=value` pairs, so order, `to`/`by` ranges and non-canonical spellings do not matter, while a key only one query names makes the fields differ. A query that cannot be expanded, or that names more than 100 000 fields, covers nothing. |
 
 `exists`, `mtime`, `size`, `inventory`, `retrieve_object` and `store_object` expand the
 request with metkit first (once per object and query), which runs the canonical-spelling
@@ -178,12 +179,14 @@ request, not GRIB, GRIB keys against the schema, configuration error, I/O error)
 is raised on the first attempt.
 
 With `input_tracking=lookup` (the default), constructing the first provider of a process
-also patches Snakemake's private `snakemake.persistence.PersistenceBase._input`, so that
-inputs whose `tracks_input_changes` is `False` are left out of the input set Snakemake
-records for the `input` rerun trigger
-([architecture ADR-031](design/architecture.md#adr-031-interim-patch-of-persistencebase_input-for-fdb-inputs)).
-Nothing else in Snakemake is modified. If the attribute is missing or has an unexpected
-signature, the plugin logs the warning below and leaves the trigger alone.
+also patches Snakemake's private
+`snakemake.persistence.PersistenceBase._input_changed`, so that an input whose
+`tracks_input_changes` is `False` counts as changed only when `covered_by` reports that
+the recorded queries do not cover its fields
+([architecture ADR-034](design/architecture.md#adr-034-field-coverage-instead-of-hidden-inputs)).
+What Snakemake records is unchanged, and so is the comparison of every other input.
+If the attribute is missing or has an unexpected signature, the plugin logs the warning
+below and leaves the trigger alone.
 
 ## Errors and messages
 

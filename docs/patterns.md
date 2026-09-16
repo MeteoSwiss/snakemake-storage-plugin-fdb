@@ -84,8 +84,9 @@ rule t2m:
 
 The rule gets a path under `.snakemake/storage/fdb/` holding one GRIB message. The file
 is removed after the run unless `--keep-storage-local-copies` is given. A second run has
-nothing to do; the job reruns when the field is archived again, not when the query text
-changes (see [reruns](user-guide.md#reruns)).
+nothing to do; the job reruns when the field is archived again, or when the query is
+edited to name a field the job did not have, not when the same field is written
+differently (see [reruns](user-guide.md#reruns)).
 
 ### Several fields in one file
 
@@ -744,29 +745,31 @@ the GRIB and stay with `native`.
 
 ## Reruns in practice
 
-Whether a rule with FDB inputs reruns is decided by the FDB lookup, not by the text of
-its queries; the table of changes and their effect is in the
+Whether a rule with FDB inputs reruns is decided by the fields its queries name, not by
+their text; the table of changes and their effect is in the
 [user guide](user-guide.md#reruns), and `tests/test_rerun.py` verifies it. What the
 patterns add to that table:
 
 | pattern | consequence |
 |---|---|
 | [wildcards and config](#wildcards-and-config) | a new date in `config.yaml` adds jobs and leaves the others alone; removing one leaves its outputs behind |
+| [wildcards and config](#wildcards-and-config) | a parameter added to a list that a query interpolates reruns the rules that read it, and their producers, although their outputs exist |
 | [discovering what is in FDB](#discovering-what-is-in-fdb) | new fields appear in the DAG on the next run, because globbing happens while the Snakefile is read |
 | [writing outputs](#writing-outputs) | a rerun archives the fields again and masks the previous copy; the output keeps existing, so `--delete-all-output` does not make the producer rerun (use `--forceall`, see [removing outputs](user-guide.md#removing-outputs)) |
 | [one field, one rule](#one-field-one-rule) | per-step jobs rerun per step; a whole-forecast rule reruns as one job |
 | [a chain through FDB](#a-chain-through-fdb) | re-archiving the first query reruns the whole chain, one job per link |
 
-Two edits deserve care, because nothing flags them: an **input** query edited to fields
-that are all older than the output reruns nothing (see
+Two edits deserve care, because nothing flags them: a **narrowed input** query reruns
+nothing, so the output keeps the extra fields the wider query produced (see
 [reruns](user-guide.md#reruns)), and an edited **output** query leaves the fields
 archived under the old query in FDB forever (see
 [writing outputs](user-guide.md#writing-outputs)). Prefer a wildcard or a config value
 over rewriting the query of a rule that has already run.
 
 `--storage-fdb-input-tracking query` restores Snakemake's default behaviour, in which
-any change to the set of input queries reruns the job. It is a per-provider setting, so
-with tagged providers it is written `--storage-fdb-input-tracking prod::query`.
+any change to the text of the input queries reruns the job. It is a per-provider
+setting, so with tagged providers it is written
+`--storage-fdb-input-tracking prod::query`.
 
 ## Site setup
 

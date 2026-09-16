@@ -13,6 +13,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rule directives, writing outputs, reruns and site setup; every example in it is
   executed by `tests/test_patterns.py`.
 
+### Changed
+
+- Reruns of rules with FDB inputs follow the *fields* of their queries, not the text: a
+  query naming the same fields or fewer (narrowed, reordered, a range for a list,
+  `param=2t` for `param=167`, split into per-field queries) reruns nothing, while a
+  query widened to fields the job did not have reruns it, even when those fields are
+  older than the output or have yet to be produced. In 0.2.0 the widened case ran
+  nothing at all. `input_tracking=query` still gives Snakemake's own behaviour.
+- Records written by 0.2.0 hold no FDB inputs, so rules with FDB inputs rerun once after
+  upgrading; the plugin now records what Snakemake records.
+
 ### Fixed
 
 - An unreadable FDB root is reported as `FDB I/O error ... FDB root <path> is not

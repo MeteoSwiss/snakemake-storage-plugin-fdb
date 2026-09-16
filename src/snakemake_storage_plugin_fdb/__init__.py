@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +41,7 @@ from .backend import (
     Field,
     SchemaInfo,
     count_fields,
+    distinct_values,
     fallback_expand,
     fdb_time,
     is_transient,
@@ -83,6 +84,8 @@ _SPELLING_WARNED: set[str] = set()
 _REMOVE_WARNED: set[str] = set()
 _PARTIAL_WARNED: set[str] = set()
 _WARNED_LOCK = threading.Lock()
+FieldId = tuple[tuple[str, str], ...]  # one field of a query: its key=value pairs
+COVERAGE_MAX = 100_000  # fields enumerated for the input-set trigger (§8.10)
 MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
 OFFENDERS_SHOWN = 3  # messages named in a post-check error
 STAY_NOTE = "they stay in FDB until the next successful store masks them"
@@ -295,6 +298,7 @@ class StorageProvider(StorageProviderBase):
         if self.input_tracking == "lookup":  # FR-RERUN-001, before the DAG is built
             install_lookup_input_tracking(self.logger)
         self._normalised: set[str] = set()  # queries seen by postprocess_query
+        self._field_sets: dict[str, frozenset[FieldId] | None] = {}
 
         self._prepare_environment(settings)  # before anything reads the environment
 
@@ -441,6 +445,41 @@ class StorageProvider(StorageProviderBase):
         self._normalised.add(normalised)
         return normalised
 
+    def field_set(self, query: str) -> frozenset[FieldId] | None:
+        """The fields ``query`` expands to, each as its sorted key=value pairs, or
+        ``None`` if the query cannot be expanded or names more than ``COVERAGE_MAX``
+        fields (architecture.md §8.10). Cached per query text for the process: the
+        recorded queries of a job repeat across its outputs and across jobs. Snakemake
+        asks from its event loop; a concurrent miss would only expand twice.
+        """
+        if query not in self._field_sets:
+            self._field_sets[query] = self._expand_fields(query)
+        return self._field_sets[query]
+
+    def _expand_fields(self, query: str) -> frozenset[FieldId] | None:
+        # A recorded query may be one the Snakefile no longer has, so it is expanded
+        # without a storage object: no spelling warning, no normalisation record.
+        try:
+            request = parse(query, self.key_order).to_request()
+            expanded = self.backend.expand(request) or fallback_expand(request)
+        except Exception as e:
+            self.logger.debug(
+                f"FDB storage: {query} is not expanded for the input-set trigger "
+                f"({e}); it covers no fields"
+            )
+            return None
+        if count_fields(expanded) > COVERAGE_MAX:
+            self.logger.debug(
+                f"FDB storage: {query} names more than {COVERAGE_MAX} fields; it "
+                "covers no fields"
+            )
+            return None
+        keys = sorted(expanded)
+        return frozenset(
+            tuple(zip(keys, combination, strict=True))
+            for combination in itertools.product(*distinct_values(expanded, keys))
+        )
+
     def is_normalised(self, query: str) -> bool:
         """Whether ``query`` was returned by ``postprocess_query`` of this provider."""
         return query in self._normalised
@@ -461,10 +500,32 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     @property
     def tracks_input_changes(self) -> bool:
-        """Whether this query takes part in Snakemake's input-set rerun trigger
-        (FR-RERUN-002). Name and meaning of the upstream hook proposed in
-        requirements.md D-011; until it exists, ``rerun.py`` reads it (ADR-031)."""
+        """Whether the text of this query takes part in Snakemake's input-set rerun
+        trigger (FR-RERUN-002). False means the trigger asks ``covered_by`` instead.
+        Name and meaning of the upstream hook proposed in requirements.md D-011; until
+        it exists, ``rerun.py`` reads it (ADR-034)."""
         return self.provider.input_tracking == "query"
+
+    def covered_by(self, recorded: Iterable[str]) -> bool:
+        """Whether every field of this query is a field of one of the ``recorded``
+        queries (FR-RERUN-001, architecture.md §8.10).
+
+        A recorded query with the same text covers this one without any expansion.
+        Otherwise fields are compared as the key=value pairs of the expanded requests,
+        so the order of keys and values, list or range notation and non-canonical
+        spellings do not matter, while a key only one of the queries names makes their
+        fields differ. A query that cannot be expanded covers nothing, and an
+        unexpandable own query is covered by its own text only (the trigger then
+        behaves as Snakemake's own).
+        """
+        recorded = set(recorded)
+        if self.query in recorded:
+            return True
+        mine = self.provider.field_set(self.query) if recorded else None
+        if mine is None:
+            return False
+        sets = [s for query in recorded if (s := self.provider.field_set(query))]
+        return any(mine <= s for s in sets) or mine <= frozenset().union(*sets)
 
     def __post_init__(self) -> None:
         self._parsed_for: str | None = None
@@ -670,7 +731,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         schema keys the query does not name (FR-READ-008)."""
         expanded = self._expanded()
         keys = self.provider.key_order.sorted(expanded)
-        values = [list(dict.fromkeys(expanded[k])) for k in keys]
+        values = distinct_values(expanded, keys)
         varying = [i for i, v in enumerate(values) if len(v) > 1] or range(len(keys))
         present = {tuple(f.key.get(k, "") for k in keys) for f in fields}
         combos = (c for c in itertools.product(*values) if c not in present)
