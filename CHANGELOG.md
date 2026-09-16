@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `docs/patterns.md`, a usage-patterns guide with complete workflows for query shapes,
+  rule directives, writing outputs, reruns and site setup; every example in it is
+  executed by `tests/test_patterns.py`.
+
 ### Fixed
 
 - An unreadable FDB root is reported as `FDB I/O error ... FDB root <path> is not

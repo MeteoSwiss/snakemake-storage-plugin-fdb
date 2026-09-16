@@ -1,7 +1,9 @@
 # User guide
 
 How to use the Snakemake storage plugin for ECMWF's Fields DataBase (FDB) in workflows.
-Exact settings, messages and method behaviour are in the [reference](reference.md).
+Exact settings, messages and method behaviour are in the [reference](reference.md);
+complete, runnable workflows for the usual cases are in the
+[usage patterns](patterns.md).
 
 - [Concepts](#concepts)
 - [Installation](#installation)
@@ -220,6 +222,11 @@ rule t2m:
     shell:
         "cp {input} {output}"
 ```
+
+Run it with a target (`snakemake ... t2m/20200101.grib`) or list the targets in a
+`rule all` at the top of the Snakefile. Snakemake builds the first rule when no target
+is given: a first rule with wildcards fails with `Target rules may not contain
+wildcards`, and a first rule that is not the collecting rule builds only itself.
 
 - The input exists only when **all** fields of the query are in FDB (3 here). If some
   are missing, Snakemake treats the input as missing and reports the whole query as a
@@ -467,7 +474,8 @@ Most of Snakemake works unchanged with FDB objects; these are the exceptions.
 - **FDB queries cannot be command-line targets**, because Snakemake sends targets
   through path normalisation and `fdb://...` becomes `fdb:/...`
   (`MissingRuleException: No rule to produce fdb:/class=...`). Drive such a workflow by
-  rule name, or let the last rule write a small local sentinel file. For the same reason
+  rule name, let the last rule write a small local sentinel file, or list the queries as
+  inputs of a first `rule all`, which works. For the same reason
   `--cleanup-metadata "fdb://..."` reports that the metadata was not present, and an FDB
   output's metadata cannot be cleaned up.
 - **`ensure(non_empty=True)` on an FDB output always fails** with `Detected unexpected

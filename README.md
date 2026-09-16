@@ -102,6 +102,8 @@ globbing and site setups.
 
 - [User guide](docs/user-guide.md): configuration, queries, reading, writing, globbing,
   troubleshooting
+- [Usage patterns](docs/patterns.md): runnable workflows for query shapes, rule
+  directives, writing outputs, reruns and site setup
 - [Reference](docs/reference.md): settings, query grammar, local paths, methods, errors,
   environment variables
 - [MeteoSwiss site guide](docs/sites/meteoswiss.md)

@@ -28,8 +28,31 @@ uv run coverage run -m pytest -q -rs && uv run coverage report --include='src/*'
 
 Tests that need the ECMWF samples in `tests/data/grib/ecmwf/` skip without them. Test
 FDBs are created in pytest's temporary directories. The end-to-end tests
-(`tests/test_workflow.py`) run `snakemake` in subprocesses with a clean environment and
-write each stage's output to a log file under pytest's temporary directory.
+(`tests/test_workflow.py`, `tests/test_rerun.py`, `tests/test_patterns.py`) run
+`snakemake` in subprocesses with a clean environment and write each stage's output to a
+log file under pytest's temporary directory.
+
+### The examples in `docs/patterns.md`
+
+Every workflow in [`patterns.md`](patterns.md) is executed by `tests/test_patterns.py`
+against a development FDB, so an example that stops working fails the suite. A block is
+executed when an HTML comment on the line before its fence names a pattern:
+
+```markdown
+<!-- pattern: one-field; rerun: nothing; expect: Storing in storage -->
+```
+
+The directives after the name are optional and separated by `;`: `file: <path>` makes
+the block an auxiliary file of that pattern (a script, a `config.yaml`) instead of its
+Snakefile, `rerun: nothing` requires a second run to report "Nothing to be done",
+`expect: <substring>` (repeatable) requires the substring in the run's log, `cores: N`
+runs with `-cN`, and `args:` / `env: NAME=VALUE` add command-line arguments and
+environment variables, with `{config}` and `{config2}` standing for the FDB
+configurations the test creates. Blocks without such a comment (profiles, shell
+commands, fragments) are not executed. A new pattern needs an `expver` of its own if it
+writes, and fields that the test FDB holds (listed at the top of `patterns.md`). Tag
+`rerun: nothing` only where the text claims that a second run has nothing to do; each
+tag costs one more `snakemake` run.
 
 ### Site suite
 
