@@ -363,7 +363,7 @@ class StorageProvider(StorageProviderBase):
         return [
             ExampleQuery(
                 query="fdb://class=od,expver=0001,stream=oper,date={date},time=0000,"
-                "type=fc,levtype=sfc,step=0/6/12,param=167",
+                "domain=g,type=fc,levtype=sfc,step=0/6/12,param=167",
                 description="2 m temperature at steps 0, 6 and 12 of the 00 UTC "
                 "forecast of each date (one local file with 3 fields).",
                 type=QueryType.ANY,
@@ -376,7 +376,7 @@ class StorageProvider(StorageProviderBase):
             ),
             ExampleQuery(
                 query="fdb://class=od,expver=0001,stream=oper,date={date},time={time},"
-                "type=fc,levtype=sfc,step=0/to/48/by/6,param=167/165/166",
+                "domain=g,type=fc,levtype=sfc,step=0/to/48/by/6,param=167/165/166",
                 description="A to/by step range for three parameters (27 fields).",
                 type=QueryType.INPUT,
             ),

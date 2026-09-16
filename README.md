@@ -10,7 +10,7 @@ retrieves the fields into a local GRIB file for the job, and archives the GRIB f
 that jobs produce.
 
 ```text
-fdb://class=od,expver=0001,stream=oper,date={date},time=0000,type=fc,levtype=sfc,step=0/6/12,param=167
+fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,levtype=sfc,step=0/6/12,param=167
 ```
 
 **Status:** unreleased, pre-1.0 (version 0.1.0). Interfaces and defaults may still change.

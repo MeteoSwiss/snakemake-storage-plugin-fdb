@@ -33,7 +33,9 @@ What to expect:
 - a second run reports "Nothing to be done";
 - `snakemake --delete-all-output ...` deletes `done/` but only warns for the FDB
   output: FDB cannot delete individual fields; a later run masks them with new ones
-  (`fdb purge` reclaims the space).
+  (`fdb purge` reclaims the space). The next run therefore rebuilds `done/` only:
+  `shift_expver` is skipped because its FDB output still exists. Use `--forceall` to
+  re-archive it.
 
 The rules use `run:`, so Snakemake runs them in spawned job processes. Pass the FDB
 untagged, as above: tagged settings (`TAG::VALUE`) do not reach spawned jobs in

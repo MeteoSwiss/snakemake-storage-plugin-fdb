@@ -12,6 +12,7 @@ Exact settings, messages and method behaviour are in the [reference](reference.m
 - [Globbing](#globbing)
 - [Canonical spelling](#canonical-spelling)
 - [Removing outputs](#removing-outputs)
+- [Snakemake flags and features](#snakemake-flags-and-features)
 - [Site definitions and MARS language](#site-definitions-and-mars-language)
 - [A local development FDB](#a-local-development-fdb)
 - [Troubleshooting](#troubleshooting)
@@ -53,8 +54,10 @@ spaces:
 
 Without `config`, FDB's own environment applies (`FDB_CONFIG`, `FDB_CONFIG_FILE`,
 `FDB_HOME`). The plugin reads the schema named by the configuration to order query keys
-(see [Writing queries](#writing-queries)). A relative path resolves against the
-directory Snakemake runs in.
+(see [Writing queries](#writing-queries)). A relative path resolves against
+Snakemake's working directory, which is the directory the command was typed in unless
+`-d`/`--directory` moves it elsewhere; with `-d` the path must be relative to that
+directory, not to the shell's. An absolute path always works.
 
 ### Where settings go
 
@@ -81,6 +84,10 @@ storage:
 
 The Snakefile then refers to the provider as `storage.fdb("fdb://...")`, or
 `storage("fdb://...")` without naming it.
+
+Snakemake also applies a `profiles/default/` directory next to the Snakefile without
+being asked (its workflow profile), so a stray `profiles/default/config.yaml` can
+supply the FDB settings of a run that seems to have none.
 
 ### Several FDBs: tagged providers
 
@@ -127,7 +134,7 @@ is fixed:
 ## Writing queries
 
 ```text
-fdb://class=od,expver=0001,stream=oper,date={date},time=0000,type=fc,levtype=sfc,step=0/6/12,param=167
+fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,levtype=sfc,step=0/6/12,param=167
 ```
 
 - Keys are MARS keys; values are MARS values. Lists use `/` (`param=167/165`), ranges
@@ -151,8 +158,38 @@ Values are never changed. Normalised queries appear in Snakemake's log and in lo
 paths:
 
 ```text
-.snakemake/storage/fdb/class=od/expver=0001/stream=oper/date=20240101/time=0000/type=fc/levtype=sfc/step=0+6+12/param=167.grib
+.snakemake/storage/fdb/class=od/expver=0001/stream=oper/date=20240101/time=0000/domain=g/type=fc/levtype=sfc/step=0+6+12/param=167.grib
 ```
+
+### Several fields in one rule
+
+A query with `/` lists gives one local file. To give a rule one file per value instead,
+expand the query text and wrap the results, not the other way round:
+
+```snakemake
+QUERY = (
+    "fdb://class=ea,expver=0001,stream=oper,date={date},time=0000,domain=g,"
+    "type=an,levtype=sfc,step={step},param={param}"
+)
+
+
+rule merge:
+    input:
+        storage.fdb(expand(QUERY, step=[0, 6, 12], param=[167, 165], allow_missing=True)),
+    output:
+        "merged/{date}.grib",
+    shell:
+        "cat {input} > {output}"
+```
+
+`allow_missing=True` keeps `{date}` for Snakemake to fill in per job; a list
+comprehension over formatted query strings works as well.
+
+`expand(storage.fdb(QUERY), ...)` does **not** work: Snakemake requires flags outside
+`expand`, and the error names the internal local path
+(`Flags ({'storage_object': ...}) in file pattern '.snakemake/storage/fdb/.../param={param}.grib' given to expand() are invalid`)
+instead of the query. `multiext(storage.fdb(QUERY), ...)` drops the storage flag
+silently; the job then asks for local files nobody produces.
 
 ## Reading inputs
 
@@ -173,7 +210,10 @@ rule t2m:
   missing, Snakemake treats the input as missing; retrieving it fails with a message
   such as `...: 2 of 3 fields found in FDB; missing: step=12`. If nothing matches, the
   message lists optional schema keys the query does not name.
-- The local file holds the messages in request order (e.g. step 0, 6, 12).
+- The local file holds the messages in request order, never sorted: each key's values in
+  the order the query lists them, keys nested in canonical key order with the last key
+  varying fastest. `step=12/0/6,param=165/167` gives `12/165, 12/167, 0/165, 0/167,
+  6/165, 6/167`.
 - The input's modification time is the time FDB last flushed the index holding the
   fields (one-second resolution), so rules rerun when inputs are re-archived.
 - An invalid request (unknown key or value, `number` with `type=cf`) is an error, not a
@@ -220,6 +260,27 @@ Everything that fails here says "nothing was archived". After archiving, the plu
 checks that FDB now returns every message for the query. If not, some messages carry
 keys outside the query; they stay in FDB until a later successful store masks them, and
 the error says so.
+
+Editing an output query leaves the fields the rule archived under the old query in FDB:
+nothing masks them (their keys differ), `fdb purge` does not reclaim them and nothing in
+the run mentions them, so every edit of an output query leaks a full copy of the data.
+Prefer a wildcard or a config value over rewriting the query of a rule that has already
+run.
+
+Two rules whose output queries overlap (`step=0/6/12` and `step=0` of the same
+experiment) are accepted without a word: Snakemake compares query strings, FDB identity
+is per field, so the DAG has no edge between them and the jobs mask parts of each
+other's output. Keep to **one field, one rule**; per-step and whole-forecast rules over
+the same fields are the usual accident.
+
+When a job has several FDB outputs and a later one fails its checks, the earlier ones
+are already archived and stay in FDB, even though Snakemake reports the outputs as
+removed. A retry re-archives them, masking the first copy.
+
+Archiving reads the whole output file into memory and keeps it several times over: a
+205 MB file with 20000 messages peaked at about 900 MB resident, roughly four times the
+file. Give archiving jobs a `resources: mem_mb` to match (retrieval, by contrast,
+streams).
 
 ### Archive modes
 
@@ -282,20 +343,63 @@ Query fdb://...,param=2t uses non-canonical spelling: param=2t (canonical: 167).
 Set `canonical_spelling=error` to make it an error, or `ignore` to silence it. Values with
 `to`/`by` ranges and wildcards are not checked.
 
+Spelling is not the only way two queries can name one field set, and the check covers
+values only. The order of a value list (`step=12/6/0` vs `0/6/12`), a repeated value,
+`step=0/to/12/by/6` versus `step=0/6/12`, and MARS **key** aliases (`levtyp=` for
+`levtype=`, `parameter=` for `param=`) each give a second storage object with its own
+local path, its own retrieval and no warning; aliased keys are unknown to the schema and
+sort to the end of the key order. Relative dates such as `date=-1` work — metkit expands
+them at run time, and the spelling warning names the date they expanded to — but the
+local path keeps the text `-1`, so a local copy kept with
+`--keep-storage-local-copies` is silently stale the next day. Write queries the way FDB
+lists them back, and write them the same way everywhere.
+
 ## Removing outputs
 
-FDB cannot delete individual fields, so the plugin never deletes anything. When Snakemake
-removes an FDB output (before rerunning a job, after a failed job, with
-`--delete-all-output`, for `temp()` outputs), `remove_policy=warn` (default) logs once
-per query:
+FDB cannot delete individual fields, so the plugin never deletes anything. In Snakemake
+9.27, `--delete-all-output` is the only thing that asks the plugin to remove an FDB
+output; `remove_policy=warn` (default) then logs once per query:
 
 ```text
 FDB cannot delete individual fields; existing fields for <query> will be masked by the next archive. Use `fdb purge` to reclaim space.
 ```
 
 `remove_policy=ignore` stays silent; `remove_policy=error` makes removal an error.
-`--delete-all-output` therefore deletes local outputs but leaves FDB fields in place.
-`--touch` is not supported for FDB outputs.
+
+Neither rerunning a job nor a failed job removes anything: no `remove()` call, no
+warning, and Snakemake's own `Removing output files of failed job ... (in storage)` line
+removes nothing from FDB. `temp()` outputs cannot occur — `temp(storage.fdb(...))` is a
+`SyntaxError` ("Storage and temporary flags are mutually exclusive"), as are
+`protected()` and `directory()`, and `pipe()` gives "Pipes may not be in storage".
+
+`--delete-all-output` therefore deletes local outputs and leaves the FDB fields in
+place, and because the FDB output still exists the producing job is **not** rerun
+afterwards. Use `--forceall`/`--forcerun` for a rebuild; the new fields mask the old
+ones.
+
+## Snakemake flags and features
+
+Most of Snakemake works unchanged with FDB objects; these are the exceptions.
+
+- **`--touch`** is refused for the *whole* workflow if a single output is an FDB query:
+  `Touching output files is impossible. The workflow uses remote storage but the storage
+  plugin does not support the touch operation.` Local outputs of that workflow cannot be
+  touched either.
+- **FDB queries cannot be command-line targets**, because Snakemake sends targets
+  through path normalisation and `fdb://...` becomes `fdb:/...`
+  (`MissingRuleException: No rule to produce fdb:/class=...`). Drive such a workflow by
+  rule name, or let the last rule write a small local sentinel file. For the same reason
+  `--cleanup-metadata "fdb://..."` reports that the metadata was not present, and an FDB
+  output's metadata cannot be cleaned up.
+- **`ensure(non_empty=True)` on an FDB output always fails** with `Detected unexpected
+  empty output files`: Snakemake asks the storage object for its size, which is 0 before
+  the store, instead of measuring the local file the rule just wrote.
+- **`--not-retrieve-storage`** hands the job the local path of the input without
+  retrieving it, so the job fails on a file that does not exist.
+- `touch()`, `ancient()` and `report()` work on FDB objects; `temp()`, `protected()`,
+  `directory()` and `pipe()` are rejected (see
+  [Removing outputs](#removing-outputs)), and `multiext()` silently drops the storage
+  flag (see [Several fields in one rule](#several-fields-in-one-rule)).
 
 ## Site definitions and MARS language
 
@@ -309,7 +413,12 @@ Sites with their own GRIB conventions set up the plugin with generic settings:
 - `env`: other environment variables, `NAME=VALUE[,NAME=VALUE]`.
 
 Exporting `ECCODES_DEFINITION_PATH` and `METKIT_HOME` in the shell or profile works just
-as well; the plugin then needs no site settings.
+as well; the plugin then needs no site settings. Reading fields needs the MARS language
+but not the definitions; archiving and decoding GRIB keys need both. Every process that
+touches FDB sets this up for itself, so with a `conda:` or `container:` directive the
+environment or image must contain `pyfdb`, `eccodes` and the site definitions, and with
+a cluster or remote executor every node must see the definitions, the metkit home and
+the FDB configuration at the configured paths.
 
 Two caveats:
 
@@ -346,7 +455,7 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 | `Invalid MARS request ...: Key [number] not acceptable with context ...` | The key is not valid with the other values (e.g. `number` with `type=cf`). Remove it. |
 | `...: 0 of N fields found in FDB ... optional schema keys not in the query: ...` | The fields carry keys the query does not name. Add them (`domain=g`, `number=...`, `timespan=fs`). |
 | `...: n of N fields found in FDB; missing: ...` | Some fields are not archived; the message names them. |
-| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping` | Wrong path (relative to the working directory). If the value looks like `tag:path`, see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
+| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping` | Wrong path. Relative paths resolve against Snakemake's working directory (`-d`), not the directory the command was typed in. If the value looks like `tag:path`, see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
 | `FDB configuration error: Cannot open ...` / `No writable roots available ...` | The schema file or database root in the FDB configuration does not exist. |
 | `GRIB keys do not match the FDB schema for ...: Keywords not used: {number}` | The GRIB carries a key the schema does not accept. Use a schema with that key (e.g. `number?`), or `archive_mode=identifier`. |
 | `...: cannot determine <key> for message 1 ...` | Identifier mode with a multi-rule schema. Use `archive_mode=native` or add the key to the query. |
@@ -359,12 +468,17 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 | `WARNING: definitions.edzw version ... is NOT compatible ...` | Harmless; set `ECCODES_VERSION_CHECK_OFF=1`. |
 | A log file is truncated or full of NUL bytes | A job decoded GRIB with the COSMO definitions while its stderr went to that file; use a per-job log. |
 | Site definitions seem to be ignored | `eccodes` was imported before the provider was set up; export `ECCODES_DEFINITION_PATH` before starting Snakemake. |
-| `--delete-all-output` leaves data in FDB | By design (see [Removing outputs](#removing-outputs)). |
-| `--touch` fails for FDB outputs | Not supported. |
+| `--delete-all-output` leaves data in FDB | By design, and the producing job is not rerun afterwards (see [Removing outputs](#removing-outputs)). Use `--forceall`. |
+| `Touching output files is impossible ...` | `--touch` is not supported and the check covers the whole workflow (see [Snakemake flags and features](#snakemake-flags-and-features)). |
+| `MissingRuleException: No rule to produce fdb:/...` | An FDB query was used as a command-line target; Snakemake normalised it. Target the rule by name or a local file. |
+| `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
+| `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
+| "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
 
 ## Limitations
 
-- Not usable as `--default-storage-provider`; files only; no `--touch`.
+- Not usable as `--default-storage-provider`; files only; no `--touch` (refused for the
+  whole workflow); FDB queries cannot be command-line targets.
 - No deletion; reruns mask old fields.
 - Modification times have one-second resolution.
 - Remote FDB backends are untested.

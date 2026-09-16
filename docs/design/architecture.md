@@ -305,10 +305,12 @@ sequenceDiagram
 
 ### 6.6 Remove
 
-Snakemake calls `managed_remove()` before a job runs on every output that exists in
-storage, on job-failure cleanup, for `--delete-all-output` and for temporary outputs
-(§13.8). `remove()` applies `remove_policy` and never deletes (FR-REMOVE-001). A rerun
-archives new fields that mask the old ones.
+Snakemake's code path calls `managed_remove()` before a job runs on every output that
+exists in storage, on job-failure cleanup, for `--delete-all-output` and for temporary
+outputs (§13.8); of these only `--delete-all-output` is observed to reach an FDB output
+in 9.27, and temporary storage outputs cannot be written at all. `remove()` applies
+`remove_policy` and never deletes (FR-REMOVE-001). A rerun archives new fields that mask
+the old ones.
 
 ## 7. Deployment view
 
@@ -559,7 +561,8 @@ design round, provided requirements, architecture and code are updated together.
   (§13.6).
 - Decision: `remove_policy` `warn` (default), `ignore` or `error`; never delete.
 - Status: accepted.
-- Consequences: `--delete-all-output` and temporary outputs leave fields; reruns mask;
+- Consequences: `--delete-all-output` leaves fields (and does not make the producer
+  rerun); reruns mask;
   `fdb purge` is manual. A future `wipe` policy only with proof of full index coverage
   (requirements.md D-006).
 
@@ -1019,7 +1022,11 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   including input-function results (`rules.py:855-880`).
 - `managed_remove()` runs before a job on every output that exists in storage
   (`jobs.py:756-771`), on failure cleanup, for `--delete-all-output` and for temporary
-  outputs; it does not delete the local copy (`io/__init__.py:1251-1254`).
+  outputs; it does not delete the local copy (`io/__init__.py:1251-1254`). Only
+  `--delete-all-output` was observed to reach an FDB output in 9.27; a storage object
+  cannot carry `temp()`, `protected()`, `directory()` or `pipe()` (they are rejected at
+  parse time), and the "Removing output files of failed job" line is printed without
+  calling the plugin.
 - After `store_object` Snakemake calls `mtime().storage()` to touch the local file and
   then `exists_in_storage()` (`dag.py:995-1028`); local copies are removed at the end
   unless `--keep-storage-local-copies`.
@@ -1038,8 +1045,21 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
 - `glob_wildcards` matches `re.match(query_pattern, candidate)` against
   `list_candidate_matches()` (`io/__init__.py:1767-1810`); without `StorageObjectGlob`
   it raises `AttributeError`. The wildcard regex escapes `+`, `=`, `.` in constant parts.
+- `expand()` rejects patterns carrying flags, so `expand(storage(...))` fails with a
+  message naming the local path; the storage flag must be applied to the expanded
+  queries. `multiext()` drops the flag without a message.
+- Output conflicts are detected on the local path (the query text): two rules whose FDB
+  queries name overlapping but unequal field sets get no DAG edge and no ambiguity
+  error, and mask parts of each other's output.
 - `--touch` fails upfront if an output's plugin lacks `StorageObjectTouch`
-  (`dag.py:776-787`, called from `workflow.py:1364`).
+  (`dag.py:776-787`, called from `workflow.py:1364`); the check aborts the whole
+  workflow, so its local outputs cannot be touched either (L-25).
+- Command-line targets and `--cleanup-metadata` arguments go through path normalisation,
+  which turns `fdb://…` into `fdb:/…`, so storage URIs cannot be named there (L-25,
+  D-014).
+- `ensure(non_empty=True)` on a storage output consults the storage object's `size()`
+  (0 before the store) rather than the local file (`dag.py:659`), so it always fails
+  (L-26, D-014).
 - Local prefix: untagged `.snakemake/storage/fdb`, tagged `.snakemake/storage/<tag>`
   (`storage.py:81-83`). For a tagged provider Snakemake also registers an untagged
   instance with the same settings when none exists (`storage.py:112-126`), so

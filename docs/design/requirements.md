@@ -736,7 +736,10 @@ text>`.
 
 - Rationale: FDB has no per-field deletion and `wipe` can delete unrelated fields or the
   whole database (architecture.md §13.6, ADR-008). Consequence: `--delete-all-output`
-  and temporary outputs leave fields in FDB.
+  leaves the fields in FDB and, because the output still exists, does not make the
+  producing job rerun. In Snakemake 9.27 it is the only trigger that reaches `remove()`:
+  reruns and failed-job cleanup do not call it, and temporary outputs cannot exist
+  (`temp()` and storage flags are mutually exclusive).
 - Verification: test `tests/test_plugin.py::test_remove_policy`,
   `tests/sites/meteoswiss/test_write.py::test_write_remove_policy_warn`,
   `tests/test_workflow.py::test_workflow_delete_all_output_leaves_fields`.
@@ -989,6 +992,9 @@ storage object. No database- or index-level listing is used for existence checks
 #### NFR-PERF-003 Streaming retrieval
 
 Retrieval streams in 8 MiB chunks; memory use does not grow with the retrieved size.
+The store path has no such guarantee: it reads the output file whole and holds it
+several times over (measured about four times the file, 205 MB → ~900 MB resident), so
+archiving jobs need a `resources: mem_mb` to match.
 
 - Rationale: multi-GB inputs. Fresh read handles, needed for FR-READ-010, cost about as
   much as reused ones (architecture.md §13.5).
@@ -1132,7 +1138,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 
 | ID | limitation |
 |---|---|
-| L-1 | The same field spelled differently gives different local paths (warning by default, FR-SPELL-001). |
+| L-1 | The same field spelled differently gives different local paths (warning by default, FR-SPELL-001). The check covers values only: the order of a value list, a repeated value and `to`/`by` versus a list spelling are part of a storage object's identity and give a second local path without a warning. |
 | L-2 | No deletion; reruns mask; `fdb purge` is manual. |
 | L-3 | Modification times have one-second resolution and reflect index flushes, not data content. In the post-check a field of the query archived earlier within the same second as `t_start` counts as fresh. |
 | L-4 | `E` is a cross product; context-dependent keys may over-count. |
@@ -1152,6 +1158,10 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-18 | Identifier mode cannot relabel GRIB that contradicts a single-valued query key; fix the GRIB first (e.g. `grib_set`). |
 | L-19 | Tagged settings (`TAG::VALUE`) do not reach spawned job processes (upstream Snakemake issue, architecture.md §11): `run:` rules under the local executor and every job under cluster or remote executors see the untagged value `TAG:VALUE`. Use untagged settings for such workflows, or `shell` rules with the local executor. |
 | L-20 | eccodes-cosmo-resources prints a definitions version warning per decoded message unless `ECCODES_VERSION_CHECK_OFF=1`, and decoding with the COSMO definitions truncates a stderr redirected to a shared file. |
+| L-25 | Snakemake refuses `--touch` for the whole workflow, not only for FDB outputs, as soon as one output is an FDB query; FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
+| L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
+| L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
+| L-28 | Relative dates (`date=-1`) expand at run time, but the local path keeps the text, so a copy kept with `--keep-storage-local-copies` goes stale. |
 
 ---
 
@@ -1187,3 +1197,4 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
 | D-009 | qubed | Not useful for v1; revisit for compressed summaries of large FDB listings (architecture.md §13.12). |
 | D-010 | Withdrawn | Snakemake plugin catalogue pages will not be included (decided 2026-09-15); see §6.1. |
+| D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |

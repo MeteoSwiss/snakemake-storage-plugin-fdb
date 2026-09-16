@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The generic example queries and the queries in the README and the documentation name
+  `domain=g`, the key ECMWF `class=od`/`class=ea` fields are archived under.
+
+### Fixed
+
+- Documentation: removal happens only with `--delete-all-output` (and does not make the
+  producing job rerun); `temp()` and the other Snakemake flags cannot be combined with
+  storage; `--touch`, command-line targets, `--cleanup-metadata`, `ensure(non_empty)`,
+  `expand()` and `multiext()` with FDB objects; relative configuration paths resolve
+  against Snakemake's working directory and a `profiles/default/` is applied implicitly;
+  message order in a retrieved file; query identity beyond spelling (value order,
+  duplicates, `to`/`by`, key aliases, relative dates); orphaned and overlapping output
+  queries; the memory an archive needs; reads do not need `eccodes_definitions`; the
+  unreachable `key order setting is empty` error was removed from the reference.
+
 ## [0.1.0] - 2026-09-16
 
 First release.

@@ -25,7 +25,7 @@ default. Settings are validated when the provider is constructed.
 | `glob_required_keys` | `--storage-fdb-glob-required-keys` | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
 | `eccodes_definitions` | `--storage-fdb-eccodes-definitions` | unset | colon list of existing directories (made absolute; empty entries skipped; `/MEMFS/...` entries passed as is) | Prepended in order to `ECCODES_DEFINITION_PATH`. |
 | `metkit_home` | `--storage-fdb-metkit-home` | unset | directory containing `share/metkit/language.yaml` (made absolute) | Exported as `METKIT_HOME` for a custom MARS language. |
-| `key_order` | `--storage-fdb-key-order` | unset: the FDB schema's rule order, else the generic MARS order | comma list of distinct key names | Canonical key order of queries and local paths. |
+| `key_order` | `--storage-fdb-key-order` | unset: the FDB schema's rule order, else the generic MARS order | comma list of distinct key names (an empty value is ignored, like unset) | Canonical key order of queries and local paths. |
 | `env` | `--storage-fdb-env` | unset | `NAME=VALUE[,NAME=VALUE]`; names `[A-Za-z_][A-Za-z0-9_]*`; values may contain `=`, not `,`; no duplicate names | Environment overrides exported before the FDB libraries load (e.g. `FDB_HOME=/path`). |
 | `max_requests_per_second` | `--storage-fdb-max-requests-per-second` | unset | float | Inherited from the interface; unused, the rate limiter is disabled. |
 
@@ -73,9 +73,9 @@ ws         = whitespace*
 Examples:
 
 ```text
-fdb://class=od,expver=0001,stream=oper,date={date},time=0000,type=fc,levtype=sfc,step=0/6/12,param=167
+fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,levtype=sfc,step=0/6/12,param=167
 fdb://class=ea,expver=0001,stream=enda,date=20200101,time=0000,domain=g,type=an,levtype=sfc,step=0,number=0,param=167
-fdb://class=od,expver=0001,stream=oper,date={date},time={time},type=fc,levtype=sfc,step=0/to/48/by/6,param=167/165/166
+fdb://class=od,expver=0001,stream=oper,date={date},time={time},domain=g,type=fc,levtype=sfc,step=0/to/48/by/6,param=167/165/166
 fdb://class=od, expver=0001, stream=oper, date={date,\d{8}}, time=0000, type=fc, levtype=sfc, step=0, param=167
 ```
 
@@ -128,8 +128,8 @@ is one `key=value` directory per pair in canonical key order, `/` in values repl
 `+` outside wildcards, and `.grib` appended to the last component:
 
 ```text
-fdb://class=od,expver=0001,stream=oper,date={date},time=0000,type=fc,levtype=sfc,step=0/6/12,param=167
-class=od/expver=0001/stream=oper/date={date}/time=0000/type=fc/levtype=sfc/step=0+6+12/param=167.grib
+fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,levtype=sfc,step=0/6/12,param=167
+class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=sfc/step=0+6+12/param=167.grib
 ```
 
 - Wildcard text, including constraints, is copied verbatim, so the mapping commutes with
@@ -157,7 +157,7 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/type=fc/levtype=sfc/step=
 | `get_inventory_parent` | `None`. |
 | `retrieve_object` | Requires `exists`; streams `retrieve` into `<local>.part` in 8 MiB chunks, fsyncs, checks the byte count, renames over the local path; removes the part file on any error. |
 | `store_object` | Expands the query, splits the local file into GRIB messages, checks the count against `E` (`store_check`), builds identifiers and pre-checks them (`identifier` mode) or uses each message's `mars` keys (`native`), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store. Never retried. |
-| `remove` | Never deletes; applies `remove_policy`. |
+| `remove` | Never deletes; applies `remove_policy`. Snakemake 9.27 calls it only for `--delete-all-output`: not before a rerun, not on failed-job cleanup (its "Removing output files of failed job" line removes nothing from FDB), and never for `temp()`, which cannot be combined with storage. |
 | `list_candidate_matches` | Checks `glob_required_keys`; one `list` of the pattern's constant pairs; returns the sorted unique pattern texts with wildcard-bearing values replaced by listed values, skipping fields that lack them. |
 | `cleanup` | No-op. |
 | `rate_limiter_key`, `default_max_requests_per_second`, `use_rate_limiter` | `"fdb"`, `10.0`, `False`. |
@@ -182,7 +182,7 @@ pyfdb error without `UserError: `/`Serious bug: ` prefixes.
 | `invalid <setting> '<value>' (allowed: <values>)` | unknown value of a choice setting |
 | `identifier_check=strict is reserved and not implemented in this version` | `identifier_check=strict` |
 | `invalid key name(s) in glob_required_keys: <keys>` | invalid key names |
-| `invalid key_order: <reason>` | `key order setting is empty`, `empty key name in key order '<csv>'`, `invalid key name in key order: '<key>'`, `duplicate key in key order: '<key>'` |
+| `invalid key_order: <reason>` | `empty key name in key order '<csv>'`, `invalid key name in key order: '<key>'`, `duplicate key in key order: '<key>'` |
 | `invalid env setting '<value>': expected NAME=VALUE[,NAME=VALUE], got '<item>'` | missing `=` or invalid name |
 | `invalid env setting '<value>': duplicate <NAME>` | name given twice |
 | `eccodes_definitions: '<entry>' is not an existing directory` | bad definitions entry |

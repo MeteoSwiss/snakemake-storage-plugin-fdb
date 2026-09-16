@@ -15,6 +15,10 @@ ICON GRIB2 from MeteoSwiss (centre `lssw`) needs two definition sets, cosmo-mars
   (the wheel declares BSD-3-Clause; the `COSMO-ORG/eccodes-cosmo-resources` repository
   declares no license; nothing from either is copied into this repository).
 
+Only archiving and GRIB key decoding need the definitions; reading MeteoSwiss fields out
+of FDB works without `eccodes_definitions` (the MARS language below is needed either
+way).
+
 `examples/meteoswiss/setup.sh` does both into `.local/` and prints the value for the
 `eccodes_definitions` setting (or for `ECCODES_DEFINITION_PATH`):
 
@@ -62,9 +66,14 @@ storage-fdb-metkit-home: ["mch::<metkit home>"]
 storage-fdb-env: ["mch::ECCODES_VERSION_CHECK_OFF=1"]
 ```
 
-Tagged settings do not reach spawned job processes in Snakemake 9.27 (`run:` rules,
-cluster jobs); use `shell` rules with the local executor or untagged settings (see
+Tagged settings do not reach spawned job processes in Snakemake 9.27; use `shell` rules
+with the local executor or untagged settings (see
 [Tagged settings and spawned jobs](../user-guide.md#tagged-settings-and-spawned-jobs)).
+Under a cluster or remote executor *every* job is spawned, `shell` rules included, so a
+profile for such a run must pass the settings untagged, and every node needs the
+definitions, the metkit home and the FDB configuration at the same paths. A `conda:` or
+`container:` environment must itself contain `pyfdb`, `eccodes` and the site
+definitions, or the job cannot import the bindings or decodes GRIB differently.
 
 The example README has the dev-FDB command (`scripts/init_dev_fdb.py --root .fdb-mch
 ...` with the site environment) and the run instructions.
