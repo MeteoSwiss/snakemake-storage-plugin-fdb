@@ -669,12 +669,16 @@ TEMPLATE_QUERY = (
 )
 
 
-def _grib(steps=(0, 6, 12), params=(167,), zero_values=True) -> bytes:
+def _message(zero_values=True, **keys) -> bytes:
+    """One ``expver=0002`` variant of template.grib; ``keys`` override the defaults."""
     template = (SAMPLES / "template.grib").read_bytes()
+    keys = {"stream": "oper", "expver": "0002", "step": 0, "paramId": 167, **keys}
+    return variant(template, zero_values, **keys)
+
+
+def _grib(steps=(0, 6, 12), params=(167,), zero_values=True) -> bytes:
     return b"".join(
-        variant(template, zero_values, stream="oper", expver="0002", step=s, paramId=p)
-        for s in steps
-        for p in params
+        _message(zero_values, step=s, paramId=p) for s in steps for p in params
     )
 
 
@@ -743,47 +747,104 @@ def test_store_template(make_provider, schema, archive_mode, error):
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
 @pytest.mark.parametrize(
     "case",
-    ["missing", "foreign", "duplicate", "trailing-garbage", "text"],
+    ["missing", "extra", "foreign", "duplicate", "trailing-garbage", "text"],
 )
 def test_store_strict_rejects(make_provider, archive_mode, case):
     provider = make_provider(archive_mode=archive_mode)
-    native_foreign = case == "foreign" and archive_mode == "native"
     data, error = {
         "missing": (_grib((0, 6)), "has 2 fields, the query expands to 3; nothing"),
+        "extra": (_grib((0, 6, 12, 18)), "has 4 fields, the query expands to 3"),
         "foreign": (
             _grib((0, 6, 18)),
-            "1 landed outside the query or are duplicates"
-            if native_foreign
-            else "message 3 of .* has step=18, not one of 0/6/12; nothing",
+            "message 3 of .* has step=18, not one of 0/6/12; nothing",
         ),
         "duplicate": (_grib((0, 6, 6)), r"duplicate fields \(messages 2 and 3\)"),
         "trailing-garbage": (_grib() + b"GARBAGE", "trailing non-GRIB bytes"),
         "text": (b"test", "is not GRIB"),
     }[case]
-    with pytest.raises(WorkflowError, match=error) as e:
+    with pytest.raises(WorkflowError, match=error):
         _store(provider, STORE_QUERY, data)
-    if native_foreign:  # archived before the post-check; the message says so
-        assert "stay in FDB" in str(e.value)
-        assert _in_fdb(provider, STORE_QUERY) == 2
-    else:
-        assert _in_fdb(provider, STORE_QUERY) == 0
+    assert _in_fdb(provider, STORE_QUERY) == 0  # nothing was archived (FR-STORE-003)
 
 
 @needs_samples
 @pytest.mark.parametrize("archive_mode", ["identifier", "native"])
-def test_store_warn_fewer_fields(make_provider, caplog, archive_mode):
-    provider = make_provider(archive_mode=archive_mode, store_check="warn")
-    obj = _store(provider, STORE_QUERY, _grib((0, 6)))
-    warnings = _warnings(caplog)
-    assert len(warnings) == 1
-    assert "has 2 fields, the query expands to 3 (store_check=warn)" in warnings[0]
+@pytest.mark.parametrize(
+    "wrong, error",
+    [
+        ({"expver": "0001"}, "has expver=0001, but the query has expver=0002"),
+        ({"step": 18}, "has step=18, not one of 0/6/12"),
+        ({"paramId": 165}, "has param=165, but the query has param=167"),
+    ],
+    ids=["expver", "step", "param"],
+)
+def test_store_precheck_rejects_wrong_key(make_provider, archive_mode, wrong, error):
+    """A message contradicting the query is rejected in both modes, before archiving:
+    natively it would be archived under its own keys (FR-STORE-003, FR-STORE-005)."""
+    provider = make_provider(archive_mode=archive_mode)
+    data = _grib((0, 6)) + _message(**wrong)
+    with pytest.raises(WorkflowError, match=f"message 3 of .* {error}; nothing"):
+        _store(provider, STORE_QUERY, data)
+    assert _in_fdb(provider, STORE_QUERY) == 0
+    assert not provider.backend.list({"class": "ea"})  # not even under its own keys
+
+
+@needs_samples
+def test_store_native_rejects_key_absent_from_message(make_provider):
+    """Native archiving takes every key from the message, so a query key the message
+    lacks cannot be honoured (FR-STORE-003, L-23); identifier mode labels it."""
+    query = f"fdb://{EA2},step=0,quantile=1:10,param=167"
+    provider = make_provider()  # native is the default
+    with pytest.raises(
+        WorkflowError,
+        match=(
+            "message 1 of .* lacks quantile, which native archiving takes from the "
+            "message; use archive_mode=identifier"
+        ),
+    ):
+        _store(provider, query, _grib((0,)))
+    assert _in_fdb(provider, query) == 0
+    labelled = make_provider(archive_mode="identifier")
+    assert _store(labelled, query, _grib((0,))).exists() is True
+
+
+@needs_samples
+def test_no_schema_requires_no_key(make_provider):
+    """Without a readable schema the plugin cannot tell which keys FDB indexes, so no
+    key is required of a message or a field (FR-STORE-003, FR-READ-001, L-15)."""
+    provider = make_provider()
+    provider.schema_info = None  # as with a remote FDB whose schema is not local
+    query = f"fdb://{EA2},step=0,quantile=1:10,param=167"
+    assert _store(provider, query, _grib((0,))).exists() is True  # quantile dropped
+
+
+@needs_samples
+def test_exists_does_not_match_through_absent_key(make_provider):
+    """``inspect`` matches through a key the fields do not have (L-22); such fields
+    do not count (FR-READ-001)."""
+    provider = make_provider()
+    stored = _store(provider, STORE_QUERY, _grib())
+    assert stored.exists() is True
+    obj = provider.object(f"fdb://{EA2},step=0/6/12,quantile=1:10,param=167")
+    request = obj.parsed.to_request()
+    assert len(provider.backend.inspect(request)) == 3  # FDB matches through quantile
+    assert not provider.backend.list(request)  # list does not
     assert obj.exists() is False
-    assert _in_fdb(provider, STORE_QUERY) == 2
-    # foreign fields still fail (steps without earlier fields: the post-check has
-    # one-second resolution, FR-STORE-009)
-    error = "outside the query" if archive_mode == "native" else "has step=0"
-    with pytest.raises(WorkflowError, match=error):
-        _store(provider, f"fdb://{EA2},step=12/18/24,param=167", _grib((0, 18)))
+    with pytest.raises(WorkflowError, match="0 of 3 fields found in FDB"):
+        obj.retrieve_object()
+
+
+@needs_samples
+def test_store_post_check_names_offending_messages(make_provider):
+    """The pre-check skips ``to``/``by`` keys (FR-STORE-005), so a foreign step is
+    archived natively and the post-check names the message the query cannot reach
+    (FR-STORE-009)."""
+    provider = make_provider()
+    query = f"fdb://{EA2},step=0/to/12/by/6,param=167"
+    with pytest.raises(WorkflowError, match="1 landed outside the query") as e:
+        _store(provider, query, _grib((0, 6, 18)))
+    assert "or are duplicates: message 3 (step=18) (they stay in FDB" in str(e.value)
+    assert _in_fdb(provider, query) == 2
 
 
 @needs_samples

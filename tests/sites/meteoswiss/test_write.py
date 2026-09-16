@@ -139,12 +139,9 @@ def test_write_strict_rejects_foreign_member(write_job, archive_mode):
         archive_mode, {"t2m_pf": ("*_step6_t_2m_pert_m1-2.grib2", fields, {})}
     )
     res = out["results"]["t2m_pf"]
-    if archive_mode == "identifier":  # rejected before archiving
-        assert "has number=2, not one of 1/3; nothing was archived" in res["error"]
-        assert res["found"] == 0
-    else:  # FDB derives the keys; the post-check finds member 2 outside the query
-        assert "1 landed outside the query" in res["error"]
-        assert res["found"] == 1
+    # both modes pre-check the message keys against the query (FR-STORE-005)
+    assert "has number=2, not one of 1/3; nothing was archived" in res["error"]
+    assert res["found"] == 0
 
 
 def test_write_identifier_param_mismatch(write_job):

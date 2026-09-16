@@ -63,7 +63,6 @@ from .query import (
 from .query import validate as _validate_query
 
 ARCHIVE_MODES = ("identifier", "native")
-STORE_CHECKS = ("strict", "warn")
 CANONICAL_SPELLINGS = ("warn", "error", "ignore")
 REMOVE_POLICIES = ("warn", "ignore", "error")
 LANGUAGE_FILE = Path("share", "metkit", "language.yaml")
@@ -83,6 +82,7 @@ _REMOVE_WARNED: set[str] = set()
 _PARTIAL_WARNED: set[str] = set()
 _WARNED_LOCK = threading.Lock()
 MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
+OFFENDERS_SHOWN = 3  # messages named in a post-check error
 STAY_NOTE = "they stay in FDB until the next successful store masks them"
 
 
@@ -93,6 +93,14 @@ def _first_time(registry: set[str], query: str) -> bool:
             return False
         registry.add(query)
         return True
+
+
+def _contradicts(key: str, value: str, items: list[int | str]) -> bool:
+    """Whether a message value is comparable with the query's ``items`` (all of one
+    kind, FR-STORE-005) and none of them. A value that is not comparable or of the
+    other kind (``step=0`` vs ``0m``) is not a contradiction (ADR-012)."""
+    given = comparable(key, value)
+    return given is not None and type(given) is type(items[0]) and given not in items
 
 
 def _retry_fdb_io(func):
@@ -140,13 +148,6 @@ class StorageProviderSettings(StorageProviderSettingsBase):
             "help": "Check of identifiers against GRIB metadata before archiving: "
             "'none'. 'strict' is reserved and not implemented in this version. "
             "(default: none)",
-        },
-    )
-    store_check: Optional[str] = field(  # noqa: UP045
-        default="strict",
-        metadata={
-            "help": "'strict': a stored file must provide exactly the fields its query "
-            "expands to; 'warn': fewer fields are allowed and logged.",
         },
     )
     canonical_spelling: Optional[str] = field(  # noqa: UP045
@@ -266,7 +267,6 @@ class StorageProvider(StorageProviderBase):
     def __post_init__(self) -> None:
         settings = self.settings or StorageProviderSettings()
         self.archive_mode = _choice(settings, "archive_mode", ARCHIVE_MODES)
-        self.store_check = _choice(settings, "store_check", STORE_CHECKS)
         self.canonical_spelling = _choice(
             settings, "canonical_spelling", CANONICAL_SPELLINGS
         )
@@ -580,11 +580,35 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         return self.provider.backend.retrieve_to(request, dest, expected)
 
     def _fields(self) -> list[Field]:
-        """Fields FDB holds for the query: one ``inspect``, not cached (FR-READ-010)."""
+        """Fields FDB holds for the query: one ``inspect``, not cached (FR-READ-010).
+
+        Fields lacking a query key FDB indexes are dropped: ``inspect`` matches
+        through keys the indexed fields do not have (L-22), while the values of the
+        keys a field carries are matched by FDB itself (architecture.md §13.4).
+        """
         request = self._request()
         self._expanded()  # invalid requests and spelling errors before any FDB I/O
         with self._mapping_errors():
-            return self._inspect(request)
+            fields = self._inspect(request)
+        required = self._indexed_keys()
+        matching = [f for f in fields if all(f.key.get(k) for k in required)]
+        if len(matching) < len(fields):
+            self.provider.logger.debug(
+                f"FDB storage: {self.query}: {len(fields) - len(matching)} of "
+                f"{len(fields)} inspected fields lack a query key and are not counted "
+                "(FR-READ-001)"
+            )
+        return matching
+
+    def _indexed_keys(self) -> list[str]:
+        """Query keys FDB keeps in the field keys: the schema's rule keys not marked
+        ``key-``. Unknown without a schema, so nothing is required then (L-15)."""
+        info = self.provider.schema_info
+        if info is None:
+            return []
+        return [
+            k for k in self.parsed.keys() if k in info.keys and k not in info.removed
+        ]
 
     def _complete(self, fields: list[Field]) -> bool:
         expected = self._expected()
@@ -717,9 +741,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         """Archive the local GRIB file under the query (FR-STORE-*); never retried.
 
         Everything that can be checked from the file (GRIB structure, field count,
-        identifiers, duplicates, guard) is checked before the first ``archive()``;
-        a post-check ``inspect`` then requires every message to be reachable by the
-        query with a timestamp from this store.
+        message keys against the query, identifiers, duplicates, guard) is checked
+        before the first ``archive()`` (ADR-032); a post-check ``inspect`` then
+        requires every message to be reachable by the query with a timestamp from this
+        store.
         """
         expected = self._expected()  # wildcards, invalid request, spelling check
         local = self.local_path()
@@ -727,18 +752,16 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             messages = split_messages(local)
         n = len(messages)
         counts = f"{local} has {n} fields, the query expands to {expected}"
-        if n > expected or (n < expected and self.provider.store_check == "strict"):
+        if n != expected:
             raise WorkflowError(f"{self.query}: {counts}; nothing was archived")
-        if n < expected:
-            self.provider.logger.warning(
-                f"FDB storage: {self.query}: {counts} (store_check=warn)"
-            )
 
+        values = self._checked_values(messages, local)
         if self.provider.archive_mode == "identifier":
-            keyed = self._identifiers(messages, local)
+            keyed = self._identifiers(messages, values, local)
             batch = list(zip((msg.data for msg in messages), keyed, strict=True))
         else:  # native: FDB derives the keys, the guard is not consulted
-            keyed = [msg.mars for msg in messages]
+            self._require_indexed_keys(values, local)
+            keyed = values
             batch = [(b"".join(msg.data for msg in messages), None)]
         first_index: dict[tuple[tuple[str, str], ...], int] = {}
         for i, key in enumerate(keyed, 1):
@@ -755,22 +778,72 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         if len(fresh) < n:
             raise WorkflowError(
                 f"{self.query}: {counts}; {n - len(fresh)} landed outside the query "
-                f"or are duplicates ({STAY_NOTE})"
+                f"or are duplicates{self._offenders(keyed, fresh)} ({STAY_NOTE})"
             )
 
-    def _identifiers(
+    def _checked_values(
         self, messages: list[GribMessage], local: Path
     ) -> list[dict[str, str]]:
-        """FDB identifiers of ``messages`` (numbered from 1), each pre-checked against
-        the query's values and passed to the guard (FR-STORE-005, FR-STORE-008)."""
+        """MARS keys (``param`` from ``paramId``) of ``messages``, each pre-checked
+        against the query (FR-STORE-005, both archive modes)."""
+        allowed = self._allowed_values()
+        values = [{**msg.mars, "param": msg.param_id} for msg in messages]
+        for index, message in enumerate(values, 1):
+            self._precheck(index, message, allowed, local)
+        return values
+
+    def _require_indexed_keys(self, values: list[dict[str, str]], local: Path) -> None:
+        """Native archiving takes every key from the message, so a query key FDB
+        indexes that a message lacks cannot be honoured (FR-STORE-003, L-23)."""
+        required = self._indexed_keys()
+        for index, message in enumerate(values, 1):
+            if absent := next((k for k in required if not message.get(k)), None):
+                raise WorkflowError(
+                    f"{self.query}: message {index} of {local} lacks {absent}, which "
+                    "native archiving takes from the message; use "
+                    "archive_mode=identifier to label it, or drop the key from the "
+                    "query; nothing was archived"
+                )
+
+    def _offenders(self, keyed: list[dict[str, str]], fresh: list[Field]) -> str:
+        """``: message <i> (<keys>), ...`` for the messages whose key, on the indexed
+        query keys, no fresh field has (FR-STORE-009); empty if every message has one.
+        Shown are the keys that contradict the query and those the query gives several
+        values (they tell messages apart), at most ``OFFENDERS_SHOWN`` messages."""
+        keys = self._indexed_keys() or self.parsed.keys()
+
+        def signature(key: Mapping[str, str]) -> tuple[int | str | None, ...]:
+            return tuple(comparable(k, key.get(k, "")) for k in keys)
+
+        found = {signature(f.key) for f in fresh}
+        missing = [i for i, key in enumerate(keyed, 1) if signature(key) not in found]
+        if not missing:
+            return ""
+        allowed = self._allowed_values()
+        multi = {k for k, v in self._expanded().items() if len(set(v)) > 1}
+        names = []
+        for index in missing[:OFFENDERS_SHOWN]:
+            key = keyed[index - 1]
+            shown = [
+                k
+                for k in self.provider.key_order.sorted(key)
+                if k in multi or (k in allowed and _contradicts(k, key[k], allowed[k]))
+            ]
+            label = ", ".join(f"{k}={key[k]}" for k in shown)
+            names.append(f"message {index} ({label})" if label else f"message {index}")
+        more = len(missing) - len(names)
+        return ": " + ", ".join(names) + (f" and {more} more" if more else "")
+
+    def _identifiers(
+        self, messages: list[GribMessage], mars: list[dict[str, str]], local: Path
+    ) -> list[dict[str, str]]:
+        """FDB identifiers of ``messages`` (numbered from 1) from their pre-checked
+        MARS keys ``mars``, each passed to the guard (FR-STORE-004, FR-STORE-008)."""
         parsed = self.parsed
         single = self._canonical_single_values()
-        allowed = self._allowed_values()
         info = self.provider.schema_info
         identifiers = []
-        for index, message in enumerate(messages, 1):
-            values = {**message.mars, "param": message.param_id}
-            self._precheck(index, values, allowed, local)
+        for index, (message, values) in enumerate(zip(messages, mars, strict=True), 1):
             if info is None:  # no schema knowledge: query keys and message keys
                 keys = self.provider.key_order.sorted({*parsed.keys(), *values})
                 optional = removed = frozenset()
@@ -829,16 +902,15 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         allowed: Mapping[str, list[int | str]],
         local: Path,
     ) -> None:
-        """Message values of the keys in ``allowed`` must be one of the listed ones.
+        """Message values of the keys in ``allowed`` must be one of the listed ones
+        (FR-STORE-005), in both archive modes.
 
-        Keys the message does not carry are not checked: the query value labels it.
+        Keys the message does not carry are not checked here: in identifier mode the
+        query value labels the message (FR-STORE-004), in native mode
+        ``_require_indexed_keys`` rejects them.
         """
         for key, items in allowed.items():
-            if key not in values:
-                continue
-            given = comparable(key, values[key])
-            # given is None or of the other kind: an alias such as step=0 vs 0m
-            if given is None or type(given) is not type(items[0]) or given in items:
+            if key not in values or not _contradicts(key, values[key], items):
                 continue
             query_value = self.parsed.value(key)
             expected = (
@@ -897,11 +969,12 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def list_candidate_matches(self) -> list[str]:
         """Concrete queries for ``glob_wildcards`` (FR-GLOB-001), sorted.
 
-        One ``list`` of the pattern's constant keys (omitted keys are wildcards). Each
-        field gives the pattern with its wildcard-bearing values replaced by the
-        field's canonical values; fields lacking such a key, or listing it empty, are
-        skipped. Keys the pattern does not name do not appear, so fields differing
-        only there give one candidate.
+        One ``list`` of the pattern's constant keys (omitted keys are wildcards; unlike
+        ``inspect``, ``list`` does not match through keys a field lacks, architecture.md
+        §13.4). Each field gives the pattern with its wildcard-bearing values replaced
+        by the field's canonical values; fields lacking such a key, or listing it
+        empty, are skipped. Keys the pattern does not name do not appear, so fields
+        differing only there give one candidate.
         """
         parsed = self.parsed
         selection = parsed.constant_pairs()

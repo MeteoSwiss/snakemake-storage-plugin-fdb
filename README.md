@@ -25,8 +25,9 @@ fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,le
   Modification times come from FDB index timestamps. Retrieval is atomic; transient
   errors are retried and permanent ones fail at once, with a message that says what to
   fix.
-- **Safe archiving:** field count, GRIB structure and duplicates are checked before
-  anything is archived, and the result is verified afterwards.
+- **Safe archiving:** field count, GRIB structure, duplicates and every message's MARS
+  keys are checked against the query before anything is archived, and the result is
+  verified afterwards.
 - **`glob_wildcards`** from FDB listings.
 - **Canonical queries:** keys are ordered as in the FDB schema, and non-canonical values
   (`param=2t` instead of `167`) are reported.

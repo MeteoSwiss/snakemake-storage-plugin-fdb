@@ -24,6 +24,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `archive_mode=native` now validates every message before archiving anything: its MARS
+  keys must agree with the constant keys of the query, and every query key FDB indexes
+  must be present in the message. Previously FDB archived the messages under their own
+  keys whatever the query said (a rule with a wrong `expver` masked its own input), and
+  only the post-check noticed, after the data was in FDB.
+- An input exists only if the fields carry every key of its query that the FDB schema
+  indexes: FDB's `inspect` matches through keys the indexed fields do not have, so
+  `quantile=1:10` used to find quantile-less fields and every per-quantile query
+  "existed". This also applies to `mtime`, `size` and retrieval.
+- The post-check error now names the messages that landed outside the query and the
+  keys that put them there, e.g. `message 3 (step=18)`.
 - Only failures that may be transient are retried. An invalid MARS request, a
   configuration error, a schema mismatch, data that is not GRIB and I/O errors now fail
   on the first attempt instead of after three attempts and about 10 seconds.
@@ -33,6 +44,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `snakemake --help` names the default of every plugin setting.
 - The generic example queries and the queries in the README and the documentation name
   `domain=g`, the key ECMWF `class=od`/`class=ea` fields are archived under.
+
+### Removed
+
+- The `store_check` setting. A store of fewer fields than the query expands to can never
+  satisfy `exists()`, so `store_check=warn` produced a job that failed after a
+  successful store, on that run and every later one. A wrong field count is always an
+  error and nothing is archived.
 
 ### Fixed
 

@@ -29,7 +29,6 @@ SETTINGS = {
     "user_config": None,
     "archive_mode": "native",  # ADR-009
     "identifier_check": "none",
-    "store_check": "strict",
     "canonical_spelling": "warn",
     "remove_policy": "warn",
     "glob_required_keys": "class",
@@ -85,7 +84,7 @@ def test_settings_fields():
 def test_settings_help_names_the_default():
     """FR-CONF-001: a plugin setting's help text ends with ``(default: ...)``."""
     for f in fields(StorageProviderSettings):
-        if f.name in ("max_requests_per_second", "store_check"):  # store_check: none
+        if f.name == "max_requests_per_second":  # inherited, no default of ours
             continue
         assert f"(default: {f.default or 'unset'}" in f.metadata["help"], f.name
         assert f.metadata["help"].endswith(")"), f.name
@@ -94,7 +93,6 @@ def test_settings_help_names_the_default():
 def test_settings_defaults_construct(make_provider):
     provider = make_provider()
     assert provider.archive_mode == "native"
-    assert provider.store_check == "strict"
     assert provider.canonical_spelling == "warn"
     assert provider.remove_policy == "warn"
     assert provider.glob_required_keys == ("class",)
@@ -102,8 +100,8 @@ def test_settings_defaults_construct(make_provider):
 
 
 def test_settings_none_means_default(make_provider):
-    provider = make_provider(archive_mode=None, store_check=None, remove_policy=None)
-    assert (provider.archive_mode, provider.store_check) == ("native", "strict")
+    provider = make_provider(archive_mode=None, remove_policy=None)
+    assert provider.archive_mode == "native"
     assert provider.remove_policy == "warn"
 
 
@@ -111,7 +109,6 @@ def test_settings_none_means_default(make_provider):
     "name, value",
     [
         ("archive_mode", "copy"),
-        ("store_check", "lenient"),
         ("canonical_spelling", "fix"),
         ("remove_policy", "wipe"),
         ("identifier_check", "loose"),
@@ -125,12 +122,11 @@ def test_settings_invalid_choice(make_provider, name, value):
 def test_settings_other_choices(make_provider):
     provider = make_provider(
         archive_mode="identifier",
-        store_check="warn",
         canonical_spelling="error",
         remove_policy="ignore",
         glob_required_keys=" class , Stream ",
     )
-    assert (provider.archive_mode, provider.store_check) == ("identifier", "warn")
+    assert provider.archive_mode == "identifier"
     assert (provider.canonical_spelling, provider.remove_policy) == ("error", "ignore")
     assert provider.glob_required_keys == ("class", "stream")
     assert make_provider(glob_required_keys="").glob_required_keys == ()

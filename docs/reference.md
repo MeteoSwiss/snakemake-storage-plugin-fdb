@@ -22,7 +22,6 @@ the variable over the default.
 | `user_config` | `--storage-fdb-user-config` (env) | unset | as `config` | FDB user configuration (e.g. `useSubToc: true`). |
 | `archive_mode` | `--storage-fdb-archive-mode` | `native` | `native`, `identifier` | How outputs are archived: `native` (FDB derives the keys from the GRIB) or `identifier` (the plugin builds each message's FDB key; use it only with schemas whose rules share one key set, or supply the other keys in the query). |
 | `identifier_check` | `--storage-fdb-identifier-check` | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
-| `store_check` | `--storage-fdb-store-check` | `strict` | `strict`, `warn` | `strict`: a stored file must provide exactly the fields its query expands to; `warn`: fewer fields are allowed and logged. |
 | `canonical_spelling` | `--storage-fdb-canonical-spelling` | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
 | `remove_policy` | `--storage-fdb-remove-policy` | `warn` | `warn`, `ignore`, `error` | FDB cannot delete fields; what removing an output does: no-op with a warning, silent no-op, or error. |
 | `glob_required_keys` | `--storage-fdb-glob-required-keys` (env) | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
@@ -153,14 +152,14 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `postprocess_query` | Normalisation above; records the result for the wildcard guard. |
 | `example_queries` | Three generic examples (single date pattern with `step=0/6/12`, one ensemble analysis field, a `to/by` range over three parameters). |
 | `local_suffix` | Local path mapping above. |
-| `exists` | One `inspect`; true iff the expanded request's field count `E > 0` and exactly `E` fields are found. Warns once per query if some but not all fields are found. |
+| `exists` | One `inspect`; true iff the expanded request's field count `E > 0` and exactly `E` fields are found. A field counts only if its key holds every query key FDB indexes (schema rule keys not marked `key-`; none without a readable schema): `inspect` matches through keys the fields do not have. Warns once per query if some but not all fields are found. |
 | `mtime` | One `inspect`; latest index timestamp of the found fields (POSIX seconds; `os.stat` of the data file for timestamp 0, else 0 with a warning); `FileNotFoundError("no fields in FDB for <query>")` if none. |
 | `size`, `local_footprint` | One `inspect`; sum of the found fields' message lengths. |
 | `checksum` | `None` (Snakemake hashes the local copy). |
 | `inventory` | One `inspect`; fills existence, and for existing objects mtime and size, for `cache_key()`; no-op if already cached. Warns like `exists`. |
 | `get_inventory_parent` | `None`. |
 | `retrieve_object` | Requires `exists`; streams `retrieve` into `<local>.part` in 8 MiB chunks, fsyncs, checks the byte count, renames over the local path; removes the part file on any error. |
-| `store_object` | Expands the query, splits the local file into GRIB messages, checks the count against `E` (`store_check`), builds identifiers and pre-checks them (`identifier` mode) or uses each message's `mars` keys (`native`), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store. Never retried. |
+| `store_object` | Expands the query, splits the local file into GRIB messages, requires exactly `E` of them, pre-checks every message's MARS keys against the query (both modes), builds identifiers (`identifier` mode) or requires every indexed query key to be present in the message (`native` mode), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store, naming the offending messages if not. Never retried. |
 | `remove` | Never deletes; applies `remove_policy`. Snakemake 9.27 calls it only for `--delete-all-output`: not before a rerun, not on failed-job cleanup (its "Removing output files of failed job" line removes nothing from FDB), and never for `temp()`, which cannot be combined with storage. |
 | `list_candidate_matches` | Checks `glob_required_keys`; one `list` of the pattern's constant pairs; returns the sorted unique pattern texts with wildcard-bearing values replaced by listed values, skipping fields that lack them. |
 | `cleanup` | No-op. |
@@ -227,14 +226,15 @@ characters with `…`; the full text is logged at debug level.
 | `<local>: trailing non-GRIB bytes at offset <n>` / `<local>: non-GRIB bytes at offset <n>` | non-NUL bytes outside messages |
 | `<local>: cannot read GRIB message[ after offset <n>]: <error>` | truncated or undecodable message |
 | `<local or query> is not GRIB` | FDB found no GRIB in the data |
-| `<query>: <local> has <n> fields, the query expands to <E>; nothing was archived` | too many fields, or too few with `store_check=strict` |
+| `<query>: <local> has <n> fields, the query expands to <E>; nothing was archived` | more or fewer fields than the query expands to |
 | `<query>: cannot determine <key> for message <i> of <local>; nothing was archived` | identifier mode, mandatory schema key without a value |
-| `<query>: message <i> of <local> has <key>=<value>, but the query has <key>=<value>; nothing was archived` | identifier pre-check, single value |
-| `<query>: message <i> of <local> has <key>=<value>, not one of <values>; nothing was archived` | identifier pre-check, list |
+| `<query>: message <i> of <local> has <key>=<value>, but the query has <key>=<value>; nothing was archived` | pre-check (both modes), single value |
+| `<query>: message <i> of <local> has <key>=<value>, not one of <values>; nothing was archived` | pre-check (both modes), list |
+| `<query>: message <i> of <local> lacks <key>, which native archiving takes from the message; use archive_mode=identifier to label it, or drop the key from the query; nothing was archived` | native mode, query key absent from the message |
 | `<query>: identifier check failed for <local>: <mismatch>; nothing was archived` | the identifier guard rejected a message |
 | `<query>: <local> holds duplicate fields (messages <i> and <j>); nothing was archived` | duplicate keys |
 | `GRIB keys do not match the FDB schema for <query> (<local>): <detail>` | `Keywords not used`, `Could not find [...]`, `Could not find a rule` |
-| `<query>: <local> has <n> fields, the query expands to <E>; <k> landed outside the query or are duplicates (they stay in FDB until the next successful store masks them)` | post-check |
+| `<query>: <local> has <n> fields, the query expands to <E>; <k> landed outside the query or are duplicates: message <i> (<keys>)[, ...][ and <k> more] (they stay in FDB until the next successful store masks them)` | post-check; the named messages are those no fresh field matches (at most three) |
 | `<error> (<k> of <m> archive calls succeeded before the failure; they stay in FDB until the next successful store masks them)` | archive failure after a successful call |
 | `remove_policy=error: FDB cannot delete individual fields; ...` | `remove()` with `remove_policy=error` |
 
@@ -244,13 +244,13 @@ characters with `…`; the full text is logged at debug level.
 |---|---|
 | warning | `Query <query> uses non-canonical spelling: ...` (once per query per process) |
 | warning | ``FDB cannot delete individual fields; existing fields for <query> will be masked by the next archive. Use `fdb purge` to reclaim space.`` (once per query per process) |
-| warning | `FDB storage: <query>: <local> has <n> fields, the query expands to <E> (store_check=warn)` |
 | warning | `FDB storage: <query>: <n> of <E> fields found in FDB; missing: ...` (once per query per process, when FDB holds some but not all fields) |
 | warning | `FDB storage: a field of <query> has no index timestamp and no local data file; its mtime is taken as 0` |
 | warning | `FDB storage: providers in one process use different <VARIABLE> settings (<a> vs <b>); the last one wins` |
 | info | `FDB storage: metkit_home overrides METKIT_HOME=<old> with <new>` |
 | debug | `FDB storage: <query>: 0 of <E> fields found in FDB ...` (nothing found; includes the optional-schema-key hint) |
 | debug | `FDB storage: full error text: <full pyfdb message>` (for every error mapped to a `WorkflowError`) |
+| debug | `FDB storage: <query>: <k> of <n> inspected fields lack a query key and are not counted (FR-READ-001)` |
 | debug | `FDB storage: <query>: no metkit expansion; query values are used as written (spelling check skipped, identifier values from the query archived verbatim)` |
 
 ## `scripts/init_dev_fdb.py`

@@ -277,14 +277,26 @@ Before archiving, the plugin checks the file:
 
 - it must be GRIB; NUL padding between messages is fine, any other extra bytes are an
   error;
-- with `store_check=strict` (default) it must hold exactly as many fields as the query
-  expands to; `store_check=warn` allows fewer and logs a warning;
+- it must hold exactly as many fields as the query expands to, no more and no less;
+- every message's MARS keys must agree with the constant keys of the query: a `step=6`
+  query rejects a `step=0` message, a `step=0/6/12` query rejects `step=18`. The plugin
+  never relabels data, so fix the rule or the GRIB (e.g. with `grib_set`);
+- in `native` mode every query key must be present in the message (see below);
 - it must not hold the same field twice.
 
-Everything that fails here says "nothing was archived". After archiving, the plugin
-checks that FDB now returns every message for the query. If not, some messages carry
-keys outside the query; they stay in FDB until a later successful store masks them, and
-the error says so.
+All of these fail with "nothing was archived": FDB is untouched.
+
+After archiving, the plugin checks that FDB now returns every message for the query.
+This is the only step that can leave data behind: if a message still landed outside the
+query (the checks above skip `to`/`by` ranges and values they cannot compare), the error
+names it and the keys that put it there, for example for a `step=0/to/12/by/6` query
+
+```text
+... 1 landed outside the query or are duplicates: message 3 (step=18)
+(they stay in FDB until the next successful store masks them)
+```
+
+Those fields stay in FDB until a later successful store masks them.
 
 Editing an output query leaves the fields the rule archived under the old query in FDB:
 nothing masks them (their keys differ), `fdb purge` does not reclaim them and nothing in
@@ -310,14 +322,23 @@ streams).
 ### Archive modes
 
 - `archive_mode=native` (default): FDB derives the keys from each message and picks the
-  matching schema rule. Use it unless you have a reason not to.
+  matching schema rule. Since every key comes from the message, every key of the query
+  must be in the message; a query naming a key the GRIB lacks is an error:
+
+  ```text
+  message 1 of <local> lacks quantile, which native archiving takes from the message;
+  use archive_mode=identifier to label it, or drop the key from the query
+  ```
+
+  (A key the schema drops, such as `domain` under a schema that writes `domain-`, or a
+  key the schema does not know at all, is not required; nor is any key when the schema
+  is not readable locally.) Use this mode unless you have a reason not to.
 - `archive_mode=identifier`: the plugin builds each message's FDB key from the schema,
-  the query and the message. Constant query values are checked against the message
-  first (a `step=6` query rejects a `step=0` message; the plugin never relabels data, so
-  fix the GRIB instead, e.g. with `grib_set`). A query key the message does not carry
-  labels it (e.g. `quantile=1:10`). Query values are archived in canonical spelling. Use
-  this mode only with schemas whose rules share one key set, such as GRIB that lacks a
-  key the schema requires; with multi-rule schemas it fails with `cannot determine <key>`.
+  the query and the message. A query key the message does not carry labels it, so this
+  is the mode for `quantile=1:10` on GRIB without a quantile. Query values are archived
+  in canonical spelling. Use this mode only with schemas whose rules share one key set,
+  such as GRIB that lacks a key the schema requires; with multi-rule schemas it fails
+  with `cannot determine <key>`.
 
 `identifier_check` is reserved for a stricter identifier check; only `none` is accepted.
 
@@ -488,8 +509,10 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 | `GRIB keys do not match the FDB schema for ...: Keywords not used: {number}` | The GRIB carries a key the schema does not accept. Use a schema with that key (e.g. `number?`), or `archive_mode=identifier`. |
 | `...: cannot determine <key> for message 1 ...` | Identifier mode with a multi-rule schema. Use `archive_mode=native` or add the key to the query. |
 | `...: message 1 of ... has step=0, but the query has step=6 ...` | The output GRIB does not match its query. Fix the rule or the GRIB. |
-| `... landed outside the query or are duplicates ...` | Archived messages have keys outside the output query. Fix the rule; the stray fields are masked by the next successful store. |
-| `... has 2 fields, the query expands to 3; nothing was archived` | The output file is incomplete. Fix the rule, or set `store_check=warn`. |
+| `... landed outside the query or are duplicates: message 3 (step=18) ...` | Archived messages have keys outside the output query; the message names them. Fix the rule; the stray fields are masked by the next successful store. |
+| `... has 2 fields, the query expands to 3; nothing was archived` | The output file has the wrong number of fields. Fix the rule: a partial store could never satisfy the query anyway. |
+| `... message 1 of ... lacks quantile, which native archiving takes from the message ...` | The query names a key the GRIB does not carry. Set it in the GRIB, drop it from the query, or use `archive_mode=identifier`. |
+| An input with a key the fields lack is reported missing | Correct: `quantile=1:10` on fields without a quantile does not exist, even though FDB's `inspect` matches through the key. Drop the key or archive the fields with it. |
 | `Query ... uses non-canonical spelling: ...` | Use the canonical value shown (see [Canonical spelling](#canonical-spelling)). |
 | `FDB glob pattern ... needs constant values for class (glob_required_keys)` | Give `class` a constant value, or change `glob_required_keys`. |
 | `METKIT_HOME=... has no share/metkit/language.yaml ...` | Point `metkit_home` or `METKIT_HOME` at a complete metkit home (FDB would hang otherwise). |

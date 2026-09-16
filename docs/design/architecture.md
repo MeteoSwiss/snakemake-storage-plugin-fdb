@@ -166,7 +166,7 @@ requirements.md D-001.
 
 ### 5.6 `__init__.py` — Snakemake integration
 
-- `StorageProviderSettings`: the twelve plugin settings, all `Optional[str]`
+- `StorageProviderSettings`: the eleven plugin settings, all `Optional[str]`
   ([reference](../reference.md#settings)).
 - `StorageProvider.__post_init__` runs: choice settings and `identifier_check` →
   `glob_required_keys` → environment (§8.3) → `config`/`user_config` → schema path and
@@ -174,8 +174,9 @@ requirements.md D-001.
   guard. `postprocess_query` records its results for `is_normalised` (FR-PATH-004).
 - `StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob)`: the parse
   result and the request expansion are cached per query text (FR-PATH-005, §8.2);
-  `_fields()` is one retried `inspect`, never cached (FR-READ-010). Read methods,
-  `store_object` (§6.4), `remove` and `list_candidate_matches` build on them.
+  `_fields()` is one retried `inspect`, never cached (FR-READ-010), keeping only the
+  fields whose key contains every query key FDB indexes (`_indexed_keys()`, §13.4). Read
+  methods, `store_object` (§6.4), `remove` and `list_candidate_matches` build on them.
 - Module-level state, each lock-protected: `_APPLIED` (values applied by providers, to
   warn on disagreement), `_SPELLING_WARNED` and `_REMOVE_WARNED` (once-per-process
   warnings).
@@ -240,8 +241,9 @@ No native library is loaded in steps 1–4 except by provider construction (§8.
    each call `_fields()`: `_request()` (no wildcards) → `_expanded()` (metkit
    expansion, spelling check; invalid requests fail here before FDB I/O) → retried
    `Backend.inspect` on a fresh handle (§8.5, §8.6).
-3. `exists` compares the field count with `E` (§8.8). `mtime` is the maximum field time
-   (index timestamp, else `os.stat`). `size` sums message lengths.
+3. `exists` compares the count of fields carrying every indexed query key with `E`
+   (§8.8). `mtime` is the maximum field time (index timestamp, else `os.stat`). `size`
+   sums message lengths.
 4. `exists` and `inventory` take the result from `_exists(fields)`: `0 < n < E` warns with
    `_missing_message` once per query and process, `n = 0` only logs it at debug level
    (FR-READ-008). Snakemake never reaches `retrieve_object`'s error for an object it was
@@ -265,11 +267,12 @@ sequenceDiagram
     participant F as FDB
     O->>O: _expected() (wildcards, invalid request, spelling)
     O->>G: split_messages(local)
-    O->>O: count check (store_check)
+    O->>O: count check (n == E)
+    O->>O: per message: keys = mars + paramId, pre-check against the query
     alt identifier mode
-        O->>O: pre-check, build identifiers, guard.check per message
+        O->>O: build identifiers, guard.check per message
     else native mode
-        O->>O: keys = mars namespace of each message
+        O->>O: every query key must be in the message keys
     end
     O->>O: duplicate check
     O->>B: t_start = fdb_time()
@@ -281,18 +284,23 @@ sequenceDiagram
 
 1. `_expected()` fails early for wildcards, invalid requests and spelling errors.
 2. `split_messages` (GRIB errors mapped, FR-STORE-001); count check (FR-STORE-002).
-3. Identifier mode: per message `values = mars + {param: paramId}`, pre-check against
-   `_allowed_values()` (FR-STORE-005), identifier from schema keys, canonical single
-   query values (`_canonical_single_values()`) and message values (FR-STORE-004,
-   FR-STORE-006), then `guard.check` (FR-STORE-008). Batch: one `(message bytes,
-   identifier)` per message. Native mode: keys are each message's `mars` namespace; one
-   batch of the concatenated message bytes (NUL padding dropped).
+3. Per message `values = mars + {param: paramId}`, pre-checked against
+   `_allowed_values()` (FR-STORE-005) in both modes (`_checked_values`, ADR-032).
+   Identifier mode then builds the identifier from schema keys, canonical single query
+   values (`_canonical_single_values()`) and message values (FR-STORE-004,
+   FR-STORE-006), and calls `guard.check` (FR-STORE-008); batch: one `(message bytes,
+   identifier)` per message. Native mode additionally requires every indexed query key
+   (`_indexed_keys()`) to be present in `values` (`_require_indexed_keys`,
+   FR-STORE-003); keys are those `values`; one batch of the concatenated message bytes
+   (NUL padding dropped).
 4. Duplicate keys → error (FR-STORE-007). Up to here nothing was archived.
 5. `t_start = fdb_time()` (§8.7); `_archive` archives the batch and flushes once on this
    thread's handle; a failure after a successful call reports how many calls succeeded
    (FR-STORE-010). `store_object` is not retried.
-6. Post-check: `_fields()` (fresh handle), count fields with time ≥ `t_start`; fewer
-   than `n` → error saying the fields stay in FDB (FR-STORE-009).
+6. Post-check: `_fields()` (fresh handle, fields carrying every indexed query key),
+   count fields with time ≥ `t_start`; fewer than `n` → error naming the messages whose
+   key, on the indexed query keys, no fresh field has (`_offenders`) and saying the
+   fields stay in FDB (FR-STORE-009).
 7. Snakemake then touches the local file with `mtime()` and checks `exists_in_storage`
    (§13.8).
 
@@ -555,8 +563,8 @@ design round, provided requirements, architecture and code are updated together.
 - Context: a multi-field object can be partially present.
 - Decision: `exists` = `E > 0` and exactly `E` fields found.
 - Status: accepted.
-- Consequences: incomplete inputs trigger producers or "missing input"; `store_check=strict`
-  is meaningful; `E` is a cross product (L-4). evalml's completeness check is the same
+- Consequences: incomplete inputs trigger producers or "missing input"; a store of
+  fewer fields is always an error (ADR-032); `E` is a cross product (L-4). evalml's completeness check is the same
   idea at block granularity.
 
 ### ADR-006 No storage checksum
@@ -827,6 +835,31 @@ design round, provided requirements, architecture and code are updated together.
 - Consequences: implementation history is dropped; decisions, verified facts, limitations
   and deferred work are kept in the two design documents.
 
+### ADR-032 Validate before archiving in every mode, never match through absent keys
+
+- Context: native mode (the default) computed each message's MARS keys but checked
+  nothing against the query; FDB archived every message under its own keys and only the
+  post-check noticed, after the data was in FDB. A rule that forgot to change `expver`
+  archived its output on top of its own input, masking six fields. A query key the GRIB
+  does not carry (`quantile=1:10`) was archived away silently, and `inspect` then matched
+  the quantile-less fields for every per-quantile query (§13.4), so `exists()` was true
+  for all of them. `store_check=warn` allowed a partial store, which `exists()` (ADR-005)
+  then always reported missing, so the job failed with Snakemake's generic
+  `RemoteFileException` on every run.
+- Decision (user): check what can be checked from the file before the first `archive()`
+  in both modes (pre-check of the values, FR-STORE-005; presence of every indexed query
+  key in native mode, FR-STORE-003); count fields on the read side only when their key
+  contains every indexed query key (FR-READ-001; FDB matches the values of the keys a
+  field carries, so only presence needs checking); remove `store_check` (FR-STORE-002);
+  name the offending messages and keys when the post-check fails (FR-STORE-009). Which
+  keys FDB indexes is read from the schema; without a readable schema nothing is
+  required (L-15), so a missing schema never hides data or rejects a valid store.
+- Status: accepted (reversible), 2026-09-16.
+- Consequences: FDB is not touched by a store the plugin can reject; native mode rejects
+  query keys the message lacks (L-23), which identifier mode still labels; the read-side
+  filter costs one dictionary lookup per indexed query key and inspected field (pure
+  Python, no extra FDB call); `store_check=warn` workflows must fix the rule instead.
+
 ### ADR-033 Retry classification by the error mapping
 
 - Context: the retry policy retried every exception, so a permanent failure (a typo in
@@ -864,6 +897,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-11 | COSMO definitions open `/dev/stderr` as a file, truncating a stderr redirected to a regular file (also with `ECCODES_VERSION_CHECK_OFF=1`) [verified: eccodes 2.47.3 + cosmo-mars + cosmo-resources 2.47.0.1]. | Decoding jobs log stderr to their own file (MeteoSwiss example). |
 | R-12 | eckit `SeriousBug` backtraces are printed regardless of environment settings (L-7). | Accepted. |
 | R-13 | `fdb_time()` uses `ctypes.CDLL(None)`, Linux/glibc-specific. | Fallback to `int(time.time())`. |
+| R-15 | FDB request semantics: `inspect`/`retrieve` match through query keys the indexed fields lack while `list` does not (§13.4, L-22); the plugin's own key check (FR-READ-001) depends on that asymmetry not changing meaning across FDB versions. | `test_exists_does_not_match_through_absent_key` pins both behaviours; the `pyfdb-latest` canary runs it on 5.23; report upstream (requirements.md D-012). |
 | R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
 | TD-2 | No ECMWF sample fetch script. | D-008. |
@@ -958,6 +992,7 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
 | behaviour | `list(sel)` | `inspect(req)` / `retrieve(req)` |
 |---|---|---|
 | omitted key | wildcard (`{}` lists everything) | must match exactly: omitting `domain` or `number` on fields that have them finds nothing |
+| key the fields do not have | no match (0 elements) | matches through it: the fields are returned as if the key were not in the request |
 | `/` lists, `to`/`by` | expanded by metkit | expanded by metkit |
 | missing combinations | – | silently omitted; nothing found → empty iterator / 0-byte handle, no error |
 | multi-valued `class`/`stream`/`type`/`expver` | `UserError: Only one value possible for 'type'` | same |
@@ -968,6 +1003,13 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
 
 - `inspect` returns per-field elements (length, timestamp) for exactly the fields
   `retrieve` returns.
+- Three fields archived natively without a `quantile` (`tests/data/schema`, class=ea):
+  `inspect` returns 3 elements for the query with `quantile=1:10`, 3 for `quantile=2:10`
+  and 3 without `quantile`, always the same quantile-less fields, while `list` of the
+  same requests returns 3, 0 and 0 [verified: pyfdb 5.21.4.23 and 5.23.2 (`uv run
+  --with 'pyfdb>=5.23'`), 2026-09-16, probe against a temporary toc FDB, reproduced by
+  `tests/test_plugin.py::test_exists_does_not_match_through_absent_key`]. Hence FR-READ-001's key
+  check (L-22, ADR-032, D-012).
 - `retrieve` returns messages in request order (outer key first, each in the order
   given); identical requests give identical bytes; reversed lists give different bytes.
   `DataHandle.size()` works before `open()` and equals the sum of field lengths. A

@@ -313,7 +313,7 @@ never collides locally. The query itself does not name the FDB.
 #### FR-CONF-001 Settings
 
 The provider exposes the settings `config`, `user_config`, `archive_mode`,
-`identifier_check`, `store_check`, `canonical_spelling`, `remove_policy`,
+`identifier_check`, `canonical_spelling`, `remove_policy`,
 `glob_required_keys`, `eccodes_definitions`, `metkit_home`, `key_order` and `env`, all
 optional strings with the defaults of the [reference](../reference.md#settings), as
 `--storage-fdb-<name>` CLI flags, profile keys and `storage` directive arguments,
@@ -342,8 +342,7 @@ construction) or inline YAML/JSON text that parses as a mapping. Anything else r
 
 #### FR-CONF-003 Choice settings
 
-`archive_mode`, `identifier_check`, `store_check`, `canonical_spelling` and
-`remove_policy` accept exactly their lower-case values; any other value raises
+`archive_mode`, `identifier_check`, `canonical_spelling` and `remove_policy` accept exactly their lower-case values; any other value raises
 `invalid <name> '<value>' (allowed: ...)` at provider construction.
 `glob_required_keys` and `key_order` must contain valid key names.
 
@@ -478,11 +477,19 @@ different `eccodes_definitions` or `metkit_home` values log a warning; the last 
 
 `exists()` is true only if `E > 0` and FDB holds exactly `E` fields for the query
 (one `inspect`). Keys omitted from the query are not wildcards for this check (FDB
-matches keys exactly).
+matches keys exactly). A field counts only if its key contains every query key FDB keeps
+in field keys (a schema rule key not marked `key-`; none is required if the schema is
+not readable, L-15): `inspect` matches through keys the indexed fields do not have
+(L-22), and such fields are not what the query names. The values of the keys a field
+carries are matched by FDB itself (architecture.md §13.4). The same filter applies to
+`mtime()`, `size()`, `retrieve_object()` and the store post-check.
 
 - Rationale: a partially present input is not usable; reporting it missing makes
-  Snakemake run the producer or fail with "missing input" (ADR-005).
+  Snakemake run the producer or fail with "missing input" (ADR-005). Without the key
+  check ten per-quantile queries all exist and retrieve the same quantile-less fields
+  (ADR-032).
 - Verification: test `tests/test_plugin.py::test_exists_size_checksum_complete`,
+  `::test_exists_does_not_match_through_absent_key`, `::test_no_schema_requires_no_key`,
   `::test_exists_partial_retrieve_names_missing`,
   `::test_exists_missing_optional_key_and_mtime_not_found`,
   `tests/sites/meteoswiss/test_read.py::test_read_samples`.
@@ -626,26 +633,39 @@ message, a truncated message or a file without messages fails before archiving.
 
 #### FR-STORE-002 Field count before archiving
 
-With `n` messages and `E` expected fields, `n > E`, or `n < E` with
-`store_check=strict` (default), raises `<query>: <local> has <n> fields, the query
-expands to <E>; nothing was archived`. `n < E` with `store_check=warn` logs a warning
-and continues.
+With `n` messages and `E` expected fields, `n != E` raises `<query>: <local> has
+<n> fields, the query expands to <E>; nothing was archived`. There is no lenient mode:
+a store providing fewer fields than its query promises can never satisfy `exists()`
+(FR-READ-001), so the job fails afterwards anyway (ADR-032).
 
 - Rationale: an output must provide what its query promises.
 - Verification: test `tests/test_plugin.py::test_store_strict_rejects`,
-  `::test_store_warn_fewer_fields`,
   `tests/sites/meteoswiss/test_write.py::test_write_strict_rejects_foreign_member`.
 
 #### FR-STORE-003 Native archive mode (default)
 
 With `archive_mode=native` the messages are archived in one `archive(bytes)` call; FDB
-derives the keys and picks the schema rule. Identifier pre-checks and the guard are not
-used; the post-check (FR-STORE-009) verifies the result.
+derives the keys and picks the schema rule. Before that call every message's MARS keys
+(`param` from `paramId`) are checked against the query (ADR-032):
+
+- the values must pass the pre-check (FR-STORE-005);
+- every query key FDB keeps in the field key (a schema rule key not marked `key-`; none
+  if the schema is not readable, L-15) must be present in the message, else `<query>:
+  message <i> of <local> lacks <key>, which native archiving takes from the message; use
+  archive_mode=identifier to label it, or drop the key from the query; nothing was
+  archived` (L-23).
+
+The guard (FR-STORE-008) is not consulted; the post-check (FR-STORE-009) verifies the
+result.
 
 - Rationale: works with multi-rule schemas, is pyfdb's recommended path and what
-  MeteoSwiss uses in production (ADR-009).
+  MeteoSwiss uses in production (ADR-009). Unchecked, FDB archives every message under
+  its own keys whatever the query says, which masks unrelated data (ADR-032).
 - Verification: test `tests/test_plugin.py::test_store_roundtrip`,
   `::test_store_default_native_under_multi_rule_schema`,
+  `::test_store_precheck_rejects_wrong_key`,
+  `::test_store_native_rejects_key_absent_from_message`,
+  `::test_no_schema_requires_no_key`,
   `tests/sites/meteoswiss/test_write.py::test_write_ctrl`.
 
 #### FR-STORE-004 Identifier archive mode
@@ -666,9 +686,9 @@ message does not carry labels the message unchecked (e.g. `quantile=1:10`).
   `::test_store_identifier_key_absent_from_message_takes_query_value`,
   `tests/sites/meteoswiss/test_write.py::test_write_ctrl`.
 
-#### FR-STORE-005 Identifier pre-check
+#### FR-STORE-005 Message pre-check
 
-In identifier mode, for every constant query key (single- or multi-valued) that the
+In both archive modes, for every constant query key (single- or multi-valued) that the
 message carries, the message value must equal the query value or one of the listed
 values after light normalisation: integers numerically, one- or two-digit `time` as
 hours, `param` `N.T` as paramId, `date` only as `YYYYMMDD`, other strings
@@ -678,10 +698,12 @@ kind (e.g. query `step=0` vs message `0m`, left to FDB and the post-check). A mi
 raises `<query>: message <i> of <local> has <k>=<v>, but the query has <k>=<q>; nothing
 was archived` (or `..., not one of <values>; ...` for a list).
 
-- Rationale: FDB performs no consistency check between identifier and message
-  (architecture.md §13.5); relabelling GRIB is not supported (ADR-010, ADR-012).
+- Rationale: FDB performs no consistency check between identifier and message, and in
+  native mode it archives the message under its own keys (architecture.md §13.5,
+  ADR-032); relabelling GRIB is not supported (ADR-010, ADR-012).
 - Verification: test `tests/test_plugin.py::test_store_identifier_single_value_mismatch`,
-  `::test_store_strict_rejects`, `tests/test_query.py::test_comparable`,
+  `::test_store_precheck_rejects_wrong_key`, `::test_store_strict_rejects`,
+  `tests/test_query.py::test_comparable`,
   `tests/sites/meteoswiss/test_write.py::test_write_identifier_param_mismatch`.
 
 #### FR-STORE-006 Canonical identifier values
@@ -721,13 +743,18 @@ nothing was archived`, and FDB is unchanged. v1 installs `NoGuard`.
 After archiving and flushing, one `inspect` of the query counts the fields whose time
 is at or after `t_start`, taken from FDB's index clock just before the first
 `archive()`. Fewer than `n` raises `<query>: <local> has <n> fields, the query expands
-to <E>; <k> landed outside the query or are duplicates (they stay in FDB ...)`.
+to <E>; <k> landed outside the query or are duplicates: message <i> (<keys>), ... (they
+stay in FDB ...)`. Named are the messages whose key, on the query keys FDB indexes, no
+fresh field has, at most three, each with the keys of its own MARS keys that contradict
+the query plus the keys the query gives several values.
 
-- Rationale: native mode cannot pre-check keys, and in any mode a message may land
-  outside the query. Taking `t_start` from `int(time.time())` would reject fresh fields
+- Rationale: the pre-checks (FR-STORE-003, FR-STORE-005) cannot compare every key
+  (`to`/`by` ranges, values that are not comparable), so a message may still land
+  outside the query and the error must say which one and why.
+  Taking `t_start` from `int(time.time())` would reject fresh fields
   stamped with the previous second (architecture.md §8.7, ADR-015).
 - Verification: test `tests/test_plugin.py::test_store_post_check_uses_fdb_clock`,
-  `::test_fdb_time_is_c_time`, `::test_store_strict_rejects`.
+  `::test_fdb_time_is_c_time`, `::test_store_post_check_names_offending_messages`.
 
 #### FR-STORE-010 Partial archive failures
 
@@ -1224,14 +1251,16 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-10 | Not usable as `--default-storage-provider`; no `--touch`; files only. |
 | L-11 | eccodes definition overrides depend on environment variables read at library load. |
 | L-12 | MeteoSwiss: `model` values need a MARS language override; accumulations need `timespan=fs`; COSMO paramIds (`500011`) must be used, not ECMWF ones (`2t`); `model` is listed lower-case (spelling warning for `ICON-CH2-EPS`); `eccodes-cosmo-mars` must be cloned (not on PyPI); no `eccodes-cosmo-resources` release for eccodes 2.48 yet. |
-| L-13 | `identifier_check=strict` is reserved; identifier mode's built-in check covers only constant query keys the message carries, with light normalisation. |
+| L-13 | `identifier_check=strict` is reserved; the built-in pre-check (both modes) covers only constant query keys the message carries, with light normalisation. |
 | L-14 | OGD data expires after 24 h, so samples cannot be re-fetched reproducibly; the committed MeteoSwiss samples have no real field values. |
-| L-15 | Site users supply definitions paths, a metkit home and (if the schema is not readable locally) `key_order`. Two providers with different definitions or languages in one process are not supported (last one wins, with a warning). |
+| L-15 | Site users supply definitions paths, a metkit home and (if the schema is not readable locally) `key_order`. Without a readable schema the plugin cannot tell which query keys FDB indexes, so it requires none of a message (FR-STORE-003) or a field (FR-READ-001). Two providers with different definitions or languages in one process are not supported (last one wins, with a warning). |
 | L-16 | The canonical key order depends on the provider's schema; one query used with two schemas gets two local paths (under separate prefixes anyway). |
 | L-17 | `archive_mode=identifier` with a multi-rule schema needs a value for every key mandatory in any rule; no rule matching. |
 | L-18 | Identifier mode cannot relabel GRIB that contradicts a single-valued query key; fix the GRIB first (e.g. `grib_set`). |
 | L-19 | Tagged settings (`TAG::VALUE`) do not reach spawned job processes (upstream Snakemake issue, architecture.md §11): `run:` rules under the local executor and every job under cluster or remote executors see the untagged value `TAG:VALUE`. Use untagged settings for such workflows, or `shell` rules with the local executor. |
 | L-20 | eccodes-cosmo-resources prints a definitions version warning per decoded message unless `ECCODES_VERSION_CHECK_OFF=1`, and decoding with the COSMO definitions truncates a stderr redirected to a shared file. |
+| L-22 | `inspect`/`retrieve` match through query keys the indexed fields do not have (`quantile=1:10` finds quantile-less fields), unlike `list` (architecture.md §13.4). Mitigated by the key check of FR-READ-001; a retrieval whose `inspect` returns matching and non-matching fields together fails on the byte count instead (FR-READ-007). |
+| L-23 | Native mode cannot label a key the message does not carry: naming such a key in the query is an error (FR-STORE-003). Use `archive_mode=identifier`, set the key in the GRIB, or drop it from the query. |
 | L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error (FR-ERR-004). |
 | L-25 | Snakemake refuses `--touch` for the whole workflow, not only for FDB outputs, as soon as one output is an FDB query; FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
@@ -1272,5 +1301,6 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
 | D-009 | qubed | Not useful for v1; revisit for compressed summaries of large FDB listings (architecture.md §13.12). |
 | D-010 | Withdrawn | Snakemake plugin catalogue pages will not be included (decided 2026-09-15); see §6.1. |
+| D-012 | Report the `inspect` vs `list` discrepancy upstream | `inspect`/`retrieve` match through query keys absent from the indexed fields while `list` does not (L-22, architecture.md §13.4); same behaviour on pyfdb 5.21.4.23 and 5.23.2. Open an issue on `ecmwf/fdb` asking whether this is intended; drop the plugin-side key check (FR-READ-001) if it is ever fixed. |
 | D-013 | Report the `{provider}` formatting of invalid-query messages upstream | `snakemake/storage.py:205-209` (snakemake 9.27.0) formats the provider object into the catalogue URL of an invalid query, so a plugin without `__str__` produces `.../plugins/storage/<...StorageProvider object at 0x...>.html`. The plugin works around it with `StorageProvider.__str__` (FR-IFACE-002); upstream should use the plugin name. |
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |
