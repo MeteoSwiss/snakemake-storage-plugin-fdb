@@ -581,6 +581,11 @@ process only (§13.8). The patch is guarded: a missing attribute or an unexpecte
 signature gives a warning and Snakemake's behaviour (L-21, R-14). `input_tracking=query`
 skips it.
 
+The patch does not depend on the provenance backend (FR-IFACE-005): `_input_changed`,
+`_input` and `_get_key` are defined on `PersistenceBase`, and `--persistence-backend db`
+only replaces how a record is stored and read (§13.8). Both backends key the record of a
+storage file by its query text and are covered by the end-to-end tests.
+
 ## 9. Architecture decisions
 
 All decisions are dated 2026-09-15 (design and implementation) unless the entry gives
@@ -1026,7 +1031,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-11 | COSMO definitions open `/dev/stderr` as a file, truncating a stderr redirected to a regular file (also with `ECCODES_VERSION_CHECK_OFF=1`) [verified: eccodes 2.47.3 + cosmo-mars + cosmo-resources 2.47.0.1]. | Decoding jobs log stderr to their own file (MeteoSwiss example). |
 | R-12 | eckit `SeriousBug` backtraces are printed regardless of environment settings (L-7). | Accepted. |
 | R-13 | `fdb_time()` uses `ctypes.CDLL(None)`, Linux/glibc-specific. | Fallback to `int(time.time())`. |
-| R-14 | **Private Snakemake API.** Input tracking by lookup patches `PersistenceBase._input_changed` (ADR-034); a rename, a signature change, an override in a subclass, a changed format-version gate or a change of the recorded form of storage inputs (today `storage_object.query` verbatim, from `_input`) would silently restore query tracking or break the patch. | Guarded installation with a warning and a fallback (L-21); the signature of the hook and the recorded form are asserted by `tests/test_rerun.py::test_persistence_private_api_is_stable`; the end-to-end tests check the behaviour; `input_tracking=query` as an escape hatch; upstream hook (requirements.md D-011). |
+| R-14 | **Private Snakemake API.** Input tracking by lookup patches `PersistenceBase._input_changed` (ADR-034); a rename, a signature change, an override in a subclass, a changed format-version gate or a change of the recorded form of storage inputs (today `storage_object.query` verbatim, from `_input`) would silently restore query tracking or break the patch. The patch is independent of the provenance backend, because `_input_changed` and `_input` are defined on `PersistenceBase` and `FilePersistence`/`DbPersistence` override only the storage of a record (§13.8); an override of the hook in a subclass would defeat it. | Guarded installation with a warning and a fallback (L-21); the signature of the hook and the recorded form are asserted by `tests/test_rerun.py::test_persistence_private_api_is_stable`; the end-to-end tests check the behaviour on both backends; `input_tracking=query` as an escape hatch; upstream hook (requirements.md D-011). |
 | R-15 | FDB request semantics: `inspect`/`retrieve` match through query keys the indexed fields lack while `list` does not (§13.4, L-22); the plugin's own key check (FR-READ-001) depends on that asymmetry not changing meaning across FDB versions. | `test_exists_does_not_match_through_absent_key` pins both behaviours; the `pyfdb-latest` canary runs it on 5.23; report upstream (requirements.md D-012). |
 | R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
@@ -1352,6 +1357,28 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   once per output file (`_bool_or_gen`, `:116-120`), returns `False` for records older
   than format version 4, and otherwise compares `self.input(file)` with `self._input(job)`
   [verified: snakemake 9.27.0].
+- `--persistence-backend db` selects `DbPersistence` (`persistence/db.py:49`), default
+  URL `sqlite:///<workdir>/.snakemake/metadata.db`, any SQLAlchemy URL through
+  `--persistence-backend-db-url`. It overrides only how records, locks and incomplete
+  marks are stored (`_read_record`/`_write_record` and the other `_`-prefixed storage
+  hooks); `_get_key` (`persistence/__init__.py:450-452`, `storage_object.query` for
+  storage files), `_input`, `_input_changed`, `finished`, `has_metadata` and
+  `cleanup_metadata` stay on `PersistenceBase`. A record is a `MetadataRecord` row
+  (table `snakemake_metadata`) whose `input` is a JSON column, keyed by
+  `(namespace, target)`: `target` is the same key the file backend base64-encodes into a
+  file name, `namespace` is the absolute path of the workdir's `.snakemake`
+  (`db.py:73`), so one database can serve several workdirs — but a workdir copied or
+  moved elsewhere no longer finds its records, while the file backend's records travel
+  with the directory [verified: snakemake 9.27.0, a copied workdir reports "Nothing to
+  be done" instead of rerunning]. SQLite pragmas and a `busy_timeout` of at least 10 s
+  (or `latency_wait`) are applied, with `journal_mode=PERSIST`/`synchronous=OFF` on a
+  network filesystem (`db.py:146-165`); the Snakemake documentation calls the backend
+  experimental and warns about SQLite on a network filesystem.
+- FDB queries work as record keys on both backends: records are written for FDB outputs
+  and read back by `--summary`, the rerun decisions of ADR-034 are the same, and
+  `--cleanup-metadata` fails on an `fdb://` argument in the same way (L-25) [verified:
+  snakemake 9.27.0, `tests/test_rerun.py` and `tests/test_workflow.py` parametrised over
+  `file` and `db` with the default SQLite URL].
 
 ### 13.9 MeteoSwiss conventions (`eccodes-cosmo-mars`, evalml)
 

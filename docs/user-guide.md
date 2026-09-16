@@ -384,6 +384,21 @@ Snakemake API for the default (`lookup`); when that is unavailable it logs
 `query`. After upgrading from 0.2.0, rules with FDB inputs rerun once, because 0.2.0
 recorded no FDB input at all; later versions record what Snakemake records.
 
+### Provenance backends
+
+Rerun decisions read Snakemake's provenance metadata, and both of its backends are
+supported and tested: the default file backend and `--persistence-backend db`, which
+keeps the records in a database (SQLite under `.snakemake/metadata.db` unless
+`--persistence-backend-db-url` names another SQLAlchemy URL). FDB queries are recorded
+and read back the same way on both, so the table above holds either way; only the
+default SQLite URL is tested. Two properties of the `db` backend are worth knowing:
+Snakemake calls it experimental, and it keys records by the absolute path of the
+workdir, so a workflow directory that is copied or moved elsewhere no longer finds its
+records and reports "Nothing to be done" where the file backend would rerun. For
+parallel runs — a cluster workflow whose jobs share one workdir on a network filesystem
+— follow Snakemake's own advice and point `--persistence-backend-db-url` at a real
+database server instead of a SQLite file on that filesystem.
+
 When a job does rerun and writes an FDB output, the new fields mask the old ones: the
 output still exists, its modification time advances and reads return the new data.
 Masked fields use disk space until an FDB administrator runs `fdb purge`.

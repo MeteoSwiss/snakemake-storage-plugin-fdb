@@ -5,6 +5,11 @@ directory next to a copy of ``examples/ecmwf/``; Snakemake runs as a subprocess 
 the documented command (``--storage-fdb-config ../../.fdb/config.yaml -c1``, untagged,
 default ``native`` archive mode). All runs happen once per module; logs are written to
 ``<tmp>/logs/``.
+
+The stages that touch provenance metadata (the two runs, ``--summary`` and
+``--delete-all-output``) run once per persistence backend (FR-IFACE-005); the stages
+that do not (globbing, the configuration through the environment) run for the file
+backend only, and their tests skip for the db one.
 """
 
 import shutil
@@ -22,6 +27,7 @@ pytestmark = pytest.mark.skipif(
     not (SAMPLES / "template.grib").exists(), reason="no ECMWF samples"
 )
 
+BACKENDS = ("file", "db")  # --persistence-backend (FR-IFACE-005)
 OUTPUT_REQUEST = {
     "class": "ea",
     "expver": "0002",
@@ -75,18 +81,25 @@ def _fields(config: Path) -> list[dict[str, str]]:
     return [f.key for f in Backend(config).inspect(OUTPUT_REQUEST)]
 
 
-@pytest.fixture(scope="module")
-def workflow(tmp_path_factory, run_logged) -> dict:
-    """Runs, in order: init, the example twice, a glob workflow (keeping local
-    copies), ``--delete-all-output``. The ``Run`` of each stage, the paths, and what
-    the later stages change: the ``done`` file, the local copy and the FDB fields
+@pytest.fixture(scope="module", params=BACKENDS)
+def workflow(request, tmp_path_factory, run_logged) -> dict:
+    """Runs, in order: init, the example twice, ``--summary``, a glob workflow (keeping
+    local copies), ``--delete-all-output``. The ``Run`` of each stage, the paths, and
+    what the later stages change: the ``done`` file, the local copy and the FDB fields
     after the first run."""
-    tmp = tmp_path_factory.mktemp("workflow")
+    backend = request.param
+    tmp = tmp_path_factory.mktemp(f"workflow-{backend}")
     run = run_logged(tmp / "logs")
     config = tmp / ".fdb" / "config.yaml"
     example = tmp / "examples" / "ecmwf"
     glob = tmp / "examples" / "glob"
-    out: dict = {"tmp": tmp, "config": config, "example": example, "glob_dir": glob}
+    out: dict = {
+        "tmp": tmp,
+        "config": config,
+        "example": example,
+        "glob_dir": glob,
+        "backend": backend,
+    }
 
     def snakemake(
         name: str,
@@ -96,7 +109,8 @@ def workflow(tmp_path_factory, run_logged) -> dict:
         env: dict[str, str] | None = None,
     ) -> None:
         flag = ["--storage-fdb-config", config] if config else []
-        cmd = [sys.executable, "-m", "snakemake", *flag, "-c1", *args]
+        cmd = [sys.executable, "-m", "snakemake", *flag]
+        cmd += ["--persistence-backend", backend, "-c1", *args]
         out[name] = run(name, cmd, cwd, env=env)
 
     init = [sys.executable, INIT_DEV_FDB, "--root", tmp / ".fdb"]
@@ -108,22 +122,29 @@ def workflow(tmp_path_factory, run_logged) -> dict:
     out["local_after_run1"] = (example / OUTPUT_LOCAL).exists()
     out["done"] = (example / "done" / "20200101.txt").read_text()
     snakemake("run2", example)
+    snakemake("summary", example, "--summary")
 
-    glob.mkdir()
-    (glob / "Snakefile").write_text(GLOB_SNAKEFILE)
-    snakemake("glob", glob, "--keep-storage-local-copies")
+    if backend == "file":  # stages that do not touch the provenance metadata
+        glob.mkdir()
+        (glob / "Snakefile").write_text(GLOB_SNAKEFILE)
+        snakemake("glob", glob, "--keep-storage-local-copies")
 
-    # FR-CONF-008: the same configuration through the environment variable, and the
-    # hint when there is none at all (FR-ERR-005).
-    env = {"SNAKEMAKE_STORAGE_FDB_CONFIG": "../../.fdb/config.yaml"}
-    snakemake("env_var", example, "--dry-run", config=None, env=env)
-    no_config = tmp / "examples" / "no-config"
-    no_config.mkdir()
-    (no_config / "Snakefile").write_text(GLOB_SNAKEFILE)
-    snakemake("no_config", no_config, "--dry-run", config=None)
+        # FR-CONF-008: the same configuration through the environment variable, and
+        # the hint when there is none at all (FR-ERR-005).
+        env = {"SNAKEMAKE_STORAGE_FDB_CONFIG": "../../.fdb/config.yaml"}
+        snakemake("env_var", example, "--dry-run", config=None, env=env)
+        no_config = tmp / "examples" / "no-config"
+        no_config.mkdir()
+        (no_config / "Snakefile").write_text(GLOB_SNAKEFILE)
+        snakemake("no_config", no_config, "--dry-run", config=None)
 
     snakemake("delete", example, "--delete-all-output")
     return out
+
+
+def _file_backend_only(workflow: dict) -> None:
+    if workflow["backend"] != "file":
+        pytest.skip("stage runs for the file backend only")
 
 
 def test_init_dev_fdb_seeds_samples_and_variants(workflow):
@@ -155,7 +176,19 @@ def test_workflow_second_run_nothing_to_be_done(workflow):
     assert run2.NOTHING_TO_BE_DONE in run2.ok()
 
 
+def test_workflow_summary_lists_the_fdb_output(workflow):
+    """FR-IFACE-005: on both backends ``--summary`` reads the record of the FDB output
+    back, keyed by its query text, and reports it up to date."""
+    rows = {
+        line.split("\t")[0]: line.split("\t")
+        for line in workflow["summary"].ok().splitlines()
+        if len(line.split("\t")) == 6
+    }
+    assert rows[OUTPUT_QUERY][4:] == ["ok", "no update"]
+
+
 def test_workflow_glob_wildcards_steps(workflow):
+    _file_backend_only(workflow)
     workflow["glob"].ok()
     glob = workflow["glob_dir"]
     assert (glob / "steps.txt").read_text().split() == ["0", "6", "12"]
@@ -165,6 +198,7 @@ def test_workflow_glob_wildcards_steps(workflow):
 
 def test_workflow_config_from_environment_variable(workflow):
     """FR-CONF-008: SNAKEMAKE_STORAGE_FDB_CONFIG replaces --storage-fdb-config."""
+    _file_backend_only(workflow)
     log = workflow["env_var"].ok()
     assert "FDB configuration error" not in log
     assert workflow["env_var"].NOTHING_TO_BE_DONE in log
@@ -172,6 +206,7 @@ def test_workflow_config_from_environment_variable(workflow):
 
 def test_workflow_without_any_configuration_hints(workflow):
     """FR-ERR-005: the bundled default schema names the missing configuration."""
+    _file_backend_only(workflow)
     log = workflow["no_config"].log
     assert workflow["no_config"].returncode != 0
     assert "no FDB configuration was given: set --storage-fdb-config" in log

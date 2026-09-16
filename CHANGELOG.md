@@ -12,6 +12,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `docs/patterns.md`, a usage-patterns guide with complete workflows for query shapes,
   rule directives, writing outputs, reruns and site setup; every example in it is
   executed by `tests/test_patterns.py`.
+- Support for both of Snakemake's provenance backends: the end-to-end tests now run with
+  the file backend and with `--persistence-backend db` (SQLite), covering the metadata
+  of FDB outputs, `--summary` and every rerun decision. Note that the `db` backend keys
+  records by the absolute workdir path, so a copied or moved workflow directory loses
+  its provenance.
 
 ### Changed
 

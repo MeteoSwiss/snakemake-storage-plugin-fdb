@@ -1058,6 +1058,23 @@ fields on `--delete-all-output`.
 - Verification: test `tests/test_workflow.py` (all tests); demonstration: the quick start
   in [`README.md`](../../README.md).
 
+#### FR-IFACE-005 Both provenance backends
+
+The plugin works with either value of Snakemake's `--persistence-backend`: the file
+backend and the `db` backend (SQLAlchemy, SQLite by default). Records for FDB inputs and
+outputs are written and read back under their query text, `--summary` reports FDB
+outputs as `ok`, and the rerun decisions of FR-RERUN-001 and FR-RERUN-002 are the same
+on both backends, including for jobs that run in a spawned process.
+
+- Rationale: the backend is a workflow-wide choice of the user, not of the plugin; the
+  input-set trigger is decided in a private Snakemake hook (ADR-034) that both backends
+  inherit, so the coupling has to be verified rather than assumed.
+- Verification: `tests/test_rerun.py` (fixtures `reruns` and `chain`) and
+  `tests/test_workflow.py` (fixture `workflow`), each parametrised over `file` and `db`.
+- Note: only the default SQLite URL is tested; other SQLAlchemy backends are untested.
+  With the `db` backend the records are keyed by the absolute workdir path, so a copied
+  or moved workdir loses its provenance (architecture.md §13.8).
+
 ### 2.13 Site support
 
 #### FR-SITE-001 MeteoSwiss end to end

@@ -3,14 +3,18 @@
 The unit tests patch ``snakemake.persistence.PersistenceBase`` in this process and
 restore it through ``monkeypatch``; the end-to-end tests run ``snakemake`` in
 subprocesses against a dev FDB in a temporary directory, like ``test_workflow.py``.
+Each end-to-end fixture runs once per provenance backend (FR-IFACE-005): the file
+backend and ``--persistence-backend db`` with its default SQLite URL.
 """
 
 import inspect
 import json
 import logging
 import shutil
+import sqlite3
 import sys
 import time
+from base64 import urlsafe_b64decode
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -110,6 +114,7 @@ rule local_files:
     shell:
         "cat {input} > {output}"
 """
+BACKENDS = ("file", "db")  # --persistence-backend (FR-IFACE-005)
 FDB_TARGETS = ["out/fields.txt", "out/fields_run.txt"]
 REFACTOR_TARGETS = ["out/merged_to_split.txt", "out/split_to_merged.txt"]
 
@@ -154,6 +159,12 @@ rule consume:
     shell:
         "cat {input} > {output}"
 """
+
+PRODUCED = (  # the FDB output of ``rule produce`` for param 167
+    "fdb://class=ea,expver=0002,stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+CLEANUP_FAILED = "Failed to clean up metadata for the following files"
 
 LOGGER = logging.getLogger("fdb-test")
 
@@ -372,8 +383,16 @@ def _archive(config: Path, params: tuple[int, ...], steps: tuple[int, ...]) -> N
     backend.flush()
 
 
-def _drop_fdb_inputs(work: Path) -> int:
-    """Remove the FDB queries from the recorded input sets, as 0.2.0 wrote them."""
+def _drop_fdb_inputs(work: Path, backend: str) -> int:
+    """Remove the FDB queries from the recorded input sets, as 0.2.0 wrote them.
+
+    ``work`` is a copy of the directory the records were written in. The db backend
+    keys its records by the absolute path of the workdir's ``.snakemake`` (namespace),
+    so the copied records are rewritten to the copy's namespace as well; the file
+    backend's records live in the copied directory and need no rewrite.
+    """
+    if backend == "db":
+        return _drop_fdb_inputs_db(work / ".snakemake")
     dropped = 0
     for record in (work / ".snakemake" / "metadata").rglob("*"):
         if not record.is_file():
@@ -389,14 +408,53 @@ def _drop_fdb_inputs(work: Path) -> int:
     return dropped
 
 
-def _workflow(tmp_path_factory, run_logged, name: str, snakefile: str):
-    """A seeded dev FDB and a workflow directory: the runs by name, and a runner."""
+def _drop_fdb_inputs_db(snakemake_dir: Path) -> int:
+    """``_drop_fdb_inputs`` for ``snakemake_metadata`` in the SQLite metadata db."""
+    dropped = 0
+    namespace = str(snakemake_dir.absolute())
+    with sqlite3.connect(snakemake_dir / "metadata.db") as db:
+        rows = db.execute(
+            "SELECT namespace, target, input FROM snakemake_metadata"
+        ).fetchall()
+        for old_namespace, target, raw in rows:
+            inputs = json.loads(raw) if raw else []
+            kept = [i for i in inputs if not i.startswith("fdb://")]
+            dropped += len(inputs) - len(kept)
+            db.execute(
+                "UPDATE snakemake_metadata SET namespace = ?, input = ? "
+                "WHERE namespace = ? AND target = ?",
+                (namespace, json.dumps(kept), old_namespace, target),
+            )
+    return dropped
+
+
+def _recorded_targets(work: Path, backend: str) -> set[str]:
+    """The keys the provenance records are stored under: the query text of a storage
+    file (``PersistenceBase._get_key``), on either backend."""
+    root = work / ".snakemake"
+    if backend == "db":
+        with sqlite3.connect(root / "metadata.db") as db:
+            return {t for (t,) in db.execute("SELECT target FROM snakemake_metadata")}
+    targets = set()
+    for record in (root / "metadata").rglob("*"):
+        if record.is_file():  # base64 of the key, split over directories at "@"
+            parts = record.relative_to(root / "metadata").parts
+            targets.add(urlsafe_b64decode("".join(p.lstrip("@") for p in parts)))
+    return {t.decode() for t in targets}
+
+
+def _workflow(tmp_path_factory, run_logged, name: str, snakefile: str, backend: str):
+    """A seeded dev FDB and a workflow directory: the runs by name, and a runner.
+
+    Every run uses ``backend`` as the provenance backend (FR-IFACE-005); ``db`` means
+    ``--persistence-backend db`` with its default SQLite file under the workdir.
+    """
     if not (SAMPLES / "template.grib").exists():
         pytest.skip("no ECMWF samples")
-    tmp = tmp_path_factory.mktemp(name)
+    tmp = tmp_path_factory.mktemp(f"{name}-{backend}")
     run = run_logged(tmp / "logs")
     config, work = tmp / ".fdb" / "config.yaml", tmp / "work"
-    out: dict = {"config": config, "work": work}
+    out: dict = {"config": config, "work": work, "backend": backend}
     init = [
         sys.executable,
         INIT_DEV_FDB,
@@ -414,16 +472,19 @@ def _workflow(tmp_path_factory, run_logged, name: str, snakefile: str):
         """One run; ``--config`` last, it swallows what follows."""
         settings = [f"{k}={v}" for k, v in conf.items()]
         cmd = [sys.executable, "-m", "snakemake", "--storage-fdb-config", str(config)]
+        cmd += ["--persistence-backend", backend]
         cmd += ["-c1", *args, *(["--config", *settings] if settings else [])]
         out[name] = run(name, cmd, cwd)
 
     return out, snakemake
 
 
-@pytest.fixture(scope="module")
-def reruns(tmp_path_factory, run_logged) -> dict:
-    """A full run, then the dry runs of the scenarios named below."""
-    out, snakemake = _workflow(tmp_path_factory, run_logged, "rerun", SNAKEFILE)
+@pytest.fixture(scope="module", params=BACKENDS)
+def reruns(request, tmp_path_factory, run_logged) -> dict:
+    """A full run, then the dry runs of the scenarios named below, per backend."""
+    out, snakemake = _workflow(
+        tmp_path_factory, run_logged, "rerun", SNAKEFILE, request.param
+    )
     config, work = out["config"], out["work"]
     _archive(config, params=(166,), steps=(0, 6, 12))  # older than every output
     (work / "a.txt").write_text("a\n")
@@ -435,7 +496,7 @@ def reruns(tmp_path_factory, run_logged) -> dict:
 
     legacy = work.parent / "legacy"
     shutil.copytree(work, legacy)
-    out["dropped"] = _drop_fdb_inputs(legacy)
+    out["dropped"] = _drop_fdb_inputs(legacy, out["backend"])
     snakemake("legacy", *FDB_TARGETS, "-n", cwd=legacy)
 
     snakemake("narrow", *FDB_TARGETS, "-n", param="167")
@@ -497,16 +558,22 @@ def test_rerun_record_without_fdb_inputs(reruns):
     assert INPUT_CHANGED in reruns["legacy"].ok()
 
 
-@pytest.fixture(scope="module")
-def chain(tmp_path_factory, run_logged) -> dict:
+@pytest.fixture(scope="module", params=BACKENDS)
+def chain(request, tmp_path_factory, run_logged) -> dict:
     """A producer with one FDB output per parameter and a consumer of all of them:
-    a full run, the run after a parameter is added, and a dry run after it."""
-    out, snakemake = _workflow(tmp_path_factory, run_logged, "chain", CHAIN)
+    a full run, the run after a parameter is added, and a dry run after it; per
+    backend, so that the metadata of FDB outputs is read back from both."""
+    out, snakemake = _workflow(
+        tmp_path_factory, run_logged, "chain", CHAIN, request.param
+    )
     snakemake("first", params="167")
     out["first"].ok()
+    out["recorded"] = _recorded_targets(out["work"], out["backend"])
     snakemake("added_plan", "-n", params="167/165")
     snakemake("added", params="167/165")
     snakemake("settled", "-n", params="167/165")
+    snakemake("summary", "--summary", params="167/165")
+    snakemake("cleanup_metadata", "--cleanup-metadata", PRODUCED, params="167/165")
     return out
 
 
@@ -522,3 +589,24 @@ def test_chain_added_parameter_is_archived(chain):
     """The new fields are archived and the consumer sees them; the next run is idle."""
     assert "Storing in storage" in chain["added"].ok()
     assert chain["settled"].NOTHING_TO_BE_DONE in chain["settled"].ok()
+
+
+def test_chain_metadata_of_fdb_outputs(chain):
+    """FR-IFACE-005: on both backends the record of an FDB output is keyed by its
+    query text and read back by ``--summary`` as up to date."""
+    assert PRODUCED in chain["recorded"]
+    summary = [line.split("\t") for line in chain["summary"].ok().splitlines()]
+    rows = {line[0]: line for line in summary if len(line) == 6}
+    assert rows[PRODUCED][2] == "produce"
+    assert rows[PRODUCED][4:] == ["ok", "no update"]
+
+
+def test_chain_cleanup_metadata_of_an_fdb_output(chain):
+    """L-25 holds for both backends: Snakemake path-normalises the ``fdb://`` argument
+    of ``--cleanup-metadata`` to ``fdb:/``, so no record is found."""
+    log = chain["cleanup_metadata"].log
+    assert chain["cleanup_metadata"].returncode != 0
+    assert CLEANUP_FAILED in log
+    assert PRODUCED.replace("fdb://", "fdb:/") in log
+    kept = _recorded_targets(chain["work"], chain["backend"])
+    assert PRODUCED in kept  # the record itself is untouched

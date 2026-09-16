@@ -32,6 +32,23 @@ FDBs are created in pytest's temporary directories. The end-to-end tests
 `snakemake` in subprocesses with a clean environment and write each stage's output to a
 log file under pytest's temporary directory.
 
+The end-to-end fixtures that touch Snakemake's provenance metadata run once per
+persistence backend (FR-IFACE-005): `reruns` and `chain` in `tests/test_rerun.py` and
+`workflow` in `tests/test_workflow.py` are parametrised over `file` and `db`, and every
+`snakemake` call of a fixture passes `--persistence-backend <param>`. The `db` variant
+uses the default SQLite URL under the run's temporary workdir. Stages that have nothing
+to do with metadata (globbing, the configuration through the environment) run for the
+file backend only, and their tests skip for `db`. The db variants add about 40 s to the
+suite. To run one backend alone:
+
+```bash
+uv run pytest -q tests/test_rerun.py tests/test_workflow.py -k "[db"       # db only
+uv run pytest -q tests/test_rerun.py tests/test_workflow.py -k "not [db"   # file only
+```
+
+The `[` selects the parameter id; plain `-k db` would also match every test whose name
+contains `fdb`.
+
 ### The examples in `docs/patterns.md`
 
 Every workflow in [`patterns.md`](patterns.md) is executed by `tests/test_patterns.py`
