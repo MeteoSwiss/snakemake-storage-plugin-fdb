@@ -152,7 +152,7 @@ the process environment.
 - `Backend`: a per-thread archiving handle and a fresh handle per read (§8.6);
   `inspect`, `list`, `retrieve_to` (atomic, FR-READ-007), `archive`, `flush`, `expand`
   (§8.8) and `spelling_diffs`. It propagates pyfdb's `RuntimeError`s; callers map them
-  with `map_error` (§8.4).
+  with `map_error` (§8.4); `is_transient` classifies them for the retry policy (§8.5).
 - `Field(key, length, timestamp, uri_path)`: one inspected or listed field (`length` 0
   and `uri_path` `None` below level 3).
 - `fallback_expand` and `count_fields` (§8.8), `fdb_time()` (§8.7).
@@ -242,6 +242,10 @@ No native library is loaded in steps 1–4 except by provider construction (§8.
    `Backend.inspect` on a fresh handle (§8.5, §8.6).
 3. `exists` compares the field count with `E` (§8.8). `mtime` is the maximum field time
    (index timestamp, else `os.stat`). `size` sums message lengths.
+4. `exists` and `inventory` take the result from `_exists(fields)`: `0 < n < E` warns with
+   `_missing_message` once per query and process, `n = 0` only logs it at debug level
+   (FR-READ-008). Snakemake never reaches `retrieve_object`'s error for an object it was
+   told does not exist.
 
 ### 6.3 Retrieve
 
@@ -405,23 +409,41 @@ plain `RuntimeError` (§13.11); matching is by substring, in order:
 | `UserError` | `Invalid MARS request <query>: <detail>` (+ `metkit_home` hint if `cannot expand`) |
 | `Cannot find a metkit SplitterBuilder` | `<local file or query> is not GRIB` |
 | `Keywords not used`, `Could not find [`, `Could not find a rule` | `GRIB keys do not match the FDB schema for <query> (<local>): <detail>` |
-| `Cannot open`, `No writable roots available` | `FDB configuration error: <detail>` |
+| `Cannot open`, `No writable roots available` | `FDB configuration error: <detail>` (+ the no-configuration hint if the detail names `fdb5lib/etc/fdb/schema`) |
+| `Failed system call`, `Failed to mkdir`, `Permission denied`, `No space left on device`, `Read-only file system` | `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the FDB configuration)` |
 | (`GribError`) | its message |
 | other | re-raised |
 
-`<detail>` is the first non-empty line with leading `UserError: ` and `Serious bug: `
-prefixes removed (metkit doubles the prefix).
+`_kind` does the marker scan; `map_error` formats the row it returns, and `is_transient`
+(§8.5) treats an unmatched exception as transient. `<detail>` is the first non-empty
+line with leading `UserError: ` and `Serious bug: ` prefixes removed (metkit doubles the
+prefix), cut before ` request=` (metkit appends the request and its expansion) or the
+first `;`, without a trailing ` (Success)` (§13.7), and truncated to `DETAIL_MAX` = 200
+characters with `…`, so the plugin's sentence and any hint after it stay readable
+(FR-ERR-001). `StorageObject._mapping_errors`, the one place that raises the mapped
+error, logs the full text at debug level on the provider's logger.
+
+`resolve_config` adds the mangled-tagged-setting hint of FR-ERR-005 when a value that is
+neither a file nor a YAML mapping matches `TAG:<existing file>` (L-19).
 
 ### 8.5 Retries
 
-`_retry_fdb_io(f) = retry_decorator(f).retry_with(reraise=True)`: the interface's tenacity
-policy (3 attempts, exponential wait from 3 s), but raising the last attempt's own
-exception so it can be mapped (hence the direct `tenacity` dependency). Applied only to
-`StorageObject._inspect`, `_retrieve_to` and `_list`, which back `exists`, `mtime`,
-`size`, `inventory`, `retrieve_object`, the store post-check and glob. Plugin logic
-errors (invalid request from expansion, missing fields, spelling errors,
-`FileNotFoundError` from `mtime`) are deterministic and not retried. Archiving is never
-retried (ADR-028).
+`_retry_fdb_io(f) = retry_decorator(f).retry_with(reraise=True,
+retry=retry_if_exception(is_transient))`: the interface's tenacity policy (3 attempts,
+exponential wait from 3 s), but raising the last attempt's own exception so it can be
+mapped (hence the direct `tenacity` dependency) and retrying only failures that may be
+transient. Applied only to `StorageObject._inspect`, `_retrieve_to` and `_list`, which
+back `exists`, `mtime`, `size`, `inventory`, `retrieve_object`, the store post-check and
+glob.
+
+`backend.is_transient(exc)` is true for an `Exception` that `_kind` (§8.4) does not
+classify: everything the mapping table lists — invalid request, not GRIB, schema
+mismatch, configuration error, OS-level I/O error and `GribError` — is permanent and
+raised on the first attempt; any other `Exception` is retried, and `BaseException`s
+(`KeyboardInterrupt`) are never retried, as with tenacity's default predicate (ADR-033).
+Plugin logic errors (invalid request from expansion, missing fields, spelling
+errors, `FileNotFoundError` from `mtime`) are raised outside the retried helpers and
+never retried either. Archiving is never retried (ADR-028).
 
 ### 8.6 FDB handles: fresh reads, per-thread archives
 
@@ -805,6 +827,20 @@ design round, provided requirements, architecture and code are updated together.
 - Consequences: implementation history is dropped; decisions, verified facts, limitations
   and deferred work are kept in the two design documents.
 
+### ADR-033 Retry classification by the error mapping
+
+- Context: the retry policy retried every exception, so a permanent failure (a typo in
+  the configuration, an unreadable root, an invalid MARS request reaching FDB) cost
+  about 10 s per query, and a dry run over many queries became minutes of waiting
+  [verified: `read-glob-config` stress test, 10.3 s for `No writable roots available`].
+- Decision: derive the classification from the error mapping: whatever §8.4 maps is
+  permanent, every other `Exception` is retried. `_kind`, the marker scan, is shared by
+  `map_error` and `is_transient`; no second list of markers is maintained.
+- Status: accepted; reversible (2026-09-16).
+- Consequences: a marker added to §8.4 also stops that error being retried, which is the
+  intended coupling; an unmapped permanent error is still retried three times, which is
+  the safe direction. The predicate is pure and builds no message.
+
 ## 10. Quality requirements
 
 Quality scenarios are the non-functional requirements in
@@ -828,6 +864,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-11 | COSMO definitions open `/dev/stderr` as a file, truncating a stderr redirected to a regular file (also with `ECCODES_VERSION_CHECK_OFF=1`) [verified: eccodes 2.47.3 + cosmo-mars + cosmo-resources 2.47.0.1]. | Decoding jobs log stderr to their own file (MeteoSwiss example). |
 | R-12 | eckit `SeriousBug` backtraces are printed regardless of environment settings (L-7). | Accepted. |
 | R-13 | `fdb_time()` uses `ctypes.CDLL(None)`, Linux/glibc-specific. | Fallback to `int(time.time())`. |
+| R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
 | TD-2 | No ECMWF sample fetch script. | D-008. |
 
@@ -985,7 +1022,12 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   `FDB_CONFIG_FILE` (`FDB5_CONFIG_FILE`), else `$FDB_HOME/etc/fdb/{config.yaml,schema}`
   [verified: run + `src/fdb5/config/Config.cc:88-125`]. FDB also tries
   `<program name>.{yaml,json}` in `$FDB_HOME/etc/fdb/`; a missing `FDB_CONFIG_FILE` gives
-  the empty skeleton config [verified: source].
+  the empty skeleton config [verified: source]. With no configuration from any source,
+  the skeleton config points at the schema bundled in the wheel,
+  `<site-packages>/fdb5lib/etc/fdb/schema`, which does not exist: the first FDB call
+  fails with `Cannot open .../fdb5lib/etc/fdb/schema` (the marker of the
+  no-configuration hint, §8.4) [verified: pyfdb 5.21.4 wheel; `FDB_CONFIG_FILE` and
+  `FDB5_CONFIG_FILE` are both honoured].
 - `FDB(config)` does not validate: a missing schema fails at first use with
   `Cannot open <path>  (No such file or directory)`, a missing root with
   `Unexpected state: No writable roots available. Configured roots: [...]` (also for
@@ -1004,6 +1046,9 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   the process (> 60 s). `METKIT_LANGUAGE_STRICT_MODE=0` does not relax enum checks. This
   contradicts evalml's comment that there is no config-based override (its
   `patch_metkit_language.py` edits the installed file).
+- eckit appends the `errno` text to a failed system call even when `errno` is 0, giving
+  messages such as `Failed system call: opendir (Success)` [verified: `chmod 000` on an
+  FDB root, pyfdb 5.21.4].
 
 ### 13.8 Snakemake core behaviour
 
@@ -1085,6 +1130,20 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   in [verified: scalar and list forms, snakemake 9.27.0].
 - `TestStorageBase._test_storage` writes the text `test` into the local path before
   `store_object()` (`tests.py:86-90`).
+- A settings field with `metadata={"env_var": True}` gets `env_var=SNAKEMAKE_<CLI PREFIX
+  IN UPPER CASE>_<NAME>`, e.g. `SNAKEMAKE_STORAGE_FDB_CONFIG`
+  (`snakemake_interface_common/plugin_registry/plugin.py:165-166`, `get_envvar`).
+  Snakemake's parser is a `configargparse.ArgumentParser`
+  (`snakemake/common/argparse.py`), whose precedence is command line, then environment
+  variable, then default. An environment variable is a single string even for the
+  `nargs="+"` that tagged values use, so it carries one (possibly `TAG::`-tagged) value
+  [verified: `convert_item_to_command_line_arg`; end to end with
+  `SNAKEMAKE_STORAGE_FDB_CONFIG` in `tests/test_workflow.py`].
+- Plugin settings' help texts get no automatic `(default: ...)`: the defaults shown by
+  `snakemake --help` are the ones written into the help strings [verified: `snakemake
+  --help` on 9.27.0 before this was added].
+- `storage.py:205-209` formats the provider object into the plugin-catalogue URL of an
+  invalid-query error, so a provider without `__str__` shows its `repr` (D-013).
 
 ### 13.9 MeteoSwiss conventions (`eccodes-cosmo-mars`, evalml)
 

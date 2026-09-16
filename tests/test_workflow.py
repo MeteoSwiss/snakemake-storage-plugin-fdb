@@ -88,9 +88,16 @@ def workflow(tmp_path_factory, run_logged) -> dict:
     glob = tmp / "examples" / "glob"
     out: dict = {"tmp": tmp, "config": config, "example": example, "glob_dir": glob}
 
-    def snakemake(name: str, cwd: Path, *args: str) -> None:
-        cmd = [sys.executable, "-m", "snakemake", "--storage-fdb-config"]
-        out[name] = run(name, [*cmd, "../../.fdb/config.yaml", "-c1", *args], cwd)
+    def snakemake(
+        name: str,
+        cwd: Path,
+        *args: str,
+        config: str | None = "../../.fdb/config.yaml",
+        env: dict[str, str] | None = None,
+    ) -> None:
+        flag = ["--storage-fdb-config", config] if config else []
+        cmd = [sys.executable, "-m", "snakemake", *flag, "-c1", *args]
+        out[name] = run(name, cmd, cwd, env=env)
 
     init = [sys.executable, INIT_DEV_FDB, "--root", tmp / ".fdb"]
     out["init"] = run("init", [*init, "--seed", "--variants"], tmp)
@@ -105,6 +112,15 @@ def workflow(tmp_path_factory, run_logged) -> dict:
     glob.mkdir()
     (glob / "Snakefile").write_text(GLOB_SNAKEFILE)
     snakemake("glob", glob, "--keep-storage-local-copies")
+
+    # FR-CONF-008: the same configuration through the environment variable, and the
+    # hint when there is none at all (FR-ERR-005).
+    env = {"SNAKEMAKE_STORAGE_FDB_CONFIG": "../../.fdb/config.yaml"}
+    snakemake("env_var", example, "--dry-run", config=None, env=env)
+    no_config = tmp / "examples" / "no-config"
+    no_config.mkdir()
+    (no_config / "Snakefile").write_text(GLOB_SNAKEFILE)
+    snakemake("no_config", no_config, "--dry-run", config=None)
 
     snakemake("delete", example, "--delete-all-output")
     return out
@@ -145,6 +161,20 @@ def test_workflow_glob_wildcards_steps(workflow):
     assert (glob / "steps.txt").read_text().split() == ["0", "6", "12"]
     for step in (0, 6, 12):  # --keep-storage-local-copies
         assert (glob / LOCAL_PREFIX / f"step={step}" / "param=167.grib").is_file()
+
+
+def test_workflow_config_from_environment_variable(workflow):
+    """FR-CONF-008: SNAKEMAKE_STORAGE_FDB_CONFIG replaces --storage-fdb-config."""
+    log = workflow["env_var"].ok()
+    assert "FDB configuration error" not in log
+    assert workflow["env_var"].NOTHING_TO_BE_DONE in log
+
+
+def test_workflow_without_any_configuration_hints(workflow):
+    """FR-ERR-005: the bundled default schema names the missing configuration."""
+    log = workflow["no_config"].log
+    assert workflow["no_config"].returncode != 0
+    assert "no FDB configuration was given: set --storage-fdb-config" in log
 
 
 def test_workflow_delete_all_output_leaves_fields(workflow):

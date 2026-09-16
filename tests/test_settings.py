@@ -39,6 +39,18 @@ SETTINGS = {
     "env": None,
 }
 
+# reference.md "Environment variables": settings the interface reads from
+# SNAKEMAKE_STORAGE_FDB_<NAME> (FR-CONF-008).
+ENV_VAR_SETTINGS = {
+    "config",
+    "user_config",
+    "eccodes_definitions",
+    "metkit_home",
+    "key_order",
+    "env",
+    "glob_required_keys",
+}
+
 
 def _metkit_home(path: Path) -> Path:
     (path / LANGUAGE_FILE).parent.mkdir(parents=True)
@@ -65,8 +77,18 @@ def test_settings_fields():
     for name, f in own.items():
         assert hints[name] == typing.Optional[str], name  # noqa: UP045
         assert f.metadata.get("help"), name
-        for key in ("nargs", "parse_func", "env_var"):
+        for key in ("nargs", "parse_func"):
             assert key not in f.metadata, (name, key)
+        assert bool(f.metadata.get("env_var")) == (name in ENV_VAR_SETTINGS), name
+
+
+def test_settings_help_names_the_default():
+    """FR-CONF-001: a plugin setting's help text ends with ``(default: ...)``."""
+    for f in fields(StorageProviderSettings):
+        if f.name in ("max_requests_per_second", "store_check"):  # store_check: none
+            continue
+        assert f"(default: {f.default or 'unset'}" in f.metadata["help"], f.name
+        assert f.metadata["help"].endswith(")"), f.name
 
 
 def test_settings_defaults_construct(make_provider):

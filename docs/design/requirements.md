@@ -317,12 +317,14 @@ The provider exposes the settings `config`, `user_config`, `archive_mode`,
 `glob_required_keys`, `eccodes_definitions`, `metkit_home`, `key_order` and `env`, all
 optional strings with the defaults of the [reference](../reference.md#settings), as
 `--storage-fdb-<name>` CLI flags, profile keys and `storage` directive arguments,
-taggable with `TAG::VALUE`. A setting given as `None` means its default.
+taggable with `TAG::VALUE`, some also as environment variables (FR-CONF-008). A setting
+given as `None` means its default. Every help text names the setting's default.
 
 - Rationale: every site difference is expressible through generic settings
-  (NFR-NEUTRAL-002).
+  (NFR-NEUTRAL-002); `snakemake --help` is where defaults are looked up.
 - Verification: test `tests/test_settings.py::test_settings_fields`,
-  `::test_settings_defaults_construct`, `::test_settings_none_means_default`;
+  `::test_settings_defaults_construct`, `::test_settings_none_means_default`,
+  `::test_settings_help_names_the_default`;
   demonstration `uv run snakemake --help` lists every flag.
 
 #### FR-CONF-002 FDB configuration forms
@@ -383,6 +385,20 @@ If `pyfdb` or `eccodes` cannot be imported at provider construction, the provide
 
 - Rationale: a clear message instead of an import traceback.
 - Verification: inspection (`StorageProvider.__post_init__`).
+
+#### FR-CONF-008 Settings from environment variables
+
+`config`, `user_config`, `eccodes_definitions`, `metkit_home`, `key_order`, `env` and
+`glob_required_keys` are also read from `SNAKEMAKE_STORAGE_FDB_<NAME>` (upper case), the
+interface's environment-variable mechanism: the CLI flag wins, then the variable, then
+the default. The variable holds one value and may be tagged (`TAG::VALUE`). The choice
+settings are deliberately excluded: they express workflow policy, not site setup.
+
+- Rationale: site setup belongs in the environment of a site's login profile or
+  container, next to `ECCODES_DEFINITION_PATH` and `METKIT_HOME`, not in every command
+  line (NFR-NEUTRAL-002).
+- Verification: test `tests/test_settings.py::test_settings_fields`,
+  `tests/test_workflow.py::test_workflow_config_from_environment_variable`.
 
 ### 2.4 Process environment
 
@@ -537,14 +553,24 @@ local path is untouched. Messages keep FDB's request order.
 
 #### FR-READ-008 Missing-field report
 
-Retrieving an incomplete object raises `<query>: <n> of <E> fields found in FDB;
-missing: <combinations>`, listing at most 10 missing combinations and `(and <k> more)`.
-A combination names the keys with several distinct values (all keys for a single-field
-query) in canonical key order. If nothing was found and the schema is known, the message
-also lists the optional schema keys the query does not name.
+The report is `<query>: <n> of <E> fields found in FDB; missing: <combinations>`,
+listing at most 10 missing combinations and `(and <k> more)`. A combination names the
+keys with several distinct values (all keys for a single-field query) in canonical key
+order. If nothing was found and the schema is known, the report also lists the optional
+schema keys the query does not name. It appears:
 
-- Rationale: omitted optional keys (`number`, `timespan`) are the usual cause.
+- as a `WorkflowError` from `retrieve_object()` on an incomplete object;
+- as a warning from `exists()` and `inventory()`, once per query and process, when FDB
+  holds some but not all fields (`0 < n < E`);
+- as a debug message from `exists()` and `inventory()` when `n = 0`.
+
+- Rationale: Snakemake calls `retrieve_object()` only for objects `exists()` reported
+  as present, so a partial input would otherwise be a bare "missing input" naming the
+  whole query. Nothing found is the normal state of an output not produced yet and must
+  not warn, but its optional-schema-key hint (the usual cause: omitted `number`,
+  `timespan`, `domain`) stays available with `--verbose`.
 - Verification: test `tests/test_plugin.py::test_exists_partial_retrieve_names_missing`,
+  `::test_exists_partial_warns_once`, `::test_exists_absent_object_does_not_warn`,
   `::test_exists_missing_optional_key_and_mtime_not_found`.
 
 #### FR-READ-009 Inventory
@@ -572,11 +598,17 @@ object) and see fields archived after an earlier read in the same process.
 
 FDB `inspect`, `retrieve` and `list` calls are retried with the interface's retry policy
 (3 attempts, exponential wait from 3 s); the last attempt's own exception is surfaced.
+Only failures that may be transient are retried: a failure the error mapping
+(FR-ERR-001, FR-ERR-004) classifies — invalid MARS request, not GRIB, GRIB keys against
+the schema, configuration error, OS-level I/O error — is raised on the first attempt.
 Errors raised by the plugin's own logic are not retried.
 
-- Rationale: transient file-system and network hiccups on shared FDBs.
+- Rationale: transient file-system and network hiccups on shared FDBs; a permanent
+  error must not cost about 10 s per query in a dry run (ADR-033).
 - Verification: test `tests/test_plugin.py::test_exists_retries_transient_inspect_error`,
-  `::test_glob_retries_transient_list_error`.
+  `::test_exists_retries_only_transient_errors`,
+  `::test_glob_retries_transient_list_error`,
+  `tests/test_backend.py::test_map_error_table`, `::test_is_transient_unmapped`.
 
 ### 2.6 Writing
 
@@ -818,12 +850,20 @@ metkit expansion the check is skipped.
 
 Known pyfdb failures (plain `RuntimeError`s) and GRIB errors are raised as Snakemake
 `WorkflowError`s naming the query and, where relevant, the local file: invalid requests,
-non-GRIB data, GRIB keys that do not match the schema, and configuration errors. The
-mapping is in architecture.md §8.4. Other exceptions propagate.
+non-GRIB data, GRIB keys that do not match the schema, configuration errors and
+OS-level I/O errors (FR-ERR-004). The mapping is in architecture.md §8.4. Other
+exceptions propagate.
 
-- Rationale: actionable messages instead of native backtraces.
+The pyfdb detail in the message is the first non-empty line without its
+`UserError: `/`Serious bug: ` prefixes and without the ` (Success)` suffix eckit appends
+when `errno` is 0, cut before metkit's `request=` dump or the first `;` and truncated to
+200 characters with `…`; the full text is logged at debug level.
+
+- Rationale: actionable messages instead of native backtraces; a metkit dump of the
+  whole MARS vocabulary buries the plugin's sentence and any hint after it.
 - Verification: test `tests/test_backend.py::test_map_error_table`,
-  `::test_map_error_without_local_and_unknown`, `::test_archive_native_errors_map`,
+  `::test_map_error_without_local_and_unknown`, `::test_map_error_detail_is_shortened`,
+  `::test_archive_native_errors_map`,
   `::test_invalid_request`.
 
 #### FR-ERR-002 Language hint
@@ -842,6 +882,37 @@ A storage object with an invalid query does not raise at construction; `parsed`,
 - Rationale: Snakemake validates queries separately and may construct objects early.
 - Verification: test `tests/test_plugin.py::test_storage_object_invalid_query_raises_on_use`.
 
+#### FR-ERR-004 OS-level I/O failures
+
+A pyfdb `RuntimeError` containing `Failed system call`, `Failed to mkdir`,
+`Permission denied`, `No space left on device` or `Read-only file system` is raised as
+`FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the
+FDB configuration)`.
+
+- Rationale: an unreadable or read-only FDB root escaped as a raw
+  `RuntimeError: Failed system call: opendir (Success)`, whose "Success" is actively
+  misleading; the class also tells the retry policy that the failure is permanent
+  (FR-READ-011).
+- Verification: test `tests/test_backend.py::test_map_error_table`,
+  `tests/test_plugin.py::test_exists_unreadable_root_is_an_io_error`.
+
+#### FR-ERR-005 Configuration hints
+
+Configuration errors carry a hint where the cause is known:
+
+- a `config`/`user_config` value that is neither an existing file nor a YAML mapping and
+  has the shape `TAG:<existing file>` ends with
+  `(looks like a tagged setting mangled by a spawned job, see the user guide on tagged
+  settings)` (L-19);
+- a configuration error naming the schema bundled with the pyfdb wheel
+  (`.../fdb5lib/etc/fdb/schema`) ends with `(no FDB configuration was given: set
+  --storage-fdb-config or FDB_CONFIG_FILE)`.
+
+- Rationale: both failures name a path the user never wrote and give no clue what to do.
+- Verification: test `tests/test_backend.py::test_resolve_config_tagged_setting_hint`,
+  `::test_map_error_table`,
+  `tests/test_workflow.py::test_workflow_without_any_configuration_hints`.
+
 ### 2.11 Snakemake integration
 
 #### FR-IFACE-001 Plugin surface
@@ -859,11 +930,14 @@ The plugin registers as `fdb`, is read-write (`StorageObjectRead`,
 
 `use_rate_limiter()` is false (`rate_limiter_key` `"fdb"`,
 `default_max_requests_per_second` 10.0); `safe_print` is the identity; the `managed_*`
-wrappers return what the plain methods return.
+wrappers return what the plain methods return; `str(provider)` is `fdb`.
 
 - Rationale: FDB access is local or cluster-internal; queries contain no secrets.
+  Snakemake formats the provider object into user-facing text, so the default `repr`
+  leaked `<snakemake_storage_plugin_fdb.StorageProvider object at 0x...>` into the
+  catalogue URL of an invalid-query message (D-013).
 - Verification: test `tests/test_plugin.py::test_provider_settings_rate_limiter_and_safe_print`,
-  `::test_managed_wrappers_without_rate_limiter`.
+  `::test_managed_wrappers_without_rate_limiter`, `::test_provider_str_is_the_plugin_name`.
 
 #### FR-IFACE-003 Example queries
 
@@ -1158,6 +1232,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-18 | Identifier mode cannot relabel GRIB that contradicts a single-valued query key; fix the GRIB first (e.g. `grib_set`). |
 | L-19 | Tagged settings (`TAG::VALUE`) do not reach spawned job processes (upstream Snakemake issue, architecture.md §11): `run:` rules under the local executor and every job under cluster or remote executors see the untagged value `TAG:VALUE`. Use untagged settings for such workflows, or `shell` rules with the local executor. |
 | L-20 | eccodes-cosmo-resources prints a definitions version warning per decoded message unless `ECCODES_VERSION_CHECK_OFF=1`, and decoding with the COSMO definitions truncates a stderr redirected to a shared file. |
+| L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error (FR-ERR-004). |
 | L-25 | Snakemake refuses `--touch` for the whole workflow, not only for FDB outputs, as soon as one output is an FDB query; FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
@@ -1197,4 +1272,5 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
 | D-009 | qubed | Not useful for v1; revisit for compressed summaries of large FDB listings (architecture.md §13.12). |
 | D-010 | Withdrawn | Snakemake plugin catalogue pages will not be included (decided 2026-09-15); see §6.1. |
+| D-013 | Report the `{provider}` formatting of invalid-query messages upstream | `snakemake/storage.py:205-209` (snakemake 9.27.0) formats the provider object into the catalogue URL of an invalid query, so a plugin without `__str__` produces `.../plugins/storage/<...StorageProvider object at 0x...>.html`. The plugin works around it with `StorageProvider.__str__` (FR-IFACE-002); upstream should use the plugin name. |
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |

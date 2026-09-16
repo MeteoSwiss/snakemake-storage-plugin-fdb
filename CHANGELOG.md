@@ -7,13 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The settings `config`, `user_config`, `eccodes_definitions`, `metkit_home`,
+  `key_order`, `env` and `glob_required_keys` can be given as the environment variables
+  `SNAKEMAKE_STORAGE_FDB_CONFIG` and friends; a command-line flag still wins.
+- A warning, once per query, when FDB holds some but not all fields of an input:
+  `FDB storage: <query>: 2 of 3 fields found in FDB; missing: step=12`. Snakemake
+  reports such an input as missing without ever showing the retrieve error.
+- OS-level FDB failures (unreadable or read-only root, full disk) are reported as
+  `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in
+  the FDB configuration)` instead of a raw `RuntimeError: Failed system call: opendir
+  (Success)`.
+- Hints for two confusing configuration errors: a tagged setting mangled by a spawned
+  job, and no FDB configuration at all.
+
 ### Changed
 
+- Only failures that may be transient are retried. An invalid MARS request, a
+  configuration error, a schema mismatch, data that is not GRIB and I/O errors now fail
+  on the first attempt instead of after three attempts and about 10 seconds.
+- Error messages keep only the first 200 characters of the pyfdb detail, cut before
+  metkit's `request=` dump; the full text is logged at debug level. Hints are no longer
+  buried behind a dump of the whole MARS vocabulary.
+- `snakemake --help` names the default of every plugin setting.
 - The generic example queries and the queries in the README and the documentation name
   `domain=g`, the key ECMWF `class=od`/`class=ea` fields are archived under.
 
 ### Fixed
 
+- Messages about an invalid FDB query no longer contain
+  `<snakemake_storage_plugin_fdb.StorageProvider object at 0x...>`.
 - Documentation: removal happens only with `--delete-all-output` (and does not make the
   producing job rerun); `temp()` and the other Snakemake flags cannot be combined with
   storage; `--touch`, command-line targets, `--cleanup-metadata`, `ensure(non_empty)`,

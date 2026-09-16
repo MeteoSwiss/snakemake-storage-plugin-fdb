@@ -42,10 +42,34 @@ _SCHEMA_COMMENT_RE = re.compile(r"#[^\n]*")
 _SCHEMA_KEY_RE = re.compile(r"\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*)", re.S)
 _USER_ERROR_PREFIX = re.compile(r"^(?:(?:UserError|Serious bug):\s*)+")
 
-# Substrings of pyfdb RuntimeError messages (architecture.md §8.4; pyfdb 5.21.4.23)
-_SPLITTER = "Cannot find a metkit SplitterBuilder"
-_SCHEMA_MISMATCH = ("Keywords not used", "Could not find [", "Could not find a rule")
-_CONFIG = ("Cannot open", "No writable roots available")
+# Substrings of pyfdb RuntimeError messages, in matching order (architecture.md §8.4;
+# pyfdb 5.21.4.23). A ``RuntimeError`` matching none of them is treated as transient.
+_KINDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("request", ("UserError",)),
+    ("not_grib", ("Cannot find a metkit SplitterBuilder",)),
+    ("schema", ("Keywords not used", "Could not find [", "Could not find a rule")),
+    ("config", ("Cannot open", "No writable roots available")),
+    (
+        "io",
+        (
+            "Failed system call",
+            "Failed to mkdir",
+            "Permission denied",
+            "No space left on device",
+            "Read-only file system",
+        ),
+    ),
+)
+_IO_HINT = " (check permissions, free space and the roots in the FDB configuration)"
+# The schema pyfdb falls back to when no FDB configuration is given at all.
+_BUNDLED_SCHEMA = "fdb5lib/etc/fdb/schema"
+_NO_CONFIG_HINT = (
+    " (no FDB configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)"
+)
+DETAIL_MAX = 200  # characters of pyfdb detail kept in a message (architecture.md §8.4)
+_DETAIL_CUT = re.compile(r"\srequest=|;")
+# eckit appends the errno text even when errno is 0, which reads as a success.
+_ERRNO_SUCCESS = re.compile(r"\s*\(Success\)$")
 
 
 @dataclass(frozen=True)
@@ -101,14 +125,25 @@ def resolve_config(value: str | None) -> Path | str | None:
     except yaml.YAMLError as e:
         raise WorkflowError(
             f"FDB configuration error: {value!r} is neither an existing file nor "
-            f"valid YAML: {e}"
+            f"valid YAML: {e}{_tag_hint(value)}"
         ) from e
     if not isinstance(parsed, dict):
         raise WorkflowError(
             f"FDB configuration error: {value!r} is neither an existing file nor an "
-            "inline YAML mapping"
+            f"inline YAML mapping{_tag_hint(value)}"
         )
     return value
+
+
+def _tag_hint(value: str) -> str:
+    """Hint for ``TAG:VALUE`` left by a spawned job's mangled tagged setting (L-19)."""
+    tag, sep, rest = value.partition(":")
+    if tag and sep and _is_file(rest):
+        return (
+            " (looks like a tagged setting mangled by a spawned job, see the user "
+            "guide on tagged settings)"
+        )
+    return ""
 
 
 def _is_file(value: str | os.PathLike[str]) -> bool:
@@ -275,8 +310,33 @@ def count_fields(expanded: Mapping[str, list[str]]) -> int:
 
 
 def _detail(exc: BaseException) -> str:
+    """The short detail of a pyfdb failure (architecture.md §8.4): the first non-empty
+    line without the ``UserError: ``/``Serious bug: `` prefixes and a trailing
+    ``(Success)``, cut before metkit's ``request=`` dump or the first ``;``, and
+    truncated to ``DETAIL_MAX`` characters with ``…``."""
     lines = [line for line in str(exc).splitlines() if line.strip()]
-    return _USER_ERROR_PREFIX.sub("", lines[0].strip()) if lines else type(exc).__name__
+    if not lines:
+        return type(exc).__name__
+    detail = _USER_ERROR_PREFIX.sub("", lines[0].strip())
+    if m := _DETAIL_CUT.search(detail):
+        detail = detail[: m.start()].rstrip(" ,")
+    detail = _ERRNO_SUCCESS.sub("", detail)
+    if len(detail) > DETAIL_MAX:
+        detail = detail[:DETAIL_MAX].rstrip() + "…"
+    return detail
+
+
+def _kind(exc: BaseException) -> str | None:
+    """The row of the mapping table (architecture.md §8.4) ``exc`` falls in, ``None``
+    for an unknown failure."""
+    if isinstance(exc, GribError):
+        return "grib"
+    if isinstance(exc, RuntimeError):
+        text = str(exc)
+        for kind, markers in _KINDS:
+            if any(marker in text for marker in markers):
+                return kind
+    return None
 
 
 def map_error(
@@ -287,13 +347,14 @@ def map_error(
     The caller raises the result ``from exc`` or re-raises ``exc`` when ``None``
     (mapping table: architecture.md §8.4).
     """
-    if isinstance(exc, GribError):
-        return WorkflowError(str(exc))
-    if not isinstance(exc, RuntimeError):
+    kind = _kind(exc)
+    if kind is None:
         return None
+    if kind == "grib":
+        return WorkflowError(str(exc))
     text = str(exc)
     detail = _detail(exc)
-    if "UserError" in text:
+    if kind == "request":
         hint = ""
         if "cannot expand" in text:
             hint = (
@@ -301,16 +362,24 @@ def map_error(
                 "language that defines it)"
             )
         return WorkflowError(f"Invalid MARS request {query}: {detail}{hint}")
-    if _SPLITTER in text:
+    if kind == "not_grib":
         return WorkflowError(f"{local if local is not None else query} is not GRIB")
-    if any(marker in text for marker in _SCHEMA_MISMATCH):
+    if kind == "schema":
         where = f" ({local})" if local is not None else ""
         return WorkflowError(
             f"GRIB keys do not match the FDB schema for {query}{where}: {detail}"
         )
-    if any(marker in text for marker in _CONFIG):
-        return WorkflowError(f"FDB configuration error: {detail}")
-    return None
+    if kind == "config":
+        hint = _NO_CONFIG_HINT if _BUNDLED_SCHEMA in text else ""
+        return WorkflowError(f"FDB configuration error: {detail}{hint}")
+    return WorkflowError(f"FDB I/O error for {query}: {detail}{_IO_HINT}")
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether a retry may succeed (ADR-033, architecture.md §8.5): an ``Exception``
+    that ``map_error`` does not classify. ``BaseException``s such as
+    ``KeyboardInterrupt`` are never retried."""
+    return isinstance(exc, Exception) and _kind(exc) is None
 
 
 class Backend:

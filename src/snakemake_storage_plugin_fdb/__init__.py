@@ -8,6 +8,7 @@ Importing this module loads no FDB/eccodes native library: ``is_valid_query`` an
 
 import contextlib
 import itertools
+import logging
 import os
 import re
 import threading
@@ -33,6 +34,7 @@ from snakemake_interface_storage_plugins.storage_provider import (
     StorageProviderBase,
     StorageQueryValidationResult,
 )
+from tenacity import retry_if_exception
 
 from .backend import (
     Backend,
@@ -41,6 +43,7 @@ from .backend import (
     count_fields,
     fallback_expand,
     fdb_time,
+    is_transient,
     map_error,
     parse_schema,
     resolve_config,
@@ -73,9 +76,11 @@ _ENV_LOCK = threading.Lock()
 # to warn when two providers disagree (one process environment, architecture.md §8.3).
 _APPLIED: dict[str, str] = {}
 # Queries already warned about (once per process): non-canonical spelling
-# (FR-SPELL-001) and remove_policy=warn (FR-REMOVE-001).
+# (FR-SPELL-001), remove_policy=warn (FR-REMOVE-001) and partially present
+# queries (FR-READ-008).
 _SPELLING_WARNED: set[str] = set()
 _REMOVE_WARNED: set[str] = set()
+_PARTIAL_WARNED: set[str] = set()
 _WARNED_LOCK = threading.Lock()
 MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
 STAY_NOTE = "they stay in FDB until the next successful store masks them"
@@ -93,8 +98,11 @@ def _first_time(registry: set[str], query: str) -> bool:
 def _retry_fdb_io(func):
     """The interface's ``retry_decorator`` (3 attempts, exponential wait from 3 s)
     raising the last attempt's own exception instead of tenacity's ``RetryError``,
-    so it can be mapped (architecture.md §8.5)."""
-    return retry_decorator(func).retry_with(reraise=True)
+    so it can be mapped, and retrying only failures that may be transient
+    (architecture.md §8.5, ADR-033)."""
+    return retry_decorator(func).retry_with(
+        reraise=True, retry=retry_if_exception(is_transient)
+    )
 
 
 # typing.Optional, not "X | None": Snakemake unwraps only typing.Optional for the CLI.
@@ -104,30 +112,34 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=None,
         metadata={
             "help": "FDB configuration: path to a YAML file or inline YAML/JSON text. "
-            "Default: FDB's own environment (FDB_CONFIG, FDB_CONFIG_FILE, FDB_HOME).",
+            "(default: unset, FDB's own environment: FDB_CONFIG, FDB_CONFIG_FILE, "
+            "FDB_HOME)",
+            "env_var": True,
         },
     )
     user_config: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
             "help": "FDB user configuration (e.g. 'useSubToc: true'): path to a YAML "
-            "file or inline YAML/JSON text.",
+            "file or inline YAML/JSON text. (default: unset)",
+            "env_var": True,
         },
     )
     archive_mode: Optional[str] = field(  # noqa: UP045
         default="native",
         metadata={
-            "help": "How outputs are archived: 'native' (default; FDB derives the keys "
-            "from the GRIB) or 'identifier' (the plugin builds the FDB key of every "
-            "message; use it only with schemas whose rules share one key set, or "
-            "supply the other keys in the query).",
+            "help": "How outputs are archived: 'native' (FDB derives the keys from the "
+            "GRIB) or 'identifier' (the plugin builds the FDB key of every message; "
+            "use it only with schemas whose rules share one key set, or supply the "
+            "other keys in the query). (default: native)",
         },
     )
     identifier_check: Optional[str] = field(  # noqa: UP045
         default="none",
         metadata={
             "help": "Check of identifiers against GRIB metadata before archiving: "
-            "'none'. 'strict' is reserved and not implemented in this version.",
+            "'none'. 'strict' is reserved and not implemented in this version. "
+            "(default: none)",
         },
     )
     store_check: Optional[str] = field(  # noqa: UP045
@@ -141,50 +153,56 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default="warn",
         metadata={
             "help": "Query values FDB spells differently (e.g. param=2t vs 167): "
-            "'warn', 'error' or 'ignore'.",
+            "'warn', 'error' or 'ignore'. (default: warn)",
         },
     )
     remove_policy: Optional[str] = field(  # noqa: UP045
         default="warn",
         metadata={
             "help": "FDB cannot delete fields; what removing an output does: 'warn' "
-            "(no-op with a warning), 'ignore' (silent no-op) or 'error'.",
+            "(no-op with a warning), 'ignore' (silent no-op) or 'error'. "
+            "(default: warn)",
         },
     )
     glob_required_keys: Optional[str] = field(  # noqa: UP045
         default="class",
         metadata={
             "help": "Comma list of keys that must be constant in glob_wildcards "
-            "patterns.",
+            "patterns. (default: class)",
+            "env_var": True,
         },
     )
     eccodes_definitions: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
             "help": "Colon-separated eccodes definitions directories, prepended in "
-            "order to ECCODES_DEFINITION_PATH.",
+            "order to ECCODES_DEFINITION_PATH. (default: unset)",
+            "env_var": True,
         },
     )
     metkit_home: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
             "help": "Directory exported as METKIT_HOME for a custom MARS language; "
-            "must contain share/metkit/language.yaml.",
+            "must contain share/metkit/language.yaml. (default: unset)",
+            "env_var": True,
         },
     )
     key_order: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
             "help": "Comma list of keys defining the canonical key order of queries "
-            "and local paths. Default: the FDB schema's rule order, else a generic "
-            "MARS order.",
+            "and local paths. (default: unset, the FDB schema's rule order, else a "
+            "generic MARS order)",
+            "env_var": True,
         },
     )
     env: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
             "help": "Environment overrides NAME=VALUE[,NAME=VALUE] exported before the "
-            "FDB libraries load (e.g. FDB_HOME=/path).",
+            "FDB libraries load (e.g. FDB_HOME=/path). (default: unset)",
+            "env_var": True,
         },
     )
 
@@ -416,6 +434,11 @@ class StorageProvider(StorageProviderBase):
     def safe_print(self, query: str) -> str:
         return query
 
+    def __str__(self) -> str:
+        """The plugin name: Snakemake formats the provider into user-facing text
+        such as the catalogue URL of an invalid query (``snakemake/storage.py``)."""
+        return "fdb"
+
 
 class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     """One query: a MARS request mapped to one local GRIB file (FR-QUERY-002)."""
@@ -488,13 +511,15 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def _mapping_errors(
         self, local: str | os.PathLike[str] | None = None
     ) -> Iterator[None]:
-        """Known pyfdb and GRIB failures as ``WorkflowError`` (architecture.md §8.4)."""
+        """Known pyfdb and GRIB failures as ``WorkflowError`` (architecture.md §8.4);
+        the message keeps a short detail, the full text goes to the debug log."""
         try:
             yield
         except (RuntimeError, GribError) as e:
             mapped = map_error(e, self.query, local)
             if mapped is None:
                 raise
+            self.provider.logger.debug(f"FDB storage: full error text: {e}")
             raise mapped from e
 
     def _expanded(self) -> dict[str, list[str]]:
@@ -621,6 +646,25 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             )
         return message
 
+    def _exists(self, fields: list[Field]) -> bool:
+        """``_complete``, reporting an incomplete result (FR-READ-008).
+
+        Snakemake reports an incomplete input as missing without ever calling
+        ``retrieve_object``, so the error there would never be seen. A partial answer
+        is warned about once per query; nothing found is the normal case of an output
+        that does not exist yet, so it only goes to the debug log (with the
+        optional-schema-key hint).
+        """
+        if self._complete(fields):
+            return True
+        logger = self.provider.logger
+        if fields:
+            if _first_time(_PARTIAL_WARNED, self.query):
+                logger.warning(f"FDB storage: {self._missing_message(fields)}")
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"FDB storage: {self._missing_message(fields)}")
+        return False
+
     # --- read path (requirements.md §2.5) ---------------------------------------------
 
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
@@ -629,7 +673,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         if key in cache.exists_in_storage:
             return
         fields = self._fields()
-        exists = self._complete(fields)
+        exists = self._exists(fields)
         cache.exists_in_storage[key] = exists
         if exists:
             cache.mtime[key] = Mtime(storage=self._mtime_of(fields))
@@ -644,7 +688,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     def exists(self) -> bool:
         """All fields the query expands to are in FDB (FR-READ-001)."""
-        return self._complete(self._fields())
+        return self._exists(self._fields())
 
     def mtime(self) -> float:
         fields = self._fields()

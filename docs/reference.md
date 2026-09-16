@@ -11,28 +11,32 @@ Every setting is available as a Snakemake CLI flag, a profile key (the flag with
 `TAG::VALUE` for a tagged provider (`storage <tag>:`), e.g.
 `--storage-fdb-config prod::/etc/fdb/prod.yaml scratch::.fdb/config.yaml`. All plugin
 settings are optional strings (`typing.Optional[str]`); an unset setting takes its
-default. Settings are validated when the provider is constructed.
+default. Settings are validated when the provider is constructed. The settings marked
+"env" below are also read from `SNAKEMAKE_STORAGE_FDB_<NAME>` (see
+[Environment variables](#environment-variables)); the CLI flag wins over the variable,
+the variable over the default.
 
 | name | CLI flag | default | allowed values | description |
 |---|---|---|---|---|
-| `config` | `--storage-fdb-config` | unset: FDB's own environment (`FDB_CONFIG`, `FDB_CONFIG_FILE`, `FDB_HOME`) | path to an existing file (made absolute), or inline YAML/JSON text that parses as a mapping | FDB configuration, passed to `pyfdb.FDB(config, ...)`. |
-| `user_config` | `--storage-fdb-user-config` | unset | as `config` | FDB user configuration (e.g. `useSubToc: true`). |
+| `config` | `--storage-fdb-config` (env) | unset: FDB's own environment (`FDB_CONFIG`, `FDB_CONFIG_FILE`, `FDB_HOME`) | path to an existing file (made absolute), or inline YAML/JSON text that parses as a mapping | FDB configuration, passed to `pyfdb.FDB(config, ...)`. |
+| `user_config` | `--storage-fdb-user-config` (env) | unset | as `config` | FDB user configuration (e.g. `useSubToc: true`). |
 | `archive_mode` | `--storage-fdb-archive-mode` | `native` | `native`, `identifier` | How outputs are archived: `native` (FDB derives the keys from the GRIB) or `identifier` (the plugin builds each message's FDB key; use it only with schemas whose rules share one key set, or supply the other keys in the query). |
 | `identifier_check` | `--storage-fdb-identifier-check` | `none` | `none` (`strict` is reserved and rejected) | Check of identifiers against GRIB metadata before archiving. |
 | `store_check` | `--storage-fdb-store-check` | `strict` | `strict`, `warn` | `strict`: a stored file must provide exactly the fields its query expands to; `warn`: fewer fields are allowed and logged. |
 | `canonical_spelling` | `--storage-fdb-canonical-spelling` | `warn` | `warn`, `error`, `ignore` | What to do when query values are spelled differently from FDB (e.g. `param=2t` vs `167`). |
 | `remove_policy` | `--storage-fdb-remove-policy` | `warn` | `warn`, `ignore`, `error` | FDB cannot delete fields; what removing an output does: no-op with a warning, silent no-op, or error. |
-| `glob_required_keys` | `--storage-fdb-glob-required-keys` | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
-| `eccodes_definitions` | `--storage-fdb-eccodes-definitions` | unset | colon list of existing directories (made absolute; empty entries skipped; `/MEMFS/...` entries passed as is) | Prepended in order to `ECCODES_DEFINITION_PATH`. |
-| `metkit_home` | `--storage-fdb-metkit-home` | unset | directory containing `share/metkit/language.yaml` (made absolute) | Exported as `METKIT_HOME` for a custom MARS language. |
-| `key_order` | `--storage-fdb-key-order` | unset: the FDB schema's rule order, else the generic MARS order | comma list of distinct key names (an empty value is ignored, like unset) | Canonical key order of queries and local paths. |
-| `env` | `--storage-fdb-env` | unset | `NAME=VALUE[,NAME=VALUE]`; names `[A-Za-z_][A-Za-z0-9_]*`; values may contain `=`, not `,`; no duplicate names | Environment overrides exported before the FDB libraries load (e.g. `FDB_HOME=/path`). |
+| `glob_required_keys` | `--storage-fdb-glob-required-keys` (env) | `class` | comma list of key names (lower-cased); empty disables the check | Keys that must be constant in `glob_wildcards` patterns. |
+| `eccodes_definitions` | `--storage-fdb-eccodes-definitions` (env) | unset | colon list of existing directories (made absolute; empty entries skipped; `/MEMFS/...` entries passed as is) | Prepended in order to `ECCODES_DEFINITION_PATH`. |
+| `metkit_home` | `--storage-fdb-metkit-home` (env) | unset | directory containing `share/metkit/language.yaml` (made absolute) | Exported as `METKIT_HOME` for a custom MARS language. |
+| `key_order` | `--storage-fdb-key-order` (env) | unset: the FDB schema's rule order, else the generic MARS order | comma list of distinct key names (an empty value is ignored, like unset) | Canonical key order of queries and local paths. |
+| `env` | `--storage-fdb-env` (env) | unset | `NAME=VALUE[,NAME=VALUE]`; names `[A-Za-z_][A-Za-z0-9_]*`; values may contain `=`, not `,`; no duplicate names | Environment overrides exported before the FDB libraries load (e.g. `FDB_HOME=/path`). |
 | `max_requests_per_second` | `--storage-fdb-max-requests-per-second` | unset | float | Inherited from the interface; unused, the rate limiter is disabled. |
 
 ## Environment variables
 
 | variable | plugin behaviour |
 |---|---|
+| `SNAKEMAKE_STORAGE_FDB_CONFIG`, `..._USER_CONFIG`, `..._ECCODES_DEFINITIONS`, `..._METKIT_HOME`, `..._KEY_ORDER`, `..._ENV`, `..._GLOB_REQUIRED_KEYS` | Read by Snakemake's argument parser as the value of the matching setting; the CLI flag wins, then the variable, then the default. One value per variable, optionally tagged `TAG::VALUE`. |
 | `ECCODES_DEFINITION_PATH` | Read and prepended to with `eccodes_definitions` (skipped if it already starts with those directories). Read by eccodes, metkit and FDB. |
 | `METKIT_HOME` | Set from `metkit_home` (overriding a different existing value is logged at info level). Its effective value, from any source, must contain `share/metkit/language.yaml`. Read by metkit. |
 | `ECKIT_EXCEPTION_IS_SILENT` | Set to `1` if unset. `scripts/init_dev_fdb.py` and `tests/conftest.py` default it too. |
@@ -149,11 +153,11 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `postprocess_query` | Normalisation above; records the result for the wildcard guard. |
 | `example_queries` | Three generic examples (single date pattern with `step=0/6/12`, one ensemble analysis field, a `to/by` range over three parameters). |
 | `local_suffix` | Local path mapping above. |
-| `exists` | One `inspect`; true iff the expanded request's field count `E > 0` and exactly `E` fields are found. |
+| `exists` | One `inspect`; true iff the expanded request's field count `E > 0` and exactly `E` fields are found. Warns once per query if some but not all fields are found. |
 | `mtime` | One `inspect`; latest index timestamp of the found fields (POSIX seconds; `os.stat` of the data file for timestamp 0, else 0 with a warning); `FileNotFoundError("no fields in FDB for <query>")` if none. |
 | `size`, `local_footprint` | One `inspect`; sum of the found fields' message lengths. |
 | `checksum` | `None` (Snakemake hashes the local copy). |
-| `inventory` | One `inspect`; fills existence, and for existing objects mtime and size, for `cache_key()`; no-op if already cached. |
+| `inventory` | One `inspect`; fills existence, and for existing objects mtime and size, for `cache_key()`; no-op if already cached. Warns like `exists`. |
 | `get_inventory_parent` | `None`. |
 | `retrieve_object` | Requires `exists`; streams `retrieve` into `<local>.part` in 8 MiB chunks, fsyncs, checks the byte count, renames over the local path; removes the part file on any error. |
 | `store_object` | Expands the query, splits the local file into GRIB messages, checks the count against `E` (`store_check`), builds identifiers and pre-checks them (`identifier` mode) or uses each message's `mars` keys (`native`), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store. Never retried. |
@@ -167,13 +171,17 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 request with metkit first (once per object and query), which runs the canonical-spelling
 check and raises invalid requests before any FDB I/O. Queries with unresolved wildcards
 raise `FDB query <query> has unresolved wildcards`. The FDB `inspect`, `retrieve` and
-`list` calls are retried (3 attempts, exponential wait from 3 s) and use a fresh FDB handle
-each.
+`list` calls use a fresh FDB handle each and are retried (3 attempts, exponential wait
+from 3 s) unless the failure is one of the mapped permanent ones below (invalid MARS
+request, not GRIB, GRIB keys against the schema, configuration error, I/O error), which
+is raised on the first attempt.
 
 ## Errors and messages
 
 All errors are Snakemake `WorkflowError`s unless noted. `<detail>` is the first line of the
-pyfdb error without `UserError: `/`Serious bug: ` prefixes.
+pyfdb error without `UserError: `/`Serious bug: ` prefixes and without a trailing
+` (Success)`, cut before metkit's `request=` dump or the first `;` and truncated to 200
+characters with `…`; the full text is logged at debug level.
 
 ### Provider construction
 
@@ -188,6 +196,7 @@ pyfdb error without `UserError: `/`Serious bug: ` prefixes.
 | `eccodes_definitions: '<entry>' is not an existing directory` | bad definitions entry |
 | `METKIT_HOME=<dir> (from <metkit_home \| the env setting \| the environment>) has no share/metkit/language.yaml; FDB would hang instead of failing` | invalid metkit home |
 | `FDB configuration error: '<value>' is neither an existing file nor an inline YAML mapping` | `config`/`user_config` not a file and not a mapping |
+| `... (looks like a tagged setting mangled by a spawned job, see the user guide on tagged settings)` | appended when the value has the shape `TAG:<existing file>` (L-19) |
 | `FDB configuration error: '<value>' is neither an existing file nor valid YAML: <error>` | unparsable YAML |
 | `FDB configuration error: schema <path>: <detail>` | schema unreadable or without rule keys |
 | `cannot import the FDB/eccodes bindings: <error>` | `pyfdb` or `eccodes` not importable |
@@ -201,10 +210,12 @@ pyfdb error without `UserError: `/`Serious bug: ` prefixes.
 | `Invalid MARS request <query>: <detail>` | metkit rejects the request (unknown key or value, context error, several values for `class`/`stream`/`type`/`expver`) |
 | `... (if this value is valid for your FDB, point metkit_home at a MARS language that defines it)` | appended when `<detail>` contains `cannot expand` |
 | `Query <query> uses non-canonical spelling: <key>=<given> (canonical: <value>), <key>=<given> (<value>). Use canonical spellings to avoid duplicate local paths for the same field.` | `canonical_spelling=error` (a warning with `warn`) |
-| `<query>: <n> of <E> fields found in FDB; missing: <combinations> (and <k> more)` | retrieving an incomplete object; at most 10 combinations |
-| `. FDB matches keys exactly; optional schema keys not in the query: <keys>` | appended when nothing was found |
+| `<query>: <n> of <E> fields found in FDB; missing: <combinations> (and <k> more)` | retrieving an incomplete object; at most 10 combinations. Also logged, as a warning (`0 < n < E`) or at debug level (`n = 0`), by `exists` and `inventory` |
+| `. FDB matches keys exactly; optional schema keys not in the query: <keys>` | appended when nothing was found (so only in the retrieve error and the debug log) |
 | `retrieved <n> bytes for <local>, expected <m>` | retrieval byte count mismatch |
 | `FDB configuration error: <detail>` | `Cannot open ...` (e.g. missing schema), `No writable roots available ...` |
+| `... (no FDB configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)` | appended when `<detail>` names the schema bundled with the pyfdb wheel (`.../fdb5lib/etc/fdb/schema`) |
+| `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the FDB configuration)` | `Failed system call ...`, `Failed to mkdir ...`, `Permission denied`, `No space left on device`, `Read-only file system` |
 | `FDB glob pattern <query> needs constant values for <keys> (glob_required_keys)` | required key is a wildcard or absent |
 | `FileNotFoundError: no fields in FDB for <query>` | `mtime` of an absent object |
 
@@ -234,9 +245,12 @@ pyfdb error without `UserError: `/`Serious bug: ` prefixes.
 | warning | `Query <query> uses non-canonical spelling: ...` (once per query per process) |
 | warning | ``FDB cannot delete individual fields; existing fields for <query> will be masked by the next archive. Use `fdb purge` to reclaim space.`` (once per query per process) |
 | warning | `FDB storage: <query>: <local> has <n> fields, the query expands to <E> (store_check=warn)` |
+| warning | `FDB storage: <query>: <n> of <E> fields found in FDB; missing: ...` (once per query per process, when FDB holds some but not all fields) |
 | warning | `FDB storage: a field of <query> has no index timestamp and no local data file; its mtime is taken as 0` |
 | warning | `FDB storage: providers in one process use different <VARIABLE> settings (<a> vs <b>); the last one wins` |
 | info | `FDB storage: metkit_home overrides METKIT_HOME=<old> with <new>` |
+| debug | `FDB storage: <query>: 0 of <E> fields found in FDB ...` (nothing found; includes the optional-schema-key hint) |
+| debug | `FDB storage: full error text: <full pyfdb message>` (for every error mapped to a `WorkflowError`) |
 | debug | `FDB storage: <query>: no metkit expansion; query values are used as written (spelling check skipped, identifier values from the query archived verbatim)` |
 
 ## `scripts/init_dev_fdb.py`

@@ -14,6 +14,7 @@ from snakemake_storage_plugin_fdb.backend import (
     Backend,
     SchemaInfo,
     fallback_expand,
+    is_transient,
     map_error,
     parse_schema,
     resolve_config,
@@ -238,8 +239,8 @@ SPLITTER = (
         (
             RuntimeError("UserError: UserError: TypeEnum[name=class]: cannot expand "
                          "'zz' request=retrieve,class=zz, expanded=retrieve,"),
-            "Invalid MARS request fdb://q: TypeEnum[name=class]: cannot expand 'zz' "
-            "request=retrieve,class=zz, expanded=retrieve, (if this value is valid for "
+            "Invalid MARS request fdb://q: TypeEnum[name=class]: cannot expand 'zz'"
+            " (if this value is valid for "
             "your FDB, point metkit_home at a MARS language that defines it)",
         ),
         (
@@ -280,6 +281,40 @@ SPLITTER = (
             "FDB configuration error: Unexpected state: No writable roots available. "
             "Configured roots: [/x]",
         ),
+        (
+            RuntimeError("Cannot open /venv/lib/fdb5lib/etc/fdb/schema  "
+                         "(No such file or directory)"),
+            "FDB configuration error: Cannot open /venv/lib/fdb5lib/etc/fdb/schema  "
+            "(No such file or directory) (no FDB configuration was given: set "
+            "--storage-fdb-config or FDB_CONFIG_FILE)",
+        ),
+        (
+            RuntimeError("UserError: first clause; second clause"),
+            "Invalid MARS request fdb://q: first clause",
+        ),
+        (
+            RuntimeError("Failed system call: mkdir /fdb/root/ea:0001:oper (Success)"),
+            "FDB I/O error for fdb://q: Failed system call: mkdir /fdb/root/ea:0001:"
+            "oper (check permissions, free space and the roots in the FDB "
+            "configuration)",
+        ),
+        (
+            RuntimeError("Failed to mkdir /fdb/root/x (Permission denied)"),
+            "FDB I/O error for fdb://q: Failed to mkdir /fdb/root/x "
+            "(Permission denied) (check permissions, free space and the roots in the "
+            "FDB configuration)",
+        ),
+        (
+            RuntimeError("Write error: No space left on device"),
+            "FDB I/O error for fdb://q: Write error: No space left on device "
+            "(check permissions, free space and the roots in the FDB configuration)",
+        ),
+        (
+            RuntimeError("Failed system call: opendir (Read-only file system)"),
+            "FDB I/O error for fdb://q: Failed system call: opendir "
+            "(Read-only file system) (check permissions, free space and the roots in "
+            "the FDB configuration)",
+        ),
         (GribError("f.grib: trailing non-GRIB bytes at offset 7"),
          "f.grib: trailing non-GRIB bytes at offset 7"),
     ],
@@ -288,12 +323,51 @@ def test_map_error_table(exc, expected):
     mapped = map_error(exc, "fdb://q", local="out.grib")
     assert isinstance(mapped, WorkflowError)
     assert str(mapped) == expected
+    assert not is_transient(exc)  # ADR-033: every mapped failure is permanent
 
 
 def test_map_error_without_local_and_unknown():
     assert str(map_error(RuntimeError(SPLITTER), "fdb://q")) == "fdb://q is not GRIB"
     assert map_error(RuntimeError("something else"), "fdb://q") is None
     assert map_error(KeyError("UserError"), "fdb://q") is None
+
+
+def test_map_error_detail_is_shortened():
+    """FR-ERR-001: the plugin sentence first, the metkit dump cut off."""
+    vocabulary = ",".join(f"key{i}" for i in range(200))
+    exc = RuntimeError(
+        f"UserError: UserError: Cannot match [bogus] in [{vocabulary}] "
+        f"request=retrieve,bogus=42, expanded=retrieve,"
+    )
+    message = str(map_error(exc, "fdb://q"))
+    assert message.startswith("Invalid MARS request fdb://q: Cannot match [bogus] in [")
+    assert "request=" not in message
+    assert len(message) < 300 and message.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "exc, transient",
+    [
+        (RuntimeError("something else"), True),
+        (OSError("connection reset"), True),
+        (KeyboardInterrupt(), False),
+    ],
+)
+def test_is_transient_unmapped(exc, transient):
+    """ADR-033: unknown ``Exception``s are retried, ``BaseException``s never."""
+    assert is_transient(exc) is transient
+
+
+def test_resolve_config_tagged_setting_hint(tmp_path):
+    """L-19: a spawned job's mangled tagged setting is recognised."""
+    config = tmp_path / "config.yaml"
+    config.write_text("type: local\n")
+    with pytest.raises(WorkflowError) as e:
+        resolve_config(f"prod:{config}")
+    assert "mangled by a spawned job" in str(e.value)
+    with pytest.raises(WorkflowError) as e:
+        resolve_config(f"prod:{tmp_path / 'absent.yaml'}")
+    assert "mangled by a spawned job" not in str(e.value)
 
 
 def test_timestamp_of():

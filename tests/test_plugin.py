@@ -394,6 +394,37 @@ def test_exists_partial_retrieve_names_missing(seeded_provider):
 
 
 @needs_samples
+def test_exists_partial_warns_once(seeded_provider, caplog):
+    """FR-READ-008: a partially present input is warned about by ``exists`` and
+    ``inventory``, once per query."""
+    obj = seeded_provider().object(f"fdb://{EA},step=0/6/12/18,param=167")
+    cache = IOCache(max_wait_time=10)
+    with caplog.at_level(logging.WARNING):
+        assert obj.exists() is False
+        asyncio.run(obj.inventory(cache))
+    assert cache.exists_in_storage[obj.cache_key()] is False
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "3 of 4 fields found in FDB" in warnings[0]
+    assert warnings[0].endswith("missing: step=18")
+
+
+@needs_samples
+def test_exists_absent_object_does_not_warn(seeded_provider, caplog):
+    """Nothing found is the normal case of an output that does not exist yet: the
+    report, with the optional-schema-key hint, goes to the debug log (FR-READ-008)."""
+    obj = seeded_provider().object(
+        f"fdb://{EA.replace(',domain=g', '')},step=0,param=167"
+    )
+    with caplog.at_level(logging.DEBUG, logger="fdb-test"):
+        assert obj.exists() is False
+    assert not _warnings(caplog)
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("0 of 1 fields found in FDB" in m for m in debug)
+    assert any("optional schema keys not in the query: domain" in m for m in debug)
+
+
+@needs_samples
 def test_exists_missing_optional_key_and_mtime_not_found(seeded_provider):
     # the seeded fields carry domain=g; inspect needs it named (FR-READ-001)
     obj = seeded_provider().object(
@@ -426,17 +457,25 @@ def test_exists_wildcard_query_rejected(seeded_provider):
         obj.exists()
 
 
-def _fail_once(monkeypatch, provider: StorageProvider, method: str) -> list:
-    """Make ``provider.backend.<method>`` raise a transient error on its first call
-    and skip the retry sleep of the ``StorageObject`` wrapper; returns the call log."""
+def _failing(
+    monkeypatch,
+    provider: StorageProvider,
+    method: str,
+    exc: Exception | None = None,
+    *,
+    always: bool = False,
+) -> list:
+    """Make ``provider.backend.<method>`` raise ``exc`` (default: a transient error)
+    on its first call or on every call, and skip the retry sleep of the
+    ``StorageObject`` wrapper; returns the call log."""
     wrapper = {"inspect": StorageObject._inspect, "list": StorageObject._list}[method]
     monkeypatch.setattr(wrapper.retry, "sleep", lambda seconds: None)
     real, calls = getattr(provider.backend, method), []
 
     def flaky(request):
         calls.append(request)
-        if len(calls) == 1:
-            raise RuntimeError("transient")
+        if always or len(calls) == 1:
+            raise exc or RuntimeError("transient")
         return real(request)
 
     monkeypatch.setattr(provider.backend, method, flaky)
@@ -446,9 +485,79 @@ def _fail_once(monkeypatch, provider: StorageProvider, method: str) -> list:
 @needs_samples
 def test_exists_retries_transient_inspect_error(seeded_provider, monkeypatch):
     provider = seeded_provider()
-    calls = _fail_once(monkeypatch, provider, "inspect")
+    calls = _failing(monkeypatch, provider, "inspect")
     assert provider.object(f"fdb://{EA},step=0,param=167").exists() is True
     assert len(calls) == 2
+
+
+@needs_samples
+@pytest.mark.parametrize(
+    "exc, attempts, raises, message",
+    [
+        (RuntimeError("transient"), 3, RuntimeError, "transient"),
+        (
+            RuntimeError("Cannot open /x/schema  (No such file or directory)"),
+            1,
+            WorkflowError,
+            "FDB configuration error: Cannot open /x/schema",
+        ),
+        (
+            RuntimeError("Failed system call: opendir (Success)"),
+            1,
+            WorkflowError,
+            "FDB I/O error for fdb://",
+        ),
+        (
+            RuntimeError("UserError: TypeEnum[name=class]: cannot expand 'zz'"),
+            1,
+            WorkflowError,
+            "Invalid MARS request fdb://",
+        ),
+    ],
+)
+def test_exists_retries_only_transient_errors(
+    seeded_provider, monkeypatch, caplog, exc, attempts, raises, message
+):
+    """ADR-033: permanent failures are mapped and raised on the first attempt, with
+    the full pyfdb text in the debug log (FR-ERR-001)."""
+    provider = seeded_provider()
+    calls = _failing(monkeypatch, provider, "inspect", exc, always=True)
+    with caplog.at_level(logging.DEBUG, logger="fdb-test"):
+        with pytest.raises(raises) as e:
+            provider.object(f"fdb://{EA},step=0,param=167").exists()
+    assert str(e.value).startswith(message)
+    assert len(calls) == attempts
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert (f"FDB storage: full error text: {exc}" in debug) is (
+        raises is WorkflowError
+    )
+
+
+@needs_samples
+def test_exists_unreadable_root_is_an_io_error(make_provider, tmp_path):
+    """FR-ERR-004: an unreadable FDB root is a mapped I/O error, not a raw
+    ``RuntimeError``."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: permissions are not enforced")
+    provider = make_provider()
+    root = tmp_path / "fdb" / "db"  # created by make_provider's default config
+    root.chmod(0o000)
+    try:
+        with pytest.raises(WorkflowError) as e:
+            provider.object(f"fdb://{EA},step=0,param=167").exists()
+    finally:
+        root.chmod(0o755)
+    message = str(e.value)
+    assert message.startswith("FDB I/O error for fdb://")
+    assert "(Success)" not in message
+    assert message.endswith(
+        "(check permissions, free space and the roots in the FDB configuration)"
+    )
+
+
+def test_provider_str_is_the_plugin_name(make_provider):
+    """Snakemake formats the provider into user-facing text (snakemake/storage.py)."""
+    assert str(make_provider()) == "fdb"
 
 
 @needs_samples
@@ -1060,6 +1169,6 @@ def test_glob_invalid_value(seeded_provider):
 @needs_samples
 def test_glob_retries_transient_list_error(seeded_provider, monkeypatch):
     provider = seeded_provider()
-    calls = _fail_once(monkeypatch, provider, "list")
+    calls = _failing(monkeypatch, provider, "list")
     assert len(provider.object(f"fdb://{EA},step={{s}}").list_candidate_matches()) == 3
     assert len(calls) == 2

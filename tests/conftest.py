@@ -171,6 +171,7 @@ def clean_env(monkeypatch) -> pytest.MonkeyPatch:
     monkeypatch.setattr(plugin, "_APPLIED", {})
     monkeypatch.setattr(plugin, "_SPELLING_WARNED", set())
     monkeypatch.setattr(plugin, "_REMOVE_WARNED", set())
+    monkeypatch.setattr(plugin, "_PARTIAL_WARNED", set())
     return monkeypatch
 
 

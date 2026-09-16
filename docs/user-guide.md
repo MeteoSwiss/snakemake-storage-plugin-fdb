@@ -74,6 +74,19 @@ storage-fdb-config: /path/to/fdb/config.yaml
 storage-fdb-canonical-spelling: error
 ```
 
+Or in the environment, for the settings that describe the site rather than the workflow
+(`config`, `user_config`, `eccodes_definitions`, `metkit_home`, `key_order`, `env`,
+`glob_required_keys`):
+
+```bash
+export SNAKEMAKE_STORAGE_FDB_CONFIG=/path/to/fdb/config.yaml
+snakemake -c1
+```
+
+A command-line flag overrides the variable. The variable holds one value, which may be
+tagged (`SNAKEMAKE_STORAGE_FDB_CONFIG='prod::/etc/fdb/prod.yaml'`). The full list is in
+the [reference](reference.md#environment-variables).
+
 Or in the Snakefile:
 
 ```snakemake
@@ -121,7 +134,8 @@ process share one environment, so they cannot use different `eccodes_definitions
 In Snakemake 9.27, tagged setting values do **not** reach job processes that Snakemake
 spawns: a spawned job sees `TAG:VALUE` (one colon) as an untagged value and fails, e.g.
 with `FDB configuration error: 'ecm:../../.fdb/config.yaml' is neither an existing file
-nor an inline YAML mapping`. This is an upstream Snakemake bug. Affected are `run:`
+nor an inline YAML mapping (looks like a tagged setting mangled by a spawned job, see
+the user guide on tagged settings)`. This is an upstream Snakemake bug. Affected are `run:`
 rules with the local executor, and every job with cluster or remote executors. Until it
 is fixed:
 
@@ -206,10 +220,19 @@ rule t2m:
         "cp {input} {output}"
 ```
 
-- The input exists only when **all** fields of the query are in FDB (3 here). If some are
-  missing, Snakemake treats the input as missing; retrieving it fails with a message
-  such as `...: 2 of 3 fields found in FDB; missing: step=12`. If nothing matches, the
-  message lists optional schema keys the query does not name.
+- The input exists only when **all** fields of the query are in FDB (3 here). If some
+  are missing, Snakemake treats the input as missing and reports the whole query as a
+  missing input. The plugin then logs, once per query, which fields it did find:
+
+  ```text
+  WARNING FDB storage: fdb://...,step=0/6/12,param=167: 2 of 3 fields found in FDB; missing: step=12
+  ```
+
+- If **nothing** matches, that is the normal state of data not produced yet, so there is
+  no warning. Run with `--verbose` to get the same report at debug level; when the
+  schema is known it also lists the optional schema keys the query does not name
+  (`domain`, `number`, `timespan`), which is the usual cause. Otherwise check with
+  `fdb list` using the query's constant keys.
 - The local file holds the messages in request order, never sorted: each key's values in
   the order the query lists them, keys nested in canonical key order with the last key
   varying fastest. `step=12/0/6,param=165/167` gives `12/165, 12/167, 0/165, 0/167,
@@ -218,8 +241,10 @@ rule t2m:
   fields (one-second resolution), so rules rerun when inputs are re-archived.
 - An invalid request (unknown key or value, `number` with `type=cf`) is an error, not a
   missing input.
-- Retrieval is atomic: a failed transfer never leaves a partial local file. Transient
-  FDB errors are retried.
+- Retrieval is atomic: a failed transfer never leaves a partial local file. Errors that
+  may be transient are retried (3 attempts); errors the plugin recognises as permanent
+  (an invalid MARS request, a broken configuration, a permission or disk problem) fail
+  at once.
 
 ## Writing outputs
 
@@ -453,9 +478,12 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 |---|---|
 | `Invalid MARS request ...: TypeEnum[name=...]: cannot expand '<value>' (if this value is valid ...)` | A typo, or a value your MARS language does not define (e.g. a site `model`). Fix the value or set `metkit_home`. |
 | `Invalid MARS request ...: Key [number] not acceptable with context ...` | The key is not valid with the other values (e.g. `number` with `type=cf`). Remove it. |
-| `...: 0 of N fields found in FDB ... optional schema keys not in the query: ...` | The fields carry keys the query does not name. Add them (`domain=g`, `number=...`, `timespan=fs`). |
-| `...: n of N fields found in FDB; missing: ...` | Some fields are not archived; the message names them. |
-| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping` | Wrong path. Relative paths resolve against Snakemake's working directory (`-d`), not the directory the command was typed in. If the value looks like `tag:path`, see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
+| `...: 0 of N fields found in FDB ... optional schema keys not in the query: ...` | The fields carry keys the query does not name. Add them (`domain=g`, `number=...`, `timespan=fs`). Only visible with `--verbose`, or when a rule retrieves the query. |
+| `...: n of N fields found in FDB; missing: ...` | Some fields are not archived; the message names them. Snakemake still reports the whole query as a missing input. |
+| A query you know is complete is reported partial, or missing | A database directory under the FDB root may be unreadable: FDB skips it silently. Check the permissions of the `root/<class>:<expver>:...` directories. |
+| `FDB I/O error for ...: ... (check permissions, free space and the roots ...)` | The FDB root is unreadable, read-only or full. Check the roots in the configuration, the permissions and the free space. |
+| `FDB configuration error: Cannot open .../fdb5lib/etc/fdb/schema ... (no FDB configuration was given ...)` | No FDB configuration reached the plugin. Set `--storage-fdb-config`, `SNAKEMAKE_STORAGE_FDB_CONFIG` or `FDB_CONFIG_FILE`. |
+| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping` | Wrong path. Relative paths resolve against Snakemake's working directory (`-d`), not the directory the command was typed in. If the message ends with "looks like a tagged setting mangled by a spawned job", see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
 | `FDB configuration error: Cannot open ...` / `No writable roots available ...` | The schema file or database root in the FDB configuration does not exist. |
 | `GRIB keys do not match the FDB schema for ...: Keywords not used: {number}` | The GRIB carries a key the schema does not accept. Use a schema with that key (e.g. `number?`), or `archive_mode=identifier`. |
 | `...: cannot determine <key> for message 1 ...` | Identifier mode with a multi-rule schema. Use `archive_mode=native` or add the key to the query. |
@@ -483,5 +511,6 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 - Modification times have one-second resolution.
 - Remote FDB backends are untested.
 - Tagged settings are lost in spawned jobs (Snakemake 9.27).
+- An unreadable database directory inside an FDB root looks like missing data.
 
 The full list is in [`design/requirements.md`](design/requirements.md) §5.
