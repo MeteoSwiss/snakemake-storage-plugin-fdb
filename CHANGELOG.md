@@ -7,6 +7,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
+Fixes and gaps found by a stress test of 0.1.0 (about 90 scenarios across rule
+directives, query edits, the archive path and configuration).
+
 ### Added
 
 - `input_tracking` setting (`lookup`, the default, or `query`) choosing whether FDB
@@ -103,5 +108,6 @@ First release.
 - Documentation: a user guide, a reference and contributing notes under `docs/`, and a
   rewritten README with a quick start.
 
-[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/releases/tag/v0.1.0
