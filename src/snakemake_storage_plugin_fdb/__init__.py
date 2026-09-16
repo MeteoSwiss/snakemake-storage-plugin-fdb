@@ -613,6 +613,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             fields = self._inspect(request)
         required = self._indexed_keys()
         matching = [f for f in fields if all(f.key.get(k) for k in required)]
+        if len(matching) < self._expected():
+            self.provider.backend.check_roots(self.query)  # FR-ERR-004
         if len(matching) < len(fields):
             self.provider.logger.debug(
                 f"FDB storage: {self.query}: {len(fields) - len(matching)} of "

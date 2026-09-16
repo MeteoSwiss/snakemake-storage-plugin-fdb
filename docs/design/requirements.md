@@ -919,12 +919,20 @@ A pyfdb `RuntimeError` containing `Failed system call`, `Failed to mkdir`,
 `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the
 FDB configuration)`.
 
+When a lookup returns fewer fields than the query expands to, the plugin also checks
+that every root of a local FDB configuration (`spaces[].roots[].path`) that exists is
+readable, and raises `FDB I/O error for <query>: FDB root <path> is not readable (...)`
+otherwise: FDB 5.23 answers a lookup under an unreadable root with no fields instead of
+failing (architecture.md §13.7).
+
 - Rationale: an unreadable or read-only FDB root escaped as a raw
   `RuntimeError: Failed system call: opendir (Success)`, whose "Success" is actively
   misleading; the class also tells the retry policy that the failure is permanent
-  (FR-READ-011).
+  (FR-READ-011). Without the root check, an unreadable root under FDB 5.23 would look
+  like missing data and a workflow could recompute and re-archive it.
 - Verification: test `tests/test_backend.py::test_map_error_table`,
-  `tests/test_plugin.py::test_exists_unreadable_root_is_an_io_error`.
+  `::test_local_roots`, `tests/test_plugin.py::test_exists_unreadable_root_is_an_io_error`,
+  `::test_exists_unreadable_root_without_fdb_error`.
 
 #### FR-ERR-005 Configuration hints
 
@@ -1307,7 +1315,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-21 | Input tracking by lookup (FR-RERUN-001) patches the private `snakemake.persistence.PersistenceBase._input`, verified for snakemake 9.27 (architecture.md ADR-031, R-14). Where the attribute is missing or its signature differs, the plugin warns and falls back to query tracking, so query edits trigger reruns again. One residual effect is not covered by any check: a query edited to name different fields that are all older than the output does not rerun, and the output keeps what the old query produced (extra fields after narrowing, missing fields after widening, the old fields after a swap). |
 | L-22 | `inspect`/`retrieve` match through query keys the indexed fields do not have (`quantile=1:10` finds quantile-less fields), unlike `list` (architecture.md §13.4). Mitigated by the key check of FR-READ-001; a retrieval whose `inspect` returns matching and non-matching fields together fails on the byte count instead (FR-READ-007). |
 | L-23 | Native mode cannot label a key the message does not carry: naming such a key in the query is an error (FR-STORE-003). Use `archive_mode=identifier`, set the key in the GRIB, or drop it from the query. |
-| L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error (FR-ERR-004). |
+| L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error on every FDB version, because the plugin checks the configured roots itself (FR-ERR-004). |
 | L-25 | Snakemake refuses `--touch` for the whole workflow, not only for FDB outputs, as soon as one output is an FDB query; FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |

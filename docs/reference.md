@@ -225,6 +225,7 @@ characters with `…`; the full text is logged at debug level.
 | `FDB configuration error: <detail>` | `Cannot open ...` (e.g. missing schema), `No writable roots available ...` |
 | `... (no FDB configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)` | appended when `<detail>` names the schema bundled with the pyfdb wheel (`.../fdb5lib/etc/fdb/schema`) |
 | `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the FDB configuration)` | `Failed system call ...`, `Failed to mkdir ...`, `Permission denied`, `No space left on device`, `Read-only file system` |
+| `FDB I/O error for <query>: FDB root <path> is not readable (check permissions, ...)` | a lookup returned fewer fields than expected and a root of the local FDB configuration exists but is not readable (FDB 5.23 returns nothing instead of failing) |
 | `FDB glob pattern <query> needs constant values for <keys> (glob_required_keys)` | required key is a wildcard or absent |
 | `FileNotFoundError: no fields in FDB for <query>` | `mtime` of an absent object |
 

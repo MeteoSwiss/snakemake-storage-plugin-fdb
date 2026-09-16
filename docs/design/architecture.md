@@ -429,6 +429,7 @@ plain `RuntimeError` (§13.11); matching is by substring, in order:
 | `Keywords not used`, `Could not find [`, `Could not find a rule` | `GRIB keys do not match the FDB schema for <query> (<local>): <detail>` |
 | `Cannot open`, `No writable roots available` | `FDB configuration error: <detail>` (+ the no-configuration hint if the detail names `fdb5lib/etc/fdb/schema`) |
 | `Failed system call`, `Failed to mkdir`, `Permission denied`, `No space left on device`, `Read-only file system` | `FDB I/O error for <query>: <detail> (check permissions, free space and the roots in the FDB configuration)` |
+| (no exception) a lookup short of fields while a configured local root exists but is not readable (`Backend.check_roots`) | `FDB I/O error for <query>: FDB root <path> is not readable (check permissions, ...)` |
 | (`GribError`) | its message |
 | other | re-raised |
 
@@ -1164,6 +1165,14 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
 - eckit appends the `errno` text to a failed system call even when `errno` is 0, giving
   messages such as `Failed system call: opendir (Success)` [verified: `chmod 000` on an
   FDB root, pyfdb 5.21.4].
+- An unreadable FDB root (`chmod 000`) makes `inspect` raise `Failed system call:
+  opendir (Success)` on pyfdb 5.21.4.23 but return **no fields and no exception** on
+  pyfdb 5.23.2.27 [verified: 2026-09-16, fresh handle opened after the `chmod`; found by
+  the `pyfdb-latest` CI canary]. The plugin therefore checks the configured local roots
+  itself when a lookup comes back short (FR-ERR-004). Opening a second handle after such
+  a failure crashed the probe process (exit 139) on both versions; the plugin opens a
+  fresh handle per read, so a failed job followed by further reads in the same process
+  is a possible crash path (not reproduced through Snakemake).
 
 ### 13.8 Snakemake core behaviour
 

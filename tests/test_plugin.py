@@ -555,6 +555,27 @@ def test_exists_unreadable_root_is_an_io_error(make_provider, tmp_path):
     )
 
 
+@needs_samples
+def test_exists_unreadable_root_without_fdb_error(make_provider, tmp_path, monkeypatch):
+    """FR-ERR-004: FDB 5.23 returns no fields for an unreadable root instead of
+    failing; the plugin's own root check reports it on every FDB version."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: permissions are not enforced")
+    provider = make_provider()
+    monkeypatch.setattr(provider.backend, "inspect", lambda request: [])
+    root = tmp_path / "fdb" / "db"
+    root.chmod(0o000)
+    try:
+        with pytest.raises(WorkflowError) as e:
+            provider.object(f"fdb://{EA},step=0,param=167").exists()
+    finally:
+        root.chmod(0o755)
+    assert str(e.value).startswith(f"FDB I/O error for fdb://{EA}")
+    assert f"FDB root {root} is not readable" in str(e.value)
+    # readable again: the same lookup is simply missing
+    assert provider.object(f"fdb://{EA},step=0,param=167").exists() is False
+
+
 def test_provider_str_is_the_plugin_name(make_provider):
     """Snakemake formats the provider into user-facing text (snakemake/storage.py)."""
     assert str(make_provider()) == "fdb"

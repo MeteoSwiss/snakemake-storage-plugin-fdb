@@ -15,6 +15,7 @@ from snakemake_storage_plugin_fdb.backend import (
     SchemaInfo,
     fallback_expand,
     is_transient,
+    local_roots,
     map_error,
     parse_schema,
     resolve_config,
@@ -150,6 +151,18 @@ def test_parse_schema_without_rules():
 
 def _yaml(schema: Path | str, **extra) -> str:
     return yaml.safe_dump({"type": "local", "schema": str(schema), **extra})
+
+
+def test_local_roots(temp_fdb_config, tmp_path):
+    """FR-ERR-004: the local roots of a configuration, none for remote or empty ones."""
+    config = temp_fdb_config
+    assert local_roots(config) == [tmp_path / "fdb" / "db"]
+    assert local_roots(yaml.safe_dump(config)) == [tmp_path / "fdb" / "db"]
+    assert local_roots({**config, "type": "remote"}) == []
+    assert local_roots({"spaces": [{"roots": [{"path": "~/x"}]}]}) == [
+        Path("~/x").expanduser()
+    ]
+    assert local_roots(None, env={}) == []
 
 
 def test_resolve_schema_path_explicit_config(tmp_path, monkeypatch):

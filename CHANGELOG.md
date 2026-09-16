@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- An unreadable FDB root is reported as `FDB I/O error ... FDB root <path> is not
+  readable` on every FDB version: pyfdb 5.23 returns no fields for it instead of
+  failing, which made the data look missing (found by the `pyfdb-latest` CI canary).
+
 ## [0.2.0] - 2026-09-16
 
 Fixes and gaps found by a stress test of 0.1.0 (about 90 scenarios across rule

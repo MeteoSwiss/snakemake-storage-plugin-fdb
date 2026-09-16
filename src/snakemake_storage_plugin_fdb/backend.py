@@ -186,6 +186,22 @@ def _fdb_config(config: ConfigValue, env: Mapping[str, str]) -> dict[str, Any]:
     return {}
 
 
+def local_roots(
+    config: ConfigValue, env: Mapping[str, str] | None = None
+) -> list[Path]:
+    """Root directories of a local FDB configuration (``spaces[].roots[].path``);
+    empty for remote or unreadable configurations (FR-ERR-004)."""
+    cfg = _fdb_config(config, os.environ if env is None else env)
+    if cfg.get("type", "local") != "local":
+        return []
+    roots = []
+    for space in cfg.get("spaces") or []:
+        for root in (space.get("roots") or []) if isinstance(space, dict) else []:
+            if isinstance(root, dict) and isinstance(root.get("path"), str):
+                roots.append(Path(root["path"]).expanduser())
+    return roots
+
+
 def resolve_schema_path(
     config: ConfigValue, env: Mapping[str, str] | None = None
 ) -> Path | None:
@@ -402,6 +418,17 @@ class Backend:
         self.logger = logger or logging.getLogger(__name__)
         self.schema_info = schema_info
         self._local = threading.local()
+
+    def check_roots(self, query: str) -> None:
+        """Raise the I/O error for a configured local root that exists but cannot be
+        read: FDB 5.23 answers a lookup under such a root with no fields instead of
+        failing (FR-ERR-004, architecture.md §13.7)."""
+        for root in local_roots(self.config):
+            if root.exists() and not os.access(root, os.R_OK | os.X_OK):
+                raise WorkflowError(
+                    f"FDB I/O error for {query}: FDB root {root} is not readable"
+                    f"{_IO_HINT}"
+                )
 
     def _open(self) -> pyfdb.FDB:
         """A new ``pyfdb.FDB``; pyfdb is imported here, after the environment is set."""
