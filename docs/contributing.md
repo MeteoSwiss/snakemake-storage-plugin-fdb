@@ -6,10 +6,15 @@ The project is managed with [uv](https://docs.astral.sh/uv/). Run every tool thr
 `uv run`; the commands below assume the repository root as working directory.
 
 ```bash
-uv sync                 # creates .venv with the locked dependencies and the dev group
-uv run pytest -q        # generic test suite
-uv build                # wheel and sdist in dist/
+uv sync                    # creates .venv with the locked dependencies and the dev group
+uv sync --group examples   # plus earthkit-data and matplotlib, for the examples
+uv run pytest -q           # generic test suite
+uv build                   # wheel and sdist in dist/
 ```
+
+The `examples` dependency group is what `examples/forecast-evaluation/` needs
+(FR-DEV-003); `tests/test_evaluation_example.py` skips without it, and the CI jobs
+`test` and `pyfdb-latest` sync it.
 
 Development and CI run on Linux (the pyfdb wheels are `manylinux_2_28`). `uv.lock` is
 committed; update it only on purpose (`uv lock`).
@@ -28,7 +33,8 @@ uv run coverage run -m pytest -q -rs && uv run coverage report --include='src/*'
 
 Tests that need the ECMWF samples in `tests/data/grib/ecmwf/` skip without them. Test
 FDBs are created in pytest's temporary directories. The end-to-end tests
-(`tests/test_workflow.py`, `tests/test_rerun.py`, `tests/test_patterns.py`) run
+(`tests/test_workflow.py`, `tests/test_rerun.py`, `tests/test_patterns.py`,
+`tests/test_direct.py`, `tests/test_evaluation_example.py`) run
 `snakemake` in subprocesses with a clean environment and write each stage's output to a
 log file under pytest's temporary directory.
 

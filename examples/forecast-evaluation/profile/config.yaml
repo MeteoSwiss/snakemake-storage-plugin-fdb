@@ -1,0 +1,8 @@
+# Snakemake profile for the development FDB; run from examples/forecast-evaluation/.
+# Relative paths resolve against the working directory.
+storage-fdb-config: ../../.fdb/config.yaml
+# Try the alternatives:
+# storage-fdb-input-tracking: query      # Snakemake's input-set trigger: narrowing the
+#                                        # params would then rerun the model too
+# storage-fdb-archive-mode: identifier   # label keys from the query instead of the GRIB
+# storage-fdb-canonical-spelling: error  # reject param=2t, time=00, ...

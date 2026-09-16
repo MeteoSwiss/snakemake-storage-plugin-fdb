@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/forecast-evaluation/`: a dummy forecast-evaluation workflow (truth, model,
+  verification, animation; one job each per initialisation time) in which every rule
+  reads and writes FDB directly with plain pyfdb and earthkit-data, and no GRIB file is
+  ever written locally. It also shows the rerun behaviour: adding a parameter reruns the
+  model, removing one reruns nothing, a new model checkpoint is a new `expver`.
+- The `examples` dependency group (earthkit-data, matplotlib) for that example;
+  `tests/test_evaluation_example.py` runs it end to end and skips without the group.
+
+### Changed
+
+- An output a job archives itself is declared `storage.fdb(query, retrieve=False)`, like
+  an input the job reads itself: Snakemake then writes nothing locally and checks after
+  the job that every field of the query is in FDB. `touch(storage.fdb(query))` remains
+  as the checked variant, which also proves the fields were archived during this run;
+  `api.archive` outputs keep their plain declaration. The example, the patterns and the
+  documentation follow.
+
+### Fixed
+
+- The documentation claimed that Snakemake has no output-side counterpart of
+  `retrieve=False` and that a direct output must therefore leave a local file. It has
+  one, at least since Snakemake 9.27.
+
 ## [0.3.1] - 2026-09-16
 
 Jobs use plain pyfdb, eccodes and earthkit-data; the plugin stays in the Snakefile.

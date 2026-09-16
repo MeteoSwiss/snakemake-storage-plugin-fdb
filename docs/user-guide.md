@@ -272,12 +272,18 @@ script never imports the plugin. The plugin's place is the Snakefile, where it d
 what a rule reads and writes, and the provider, which puts its FDB configuration into
 the job environment so that an unconfigured `pyfdb.FDB()` or
 `earthkit.data.from_source("fdb", ...)` opens the workflow's FDB.
+[`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) is a
+runnable workflow whose every rule works this way.
 
 ### Declaring the fields
 
-Mark an input `retrieve=False`: Snakemake then hands the job the **query string**
-instead of a local path, wildcards filled in. The job derives its MARS request from that
-string in two lines — strip the scheme, split on `,` and `=` — and hands the dict to
+The rule is the same on both sides: **an FDB object the job reads or writes itself is
+declared `retrieve=False`**, input or output alike. For an output that means "expect no
+local file, look the fields up in FDB after the job" (see
+[Archiving in the job](#archiving-in-the-job)).
+
+For an input, Snakemake hands the job the **query string** instead of a local path,
+wildcards filled in. The job derives its MARS request from that string in two lines — strip the scheme, split on `,` and `=` — and hands the dict to
 pyfdb or earthkit-data as it is. Values with `/` lists or `to`/`by` ranges stay strings;
 both libraries take them as MARS lists:
 
@@ -350,7 +356,7 @@ FDB — so a job that reads exactly its declared request gets exactly those fiel
 ### Archiving in the job
 
 Archive with `pyfdb.FDB().archive(...)`, flush before the job ends, and declare the
-output `touch(storage.fdb(...))`:
+output `retrieve=False` too:
 
 ```snakemake
 QUERY = (
@@ -363,7 +369,7 @@ rule shift_expver:
     input:
         storage.fdb(QUERY.format(expver="0001"), retrieve=False),
     output:
-        touch(storage.fdb(QUERY.format(expver="0002"))),
+        storage.fdb(QUERY.format(expver="0002"), retrieve=False),
     run:
         import eccodes
         import pyfdb
@@ -379,12 +385,32 @@ rule shift_expver:
         fdb.flush()
 ```
 
-Snakemake requires a local file at an output's path after the job; `touch()` creates an
-empty one. **An empty file is the convention**: it tells the plugin's store step that the
-job archived the fields itself. The store step then archives nothing and only checks that
-every field of the query is in FDB with an index timestamp from this run — the run's
-reference time is taken when the provider is built, at the start of the workflow. A job
-that archived the wrong or too few fields fails there:
+A `retrieve=False` output needs no local file at all: after the job Snakemake asks the
+plugin whether every field of the query is in FDB, instead of waiting for a file at the
+output's path (`--latency-wait` bounds that wait as usual). Nothing is written under
+`.snakemake/storage`, nothing is removed afterwards, and the plugin's store step never
+runs for such an output. The DAG is unaffected: the query links this rule to the rules
+that read it ("Input files updated by another job"), a missing field is reported as
+`Missing output files: fdb://... (in storage)`, and a second run reports "Nothing to be
+done".
+
+`flush()` before the job ends is still required: what is not flushed is not in FDB, for
+the check and for the jobs downstream.
+
+Existence is all that is checked. A job that exits 0 having archived nothing — or the
+wrong fields — passes whenever FDB happens to hold the query's fields already, for
+instance from an earlier run of the same workflow. Where a run must prove that *it*
+wrote the fields, use the checked variant.
+
+#### The checked variant: `touch()`
+
+`touch(storage.fdb(query))` keeps the plugin's store step in the loop. Snakemake then
+requires a local file at the output's path after the job and `touch()` creates an empty
+one; **an empty file is the convention**: it tells the store step that the job archived
+the fields itself. The store step archives nothing and checks that every field of the
+query is in FDB with an index timestamp from this run — the run's reference time is
+taken when the provider is built, at the start of the workflow. A job that archived the
+wrong or too few fields, or nothing at all, fails there:
 
 ```text
 fdb://class=ea,expver=0002,...,step=0/6/12,param=167: .snakemake/storage/... is empty,
@@ -401,9 +427,9 @@ Two things to know about this check:
   archived under the same query would satisfy it. `flush()` before the job ends, or the
   fields may not be visible to the store step yet.
 
-A rule that produced no output at all fails with the same message (its file is empty
-too). `--keep-storage-local-copies` keeps the empty files like any other local copy;
-otherwise Snakemake removes them at the end of the run.
+`--keep-storage-local-copies` keeps the empty files like any other local copy; otherwise
+Snakemake removes them at the end of the run. That is the price of the check: with
+`retrieve=False` nothing is created locally in the first place.
 
 ### The optional `api` module
 
@@ -428,7 +454,9 @@ that ends early is an error too. It holds one message at a time.
 every message's keys against the query and duplicates are checked **before** the first
 archive, so a failure archives nothing, and the post-check runs in the job, naming the
 offending messages. It writes an **archive marker** at the output's local path instead of
-an empty file (so such an output is declared `storage.fdb(...)`, without `touch()`):
+an empty file, so such an output keeps the plain declaration — `storage.fdb(...)`,
+neither `touch()` nor `retrieve=False`: the job needs that local path to write the marker
+at, and the store step has to run to read it:
 
 ```text
 # snakemake-storage-plugin-fdb archived
@@ -447,10 +475,10 @@ too; `api.archive(..., archive_mode=...)` overrides it for one call.
 
 ### When a local file is still needed
 
-A `shell:` rule that hands the fields to an external program needs a file: leave the
-input retrieved (no `retrieve=False`) and the output a plain FDB output, which the
-plugin retrieves and archives as usual. Both styles mix freely in one rule — one
-retrieved input and one direct input is fine.
+A `shell:` rule that hands the fields to an external program needs a file: leave input
+and output plain (no `retrieve=False` on either), and the plugin retrieves and archives
+as usual. Both styles mix freely in one rule — one retrieved input and one direct input
+is fine.
 
 ## Writing outputs
 
@@ -697,8 +725,9 @@ Most of Snakemake works unchanged with FDB objects; these are the exceptions.
   the store, instead of measuring the local file the rule just wrote.
 - **`--not-retrieve-storage`** hands the job the local path of the input without
   retrieving it, so the job fails on a file that does not exist. The per-object flag
-  `storage.fdb(query, retrieve=False)` is a different thing: it hands the job the query
-  itself, which is what
+  `storage.fdb(query, retrieve=False)` is a different thing: on an input it hands the job
+  the query itself, and on an output it means "no local file, check the fields in FDB
+  after the job" — which is what
   [direct access](#direct-access-from-run-and-script-rules) builds on.
 - `touch()`, `ancient()` and `report()` work on FDB objects; `temp()`, `protected()`,
   `directory()` and `pipe()` are rejected (see
@@ -749,7 +778,9 @@ sample files from `tests/data/grib/ecmwf/` (`--seed`) and small variants of
 and `--variants FILE` choose other locations; see the
 [reference](reference.md#scriptsinit_dev_fdbpy). The configuration uses absolute paths,
 so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any directory.
-[`examples/ecmwf/README.md`](../examples/ecmwf/README.md) explains the example workflow.
+[`examples/ecmwf/README.md`](../examples/ecmwf/README.md) and
+[`examples/forecast-evaluation/README.md`](../examples/forecast-evaluation/README.md)
+explain the two example workflows.
 
 ## Troubleshooting
 
@@ -781,6 +812,7 @@ so `--storage-fdb-config /path/to/checkout/.fdb/config.yaml` works from any dire
 | `Touching output files is impossible ...` | `--touch` is not supported and the check covers the whole workflow (see [Snakemake flags and features](#snakemake-flags-and-features)). |
 | `MissingRuleException: No rule to produce fdb:/...` | An FDB query was used as a command-line target; Snakemake normalised it. Target the rule by name or a local file. |
 | `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
+| `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem: declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
 | `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
 | "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
 | A rule reruns after a query edit although the fields are unchanged | Input tracking by lookup is off; see the warning in the log and [Reruns](#reruns). |

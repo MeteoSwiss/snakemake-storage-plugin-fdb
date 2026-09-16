@@ -460,13 +460,16 @@ with open(snakemake.input[0], "rb") as fi, open(snakemake.output[0], "w") as fo:
 
 A `run:` or `script:` body can read the fields straight from FDB and archive straight
 into FDB with **plain pyfdb, eccodes or earthkit-data**; no rule imports the plugin
-([user guide](user-guide.md#direct-access-from-run-and-script-rules)). Flag the input
-`retrieve=False` — the job then gets the query string instead of a path — and derive
+([user guide](user-guide.md#direct-access-from-run-and-script-rules)). Flag every FDB
+object the job handles itself `retrieve=False`, input or output alike — an input so
+flagged reaches the job as the query string instead of a path — and derive
 the MARS request from that string in the job (strip `fdb://`, split on `,` and `=`; `/`
 lists stay strings, which pyfdb and earthkit-data take as MARS lists). The provider puts
 its FDB configuration in the job environment, so `pyfdb.FDB()` and
 `from_source("fdb", request)` need no arguments. Nothing GRIB-shaped is written under
 `.snakemake/storage`, which the rules below print (`GRIB FILES: 0`).
+[`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) is a whole
+workflow built this way.
 
 <!-- pattern: run-plain; expect: STEPS: 0 6 12; expect: GRIB FILES: 0 -->
 ```snakemake
@@ -556,13 +559,11 @@ print("GRIB FILES:", len(grib), file=sys.stderr)
 ```
 
 Outputs work the same way: the job archives with `pyfdb.FDB().archive(...)` and the
-output is declared `touch(storage.fdb(...))`. The empty file Snakemake leaves at the
-output's local path tells the store step that the job archived the fields itself; the
-store archives nothing and checks that every field of the query is in FDB with a
-timestamp from this run. This is the [first write pattern](#one-rule-one-query) without
-a GRIB file anywhere.
+output is declared `retrieve=False` too. Snakemake then expects no local file; after the
+job it asks the plugin whether every field of the query is in FDB. This is the
+[first write pattern](#one-rule-one-query) without a GRIB file anywhere.
 
-<!-- pattern: script-plain-archive; rerun: nothing; expect: Storing in storage: fdb://class=ea,expver=0023; expect: GRIB FILES: 0 -->
+<!-- pattern: script-plain-archive; rerun: nothing; expect: ARCHIVED: 3; expect: GRIB FILES: 0 -->
 ```snakemake
 storage:
     provider="fdb"
@@ -580,7 +581,7 @@ rule shift_expver:
     params:
         expver="0023",  # a plain value: fine in params, unlike the request
     output:
-        touch(storage.fdb(QUERY.format(expver="0023"))),
+        storage.fdb(QUERY.format(expver="0023"), retrieve=False),
     script:
         "scripts/plain_shift.py"
 ```
@@ -614,11 +615,51 @@ print("ARCHIVED:", archived, file=sys.stderr)
 print("GRIB FILES:", len(grib), file=sys.stderr)
 ```
 
-Nothing is checked before such an archive, so a job that writes the wrong fields puts
-them in FDB and the store step's post-check reports them afterwards. Where that matters,
-the plugin's optional `api.archive` runs the checks of a file-based store first (field
-count, every message's keys against the query, duplicates), archives nothing if one
-fails and leaves an archive marker instead of an empty file:
+Only existence is checked after such a job: one that exits 0 having archived nothing
+passes whenever FDB already holds the query's fields. `touch(storage.fdb(...))` is the
+checked variant. Snakemake then leaves an empty file at the output's local path, which
+tells the store step that the job archived the fields itself; the store archives nothing
+and requires every field of the query to be in FDB with a timestamp from this run, which
+is the `Storing in storage` line in the log.
+
+<!-- pattern: run-plain-checked; rerun: nothing; expect: Storing in storage: fdb://class=ea,expver=0024 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+QUERY = (
+    "fdb://class=ea,expver={expver},stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule shift_expver:
+    input:
+        storage.fdb(QUERY.format(expver="0001"), retrieve=False),
+    output:
+        touch(storage.fdb(QUERY.format(expver="0024"))),
+    run:
+        import eccodes
+        import pyfdb
+
+        query = input[0].removeprefix("fdb://")
+        request = dict(item.split("=", 1) for item in query.split(","))
+        fdb = pyfdb.FDB()
+        with fdb.retrieve(request) as source:
+            data = source.read()
+        for message in eccodes.MemoryReader(data):
+            message.set("expver", "0024")
+            fdb.archive(message.get_buffer())
+        fdb.flush()  # before the job ends: the store step looks the fields up
+```
+
+Nothing is checked before such an archive either, so a job that writes the wrong fields
+puts them in FDB and the store step's post-check reports them afterwards. Where that
+matters, the plugin's optional `api.archive` runs the checks of a file-based store first
+(field count, every message's keys against the query, duplicates), archives nothing if
+one fails and leaves an archive marker instead of an empty file. Such an output keeps
+the plain declaration, so that the job gets the local path to write the marker at:
 
 <!-- pattern: run-api-archive; expect: Storing in storage: fdb://class=ea,expver=0022; expect: GRIB FILES: 0 -->
 ```snakemake
@@ -660,8 +701,9 @@ rule shift_expver:
         print("GRIB FILES:", len(grib), "->", marker.fields, "fields", file=sys.stderr)
 ```
 
-The only file under `.snakemake/storage` is the empty file, or the marker, of the output,
-and Snakemake removes it with the other local copies at the end of the run. Where a job
+With `retrieve=False` outputs nothing is written under `.snakemake/storage` at all; with
+`touch()` or `api.archive` the only file there is the output's empty file or marker,
+which Snakemake removes with the other local copies at the end of the run. Where a job
 needs a real file after all — a `shell:` rule calling an external program — leave the
 input retrieved and the output a file, as in the sections above.
 

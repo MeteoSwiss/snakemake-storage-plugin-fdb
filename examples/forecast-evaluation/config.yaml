@@ -1,0 +1,26 @@
+# Forecast initialisation times (ISO 8601): one truth, one model run, one verification
+# and one animation job each. Any value works as an explicit target.
+init_times:
+  - "2020-01-01T00:00"
+  - "2020-01-01T12:00"
+  - "2020-01-02T00:00"
+  - "2020-01-02T12:00"
+  - "2020-01-03T00:00"
+
+# Parameters under evaluation. The model writes exactly these (one FDB output per
+# parameter). Adding one later makes the model rerun (its output is missing in FDB);
+# removing one does not (input tracking by lookup).
+params:
+  - 167 # 2 m temperature
+  # - 165 # 10 m u wind
+
+# Forecast steps: every query lists them all (one multi-step file per parameter).
+steps: [0, 6, 12]
+
+# The ML model. Its expver is a hash of the checkpoint: a new checkpoint is a new
+# experiment version in FDB, everything else (params, steps) can change without one.
+model:
+  checkpoint: "unet-v3-2026-08.ckpt"
+
+# The simulated truth (analyses) is archived under this expver.
+truth_expver: "0002"

@@ -105,6 +105,8 @@ globbing and site setups.
 
 - [User guide](docs/user-guide.md): configuration, queries, reading, writing, globbing,
   troubleshooting
+- [Forecast-evaluation example](examples/forecast-evaluation/README.md): a runnable
+  workflow in which every rule reads and writes FDB directly, with no local GRIB files
 - [Usage patterns](docs/patterns.md): runnable workflows for query shapes, rule
   directives, writing outputs, reruns and site setup
 - [Reference](docs/reference.md): settings, query grammar, local paths, methods, errors,
@@ -128,6 +130,8 @@ src/snakemake_storage_plugin_fdb/
     rerun.py             input tracking by lookup (rerun triggers)
 scripts/init_dev_fdb.py  creates and seeds a local development FDB
 examples/ecmwf/          generic example workflow
+examples/forecast-evaluation/
+                         generic workflow with direct FDB access only (examples group)
 examples/meteoswiss/     MeteoSwiss schema, profile, workflow and setup scripts
 tests/                   generic test suite; tests/data/ holds test schemas and GRIB samples
 tests/sites/meteoswiss/  MeteoSwiss site test suite

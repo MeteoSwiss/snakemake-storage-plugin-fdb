@@ -21,6 +21,9 @@ dependencies = [
 
 [dependency-groups]
 dev = ["snakemake>=9.27", "pytest>=8", "ruff", "coverage"]
+# What examples/forecast-evaluation/ needs beyond the runtime dependencies (FR-DEV-003);
+# tests/test_evaluation_example.py skips without it.
+examples = ["earthkit-data>=1.2", "matplotlib>=3.8"]
 
 [build-system]
 requires = ["hatchling"]

@@ -201,9 +201,9 @@ Jobs need nothing of the plugin: a rule body parses its MARS request from the qu
 string it holds as input (`fdb://` stripped, `,` and `=` split; see the
 [user guide](user-guide.md#declaring-the-fields)), reads FDB with plain `pyfdb` or
 earthkit-data (the provider exports the configuration, see
-[Environment variables](#environment-variables)) and archives with plain `pyfdb`,
-declaring such an output `touch(storage.fdb(...))` (the
-[empty-output convention](#the-empty-output-convention) below).
+[Environment variables](#environment-variables)) and archives with plain `pyfdb`. Every
+FDB object a job handles itself is declared `storage.fdb(query, retrieve=False)`, input
+or output alike ([Direct outputs](#direct-outputs) below).
 
 `from snakemake_storage_plugin_fdb import api` is the optional helper module for a
 Snakefile and for a job that wants the plugin's own checks
@@ -229,6 +229,21 @@ would give.
 | `read_marker(path) -> Marker \| None` | the marker at `path`, `None` if the file is not one (missing file included); raises for a file with the marker header that cannot be parsed. |
 | `Marker(query, fields, time)` | dataclass; `write(path)` writes it atomically (via `<path>.part`). |
 
+### Direct outputs
+
+An output a job archives itself is declared one of three ways; they differ in what is
+checked and in what appears at the output's [local path](#local-path-mapping):
+
+| declaration | checked after the job | local file |
+|---|---|---|
+| `storage.fdb(query, retrieve=False)` | every field of the query is in FDB (`exists`) | none: nothing is written, the store step does not run |
+| `touch(storage.fdb(query))` | every field is in FDB **with an index timestamp from this run** (the [empty-output convention](#the-empty-output-convention)) | an empty file, removed after the run unless `--keep-storage-local-copies` |
+| `storage.fdb(query)` with `api.archive` | the checks of a file-based store before the archive, then the marker's count and timestamp | the [archive marker](#the-archive-marker), removed with the other local copies |
+
+A plain `storage.fdb(query)` whose job writes no local GRIB file and does not use
+`api.archive` fails with Snakemake's missing-output message: nothing is at the local
+path to store.
+
 ### The empty-output convention
 
 A local file of size 0 at an FDB output's path (what `touch(storage.fdb(...))` leaves)
@@ -236,9 +251,11 @@ means "the job archived these fields itself". `store_object` then archives nothi
 requires every field of the query to be in FDB with an index timestamp not older than
 the **reference time** of the run: the FDB clock second read when the provider of the
 storing process was constructed — the start of the workflow under the local executor,
-where the store runs in the main process for every rule kind. What the check can and
-cannot tell is in the [user guide](user-guide.md#archiving-in-the-job) and in
-[requirements L-31](design/requirements.md#5-known-limitations).
+where the store runs in the main process for every rule kind. It is the checked variant of a direct output: it
+proves the fields were archived during this run, which the existence check of
+`retrieve=False` cannot ([L-32](design/requirements.md#5-known-limitations)). What the
+check can and cannot tell is in the [user guide](user-guide.md#archiving-in-the-job) and
+in [requirements L-31](design/requirements.md#5-known-limitations).
 
 ### The archive marker
 
@@ -361,7 +378,7 @@ uv run python scripts/init_dev_fdb.py [--root DIR] [--schema PATH] [--seed [DIR]
 | `--root DIR` | `.fdb` in the repository | writes `DIR/schema`, `DIR/root/` and `DIR/config.yaml` (local toc FDB, absolute paths) |
 | `--schema PATH` | `tests/data/schema` | schema to copy; missing file is an argument error |
 | `--seed [DIR]` | not seeded; `tests/data/grib/ecmwf` if given without DIR | natively archives every file directly in DIR whose content starts with `GRIB` (no subdirectories); a missing DIR is reported on stderr and skipped |
-| `--variants [FILE]` | none; `tests/data/grib/ecmwf/template.grib` if given without FILE | archives zeroed `stream=oper` variants of the message in FILE for steps 0/6/12 × params 167/165 (the inputs of `examples/ecmwf/`); missing FILE is an argument error |
+| `--variants [FILE]` | none; `tests/data/grib/ecmwf/template.grib` if given without FILE | archives zeroed `stream=oper` variants of the message in FILE for steps 0/6/12 × params 167/165 (the inputs of the examples); missing FILE is an argument error |
 
 Defaults are relative to the repository, explicit arguments to the working directory.
 Data needing other eccodes definitions or a MARS language is seeded with

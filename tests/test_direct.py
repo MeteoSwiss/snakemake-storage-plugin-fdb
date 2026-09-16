@@ -3,7 +3,8 @@
 Unit tests of ``snakemake_storage_plugin_fdb.api`` against temporary FDBs, of the
 archive marker (FR-DIRECT-002), of the empty-output convention (FR-DIRECT-004) and of
 the environment export, plus an end-to-end workflow whose jobs use plain pyfdb and
-eccodes and write no GRIB file anywhere.
+eccodes and write no GRIB file anywhere: its outputs are declared ``retrieve=False``
+(FR-DIRECT-005), except the two rules that demonstrate the checked variants.
 """
 
 import importlib.util
@@ -11,6 +12,7 @@ import io
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -500,9 +502,10 @@ SNAKEFILE = '''\
 """Plugin-free jobs: plain pyfdb and eccodes in the bodies, no GRIB file anywhere.
 
 Inputs are declared ``retrieve=False``, so a job holds the query string and parses its
-MARS request from it (FR-DIRECT-001); outputs a job archives itself are declared
-``touch(storage.fdb(...))``: the empty file tells the store step to check instead of
-archive (FR-DIRECT-004). Only the ``api.archive`` rules touch the plugin.
+MARS request from it (FR-DIRECT-001); an output a job archives itself is declared
+``retrieve=False`` too, so nothing local is expected and Snakemake looks the fields up
+in FDB after the job (FR-DIRECT-005). ``touch(storage.fdb(...))`` is the checked variant
+(FR-DIRECT-004). Only the ``api.archive`` rules touch the plugin.
 """
 
 import os
@@ -522,6 +525,9 @@ IN = BASE.format(expver="0001")
 MARKER = BASE.format(expver="0041")           # archived with api.archive (a marker)
 PLAIN = BASE.format(expver="0042")            # archived with plain pyfdb (touch())
 QUANTILE = BASE.format(expver="0043").replace("param=", "quantile=1:10,param=")
+DIRECT = BASE.format(expver="0044")           # archived with plain pyfdb, no local file
+NOOP = BASE.format(expver="0047")             # a job that archives nothing
+NOOP_TOUCH = BASE.format(expver="0048")       # the same, with the checked variant
 BAD = BASE.format(expver="0046")
 
 
@@ -567,6 +573,7 @@ rule all:
         "mixed.txt",
         storage.fdb(MARKER, retrieve=False),
         storage.fdb(PLAIN, retrieve=False),
+        storage.fdb(DIRECT, retrieve=False),
 
 
 rule steps:
@@ -589,6 +596,35 @@ rule plain_shift:
         touch(storage.fdb(PLAIN)),
     run:
         archive_plain(relabelled(input[0], "0042"))
+
+
+rule direct_shift:
+    """The same archive with the output declared retrieve=False: no local file at all,
+    and Snakemake checks the fields in FDB after the job (FR-DIRECT-005)."""
+    input:
+        storage.fdb(IN, retrieve=False),
+    output:
+        storage.fdb(DIRECT, retrieve=False),
+    run:
+        archive_plain(relabelled(input[0], "0044"))
+
+
+rule noop_direct:
+    """A job that archives nothing: with the fields already in FDB, only existence is
+    checked, so this passes (L-32)."""
+    output:
+        storage.fdb(NOOP, retrieve=False),
+    run:
+        print("NOOP: archived nothing", file=sys.stderr)
+
+
+rule noop_touch:
+    """The same job with the checked variant: the post-check wants timestamps from this
+    run and reports the empty output (FR-DIRECT-004)."""
+    output:
+        touch(storage.fdb(NOOP_TOUCH)),
+    run:
+        print("NOOP: archived nothing", file=sys.stderr)
 
 
 rule bad_count:
@@ -692,12 +728,14 @@ PLAIN_QUERY = BASE_QUERY.format(expver="0042")
 QUANTILE_QUERY = BASE_QUERY.format(expver="0043").replace(
     "param=", "quantile=1:10,param="
 )
+DIRECT_QUERY = BASE_QUERY.format(expver="0044")
 LOCAL = (
     ".snakemake/storage/fdb/class=ea/expver={expver}/stream=oper/date=20200101/"
     "time=0000/domain=g/type=an/levtype=sfc/step=0+6+12/param=167.grib"
 )
 MARKER_LOCAL = LOCAL.format(expver="0041")
 PLAIN_LOCAL = LOCAL.format(expver="0042")
+DIRECT_LOCAL = LOCAL.format(expver="0044")
 
 
 def _files(work: Path) -> list[Path]:
@@ -710,8 +748,8 @@ def _files(work: Path) -> list[Path]:
 @pytest.fixture(scope="module")
 def direct(tmp_path_factory, run_logged) -> dict:
     """The plugin-free workflow: first run (verbose, for the process check), second
-    run, a job that archives too few fields, a re-archived input, a run keeping the
-    local copies and ``--delete-all-output``."""
+    run, a job that archives too few fields, two jobs that archive nothing (L-32), a
+    re-archived input, a run keeping the local copies and ``--delete-all-output``."""
     tmp = tmp_path_factory.mktemp("direct")
     run = run_logged(tmp / "logs")
     config = tmp / ".fdb" / "config.yaml"
@@ -744,8 +782,28 @@ def direct(tmp_path_factory, run_logged) -> dict:
     snakemake("identifier", "quantile", "--storage-fdb-archive-mode", "identifier")
     snakemake("bad", "bad_count")
 
-    # A re-archived input field must make the direct rules rerun (mtime trigger).
+    # L-32: a job that archives nothing passes with a retrieve=False output when the
+    # fields are already in FDB, and fails with the checked variant. Both expvers are
+    # archived here, before the runs, so their timestamps precede the runs' reference
+    # times (one FDB clock second, hence the pause).
     backend = Backend(config)
+    for expver in ("0047", "0048"):
+        for step in (0, 6, 12):
+            backend.archive(
+                variant(
+                    TEMPLATE.read_bytes(),
+                    stream="oper",
+                    expver=expver,
+                    step=step,
+                    paramId=167,
+                )
+            )
+    backend.flush()
+    time.sleep(1.1)
+    snakemake("noop_direct", "noop_direct", "--force")
+    snakemake("noop_touch", "noop_touch", "--force")
+
+    # A re-archived input field must make the direct rules rerun (mtime trigger).
     backend.archive(variant(TEMPLATE.read_bytes(), stream="oper", step=0, paramId=167))
     backend.flush()
     snakemake("rerun", "--dry-run")
@@ -779,6 +837,37 @@ def test_direct_workflow_archives_into_fdb(direct):
     direct["run1"].ok()
     for query in (MARKER_QUERY, PLAIN_QUERY):
         assert _fdb_steps(direct["config"], query) == [0, 6, 12]
+
+
+def test_retrieve_false_output_archives_without_a_store_step(direct):
+    """FR-DIRECT-005: the fields are in FDB, no local file was expected or written and
+    the plugin's store step never ran for that output."""
+    log = direct["run1"].ok()
+    assert _fdb_steps(direct["config"], DIRECT_QUERY) == [0, 6, 12]
+    assert f"Storing in storage: {DIRECT_QUERY}" not in log
+    assert DIRECT_LOCAL not in {
+        p.relative_to(direct["work"]).as_posix() for p in direct["kept"]
+    }
+
+
+def test_retrieve_false_output_accepts_a_job_that_archived_nothing(direct):
+    """L-32: only existence is checked, so a job that archives nothing passes when the
+    fields are already in FDB — the freshness check of FR-DIRECT-004 does not run."""
+    log = direct["noop_direct"].ok()
+    assert "NOOP: archived nothing" in log
+    assert direct["noop_direct"].NOTHING_TO_BE_DONE not in log  # the job did run
+
+
+def test_touch_output_rejects_a_job_that_archived_nothing(direct):
+    """The checked variant (FR-DIRECT-004) is what catches the same job: its fields are
+    in FDB, but with timestamps from before this run."""
+    noop = direct["noop_touch"]
+    assert noop.returncode != 0
+    assert "NOOP: archived nothing" in noop.log
+    assert (
+        "is empty, so the job is taken to have archived the fields itself" in noop.log
+    )
+    assert "0 of 3 found in FDB with timestamps from this run" in noop.log
 
 
 def test_direct_workflow_writes_no_data_file(direct):
@@ -831,6 +920,8 @@ def test_direct_workflow_inherits_the_archive_mode(direct):
 
 
 def test_direct_workflow_second_run_is_idle(direct):
+    """Including the retrieve=False output (FR-DIRECT-005): it is up to date because
+    its fields are in FDB, not because a local file exists."""
     run2 = direct["run2"]
     assert run2.NOTHING_TO_BE_DONE in run2.ok()
 

@@ -1139,6 +1139,21 @@ fetcher (`fetch_ogd_samples.py`); `docs/sites/meteoswiss.md` documents them.
   `tests/sites/meteoswiss/test_fetch_ogd_samples.py::test_empty_data_reproduces_committed_samples`,
   `::test_fetch_live`.
 
+#### FR-DEV-003 Forecast-evaluation example
+
+`examples/forecast-evaluation/` is a generic workflow whose every rule reads and writes
+FDB directly (§2.15): a dummy truth, an "ML model", a verification and an animation
+rule, one job each per initialisation time, with every FDB object declared
+`retrieve=False` — inputs the jobs read themselves and outputs they archive themselves
+with plain pyfdb (FR-DIRECT-005) — and the GRIB template read from FDB too, so it needs
+no file outside its directory. It
+needs a development FDB (FR-DEV-001, `--seed --variants`) and the `examples` dependency
+group (earthkit-data, matplotlib).
+
+- Rationale: one runnable workflow showing what the plugin is for — no local copies,
+  reruns by lookup (FR-RERUN-002), FDB as the only data store.
+- Verification: test `tests/test_evaluation_example.py` (skips without the group).
+
 ### 2.15 Direct access from rule bodies
 
 #### FR-DIRECT-001 Direct reads
@@ -1147,7 +1162,8 @@ A rule that names an input `storage.fdb(query, retrieve=False)` receives the que
 instead of a local file and reads its fields with plain `pyfdb` (`FDB().retrieve(request)`)
 or earthkit-data (`from_source("fdb", request)`), which the job environment configures
 (FR-DIRECT-003); no GRIB file is written under `.snakemake/storage` for such an input,
-and no rule body imports the plugin.
+and no rule body imports the plugin. The same flag on an output says that the job
+archives the fields itself (FR-DIRECT-005).
 
 The job derives its MARS request from that string itself (`fdb://` stripped, `,` and
 `=` split; `/` lists and `to`/`by` ranges stay strings, which pyfdb and earthkit-data
@@ -1204,10 +1220,11 @@ the marker's field count and timestamp; a marker for another query, or one whose
 count differs from the expansion, is an error. The marker is an ordinary local copy for
 Snakemake: it is removed after the run unless `--keep-storage-local-copies` is given.
 
-- Rationale: Snakemake has no "no local output" flag — after the job it requires the
-  output's local path to exist and then calls `store_object` — so a direct archive needs
-  something at that path; a marker is small, self-describing and lets the store step keep
-  the post-check that proves the fields are reachable by the query (ADR-035, D-015).
+- Rationale: an output that is not declared `retrieve=False` (FR-DIRECT-005) must have
+  its local path after the job, and Snakemake then calls `store_object`, so a direct
+  archive that wants the plugin's checks needs something at that path; a marker is small,
+  self-describing and lets the store step keep the post-check that proves the fields are
+  reachable by the query (ADR-035).
 - Verification: test `tests/test_direct.py`
   (`test_archive_puts_the_fields_in_fdb_and_writes_a_marker`,
   `test_archive_accepts_bytes_and_iterators`,
@@ -1258,12 +1275,40 @@ A job therefore reads, spells and archives as the workflow does: `archive_mode`,
   `test_direct_workflow_inherits_the_archive_mode`, `test_direct_workflow_runs` — the
   `script:` rule uses plain `pyfdb.FDB()`).
 
+#### FR-DIRECT-005 Direct outputs
+
+An output whose fields the job archives itself is declared
+`storage.fdb(query, retrieve=False)`, the same flag as an input the job reads itself.
+Snakemake then expects no local file for it: after the job it waits (with the latency
+wait) for `exists_in_storage()` instead of the output's local path, skips the plugin's
+store step, the local mtime touch and the local-copy removal, and skips the output in
+its input-newer-than-output check (architecture.md §13.8). Nothing is written under
+`.snakemake/storage`; everything else is unchanged — the query links producer and
+consumer in the DAG, a missing field is reported as `Missing output files: fdb://...
+(in storage)`, `--summary` lists the output and a second run has nothing to do. The job
+must `flush()` before it ends, or its fields are not visible to that check.
+
+Only existence is checked, so a job that exits 0 having archived nothing passes when the
+query's fields are already in FDB (L-32); FR-DIRECT-004 is the checked variant.
+
+- Rationale: the writing counterpart of FR-DIRECT-001 — a job that keeps its fields out
+  of the filesystem should not have to leave a placeholder there, and one flag on both
+  sides is one rule to learn (ADR-037).
+- Verification: test `tests/test_direct.py`
+  (`test_retrieve_false_output_archives_without_a_store_step`,
+  `test_retrieve_false_output_accepts_a_job_that_archived_nothing`,
+  `test_direct_workflow_second_run_is_idle`,
+  `test_direct_workflow_writes_no_data_file`),
+  `tests/test_evaluation_example.py`; `docs/patterns.md` (`script-plain-archive`).
+
 #### FR-DIRECT-004 The empty-output convention
 
-A job that archives its output's fields itself with plain `pyfdb` declares the output
-`touch(storage.fdb(query))`. The empty local file Snakemake then leaves at the output's
-path means "the job archived these fields": `store_object` archives nothing and runs a
-post-check requiring every field of the query to be in FDB with an index timestamp not
+The checked variant of FR-DIRECT-005, for a run that must prove it archived the fields
+itself: a job that archives its output's fields with plain `pyfdb` declares the output
+`touch(storage.fdb(query))` instead of `retrieve=False`. The empty local file Snakemake
+then leaves at the output's path means "the job archived these fields": `store_object`
+archives nothing and runs a post-check
+requiring every field of the query to be in FDB with an index timestamp not
 older than the **reference time** of the run — the FDB clock second read when the
 provider of the storing process was constructed (architecture.md §8.7). Its message
 states the evidence and the counts (`<local> is empty, so the job is taken to have
@@ -1275,12 +1320,14 @@ problem (L-31). Under the local executor the store step runs in the main Snakema
 process for `shell:`, `run:` and `script:` rules alike, so the reference time is the
 start of the workflow.
 
-- Rationale: with it, a rule body needs nothing but `pyfdb` to write into FDB; the
-  plugin still proves that the declared fields are there (ADR-036). Snakemake has no
-  "no local output" flag (D-015), and `touch()` is its own way of saying "the job
-  produced this without a file".
+- Rationale: with it, a rule body needs nothing but `pyfdb` to write into FDB and the
+  plugin proves that this run put the declared fields there (ADR-036); the existence
+  check of FR-DIRECT-005 cannot (L-32). `touch()` is Snakemake's own way of saying "the
+  job produced this without a file"; the post-job verify hook that would make the check
+  possible without any local file is deferred (D-015).
 - Verification: test `tests/test_direct.py`
   (`test_store_object_accepts_an_empty_output`,
+  `test_touch_output_rejects_a_job_that_archived_nothing`,
   `test_store_object_empty_output_with_missing_fields`,
   `test_store_object_empty_output_with_stale_fields`,
   `test_store_object_of_a_non_empty_non_grib_file`,
@@ -1288,7 +1335,7 @@ start of the workflow.
   `test_direct_workflow_store_runs_in_the_main_process`,
   `test_direct_workflow_too_few_fields_is_reported`,
   `test_direct_workflow_writes_no_data_file`); `docs/patterns.md`
-  (`script-plain-archive`).
+  (`run-plain-checked`).
 
 ---
 
@@ -1365,10 +1412,11 @@ Test FDBs live in pytest's temporary directories.
 #### NFR-PERF-005 No local data copies for direct jobs
 
 A workflow whose `run:` and `script:` rules read straight from FDB (FR-DIRECT-001) and
-archive straight into FDB (FR-DIRECT-004, FR-DIRECT-002) writes no GRIB file under
-`.snakemake/storage`: the only file that appears there for such a rule is the output's
-empty file, or the archive marker of an `api.archive` output (a few hundred bytes), and
-only until the local copies are cleaned up. `api.messages` streams one message at a
+archive straight into FDB (FR-DIRECT-005, FR-DIRECT-004, FR-DIRECT-002) writes no GRIB
+file under `.snakemake/storage`: with `retrieve=False` outputs nothing appears there at
+all, and with the checked variants the only file is the output's empty file or the
+archive marker of an `api.archive` output (a few hundred bytes), and only until the
+local copies are cleaned up. `api.messages` streams one message at a
 time, so job memory does not grow with the size of the query.
 
 - Rationale: the reason for an FDB workflow is to keep the pressure off the filesystem;
@@ -1534,8 +1582,9 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
 | L-28 | Relative dates (`date=-1`) expand at run time, but the local path keeps the text, so a copy kept with `--keep-storage-local-copies` goes stale. |
-| L-29 | Direct access (FR-DIRECT-001/002/004) is for rule bodies written in Python (`run:`, `script:`, `notebook:`) or for programs that use pyfdb themselves. A `shell:` rule that hands the fields to an external program still needs a file: leave the input retrieved and the output a plain FDB output. A directly archived output leaves an empty file or a marker at the local path, and `--keep-storage-local-copies` keeps those like any other local copy; `--delete-all-output` deletes neither the FDB fields (FR-REMOVE-001) nor kept local copies. |
+| L-29 | Direct access (FR-DIRECT-001/002/004/005) is for rule bodies written in Python (`run:`, `script:`, `notebook:`) or for programs that use pyfdb themselves. A `shell:` rule that hands the fields to an external program still needs a file: leave the input retrieved and the output a plain FDB output. A directly archived output declared with one of the checked variants leaves an empty file or a marker at the local path, and `--keep-storage-local-copies` keeps those like any other local copy; `--delete-all-output` deletes neither the FDB fields (FR-REMOVE-001) nor kept local copies. |
 | L-31 | The empty-output convention (FR-DIRECT-004) checks by timestamp, not by identity: the post-check accepts every field of the query whose index timestamp is not older than the run's reference time, so a field an earlier job of the same run archived under the same query, or a field archived by another process during the run, satisfies it. Nothing is checked before the job's archives either, so a job that writes wrong fields puts them in FDB (they stay until masked) and only the missing ones are reported. `api.archive` (FR-DIRECT-002) is stricter (pre-checks and a marker naming query, count and time), a file-based store strictest. The reference time is one FDB clock second, so a field archived in the same second as the provider's construction passes even if it predates the run. |
+| L-32 | An output declared `retrieve=False` (FR-DIRECT-005) is checked for existence only: the plugin's store step never runs for it, so the freshness post-check of FR-DIRECT-004 does not either. A job that exits 0 having archived nothing, or the wrong fields, therefore passes whenever FDB already holds the query's fields — from an earlier run of the same workflow, say — and the workflow reports success. Declaring the output `touch(storage.fdb(query))` is the interim mitigation (the check costs an empty local file); the fix is an upstream post-job verify hook for storage outputs (D-015). |
 
 ---
 
@@ -1575,5 +1624,5 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-012 | Report the `inspect` vs `list` discrepancy upstream | `inspect`/`retrieve` match through query keys absent from the indexed fields while `list` does not (L-22, architecture.md §13.4); same behaviour on pyfdb 5.21.4.23 and 5.23.2. Open an issue on `ecmwf/fdb` asking whether this is intended; drop the plugin-side key check (FR-READ-001) if it is ever fixed. |
 | D-013 | Report the `{provider}` formatting of invalid-query messages upstream | `snakemake/storage.py:205-209` (snakemake 9.27.0) formats the provider object into the catalogue URL of an invalid query, so a plugin without `__str__` produces `.../plugins/storage/<...StorageProvider object at 0x...>.html`. The plugin works around it with `StorageProvider.__str__` (FR-IFACE-002); upstream should use the plugin name. |
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |
-| D-015 | An upstream "no local output" flag for storage outputs | Snakemake requires an FDB output's local path to exist after the job and then calls `store_object`, so a job that archived the fields itself must leave something there: an empty file (FR-DIRECT-004) or the archive marker `api.archive` writes (ADR-035, ADR-036, FR-DIRECT-002). Propose the output-side counterpart of `retrieve=False` (e.g. `storage.fdb(query, store=False)` or a `StorageObjectWrite.stored_by_job` hook) so that no file is needed at all. FIFOs (`pipe()`) were considered and rejected: a storage object cannot carry `pipe()` (architecture.md §13.8). |
+| D-015 | An upstream post-job verify hook for storage outputs | The "no local output" flag exists: `storage.fdb(query, retrieve=False)` on an output makes Snakemake check `exists_in_storage()` after the job instead of a local path (FR-DIRECT-005, ADR-037, architecture.md §13.8). What is missing is a way to run the plugin's own post-check there, since `store_object` is skipped and `exists()` cannot tell a post-job check from a DAG lookup: propose a hook such as `StorageObjectWrite.verify_stored()`, called from `dag.handle_storage` for outputs with `should_not_be_retrieved_from_storage`, so that the freshness check of FR-DIRECT-004 can run without any local file (L-32). Until then, `touch()` plus an empty file is the checked variant (ADR-036); FIFOs (`pipe()`) were considered and rejected: a storage object cannot carry `pipe()` (architecture.md §13.8). |
 | D-016 | Verify the empty-output convention under other executors | The store step runs in the main Snakemake process under the local executor, so the reference time of FR-DIRECT-004 is the start of the workflow; under cluster and cloud executors the store may run in the job process, whose provider gives a later reference time (still before the job's archives). Verify per executor when one is tested (L-19 limits tagged settings there anyway). |

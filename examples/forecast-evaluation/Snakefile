@@ -1,0 +1,233 @@
+"""A dummy forecast-evaluation pipeline on a development FDB (../../.fdb).
+
+    uv run snakemake --profile profile -c4
+    uv run snakemake --profile profile -c1 metrics/2020-01-04T00:00.csv   # any init time
+
+All fields are read from and written to FDB directly, with plain pyfdb, eccodes and
+earthkit-data: no rule sees a local GRIB file and nothing here imports the storage
+plugin. Every FDB object a job reads or writes itself is declared `retrieve=False`,
+input or output alike: the job gets the query strings and parses its MARS requests from
+them, and Snakemake checks an output by looking its fields up in FDB instead of on the
+filesystem (see the user guide, "Direct access from run and script rules").
+Nothing data-related goes through `params:`, whose rerun trigger would fire on any edit.
+
+Stages, each one job per initialisation time (the {init_time} wildcard, ISO 8601), all
+data passing through FDB:
+
+    truth      random analyses (type=an) for the requested params and steps
+                 -> expver=<truth_expver>
+    run_model  the "ML model": reads the truth at step 0 as initial condition, writes
+                 forecasts (type=fc) for the requested params and steps
+                 -> expver=<hash of the model checkpoint>
+    verify     RMSE of the forecast against the truth -> metrics/{init_time}.csv
+    animate    one GIF per init time with a frame per step -> animations/{init_time}.gif
+
+config.yaml decides the init times, params, steps and the model checkpoint. The
+params are what gets evaluated and what the model writes: adding one makes the model
+rerun (its FDB output is missing), removing one does not (input tracking by lookup).
+"""
+
+import hashlib
+import sys
+from datetime import datetime
+
+sys.path.insert(0, workflow.basedir)  # dummy.py next to this Snakefile
+
+configfile: "config.yaml"
+
+
+storage:
+    provider="fdb"
+
+
+wildcard_constraints:
+    init_time=r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}",
+    date=r"\d{8}",
+    time=r"\d{4}",
+
+
+PARAMS = [str(p) for p in config["params"]]
+STEPS = [int(s) for s in config["steps"]]
+TRUTH = str(config["truth_expver"])
+# The experiment version of the model: 4 hex characters of the checkpoint's hash.
+EXPVER = hashlib.sha256(config["model"]["checkpoint"].encode()).hexdigest()[:4]
+print(f"model checkpoint {config['model']['checkpoint']} -> expver={EXPVER}", file=sys.stderr)
+
+# The GRIB message every generated field is a copy of: one field of the development FDB
+# (`init_dev_fdb.py --seed --variants`). Reading the template from FDB too keeps the
+# example self-contained — it needs no file besides this directory.
+TEMPLATE = (
+    "fdb://class=ea,expver=0001,stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0,param=167"
+)
+
+
+def query(expver, type_, date, time, param, steps=STEPS):
+    """The FDB query of one parameter: what the DAG sees and what the job parses."""
+    return (
+        f"fdb://class=ea,expver={expver},stream=oper,date={date},time={time},domain=g,"
+        f"type={type_},levtype=sfc,step={'/'.join(str(s) for s in steps)},param={param}"
+    )
+
+
+def mars_date_time(init_time):
+    """'2020-01-01T00:00' -> ('20200101', '0000')."""
+    t = datetime.fromisoformat(init_time)
+    return t.strftime("%Y%m%d"), t.strftime("%H%M")
+
+
+def date_time_of(wildcards):
+    """The job's MARS date and time from {init_time} or from {date}/{time}."""
+    if hasattr(wildcards, "init_time"):
+        return mars_date_time(wildcards.init_time)
+    return wildcards.date, wildcards.time
+
+
+def per_param(expver, type_):
+    """Input function factory: one query per parameter for the job's init time."""
+
+    def inputs(wildcards):
+        date, time = date_time_of(wildcards)
+        queries = [query(expver, type_, date, time, p) for p in PARAMS]
+        return storage.fdb(queries, retrieve=False)  # the job gets the query strings
+
+    return inputs
+
+
+def per_param_outputs(expver, type_):
+    """Output list: one query per parameter, with {date}/{time} as wildcards.
+
+    An `fdb://` query cannot hold `{init_time}`: its value has a colon and a dash, so
+    the outputs use `{date}`/`{time}` and the input functions convert the init time.
+
+    ``retrieve=False``: the job archives the fields itself, so Snakemake asks FDB
+    whether every field of the query is there instead of waiting for a local file, and
+    nothing at all appears under `.snakemake/storage`.
+    """
+    queries = [query(expver, type_, "{date}", "{time}", p) for p in PARAMS]
+    return storage.fdb(queries, retrieve=False)
+
+
+rule all:
+    input:
+        expand("metrics/{init_time}.csv", init_time=config["init_times"]),
+        expand("animations/{init_time}.gif", init_time=config["init_times"]),
+
+
+# Simulated truth: random analyses for every requested parameter and step.
+rule truth:
+    input:
+        template=storage.fdb(TEMPLATE, retrieve=False),
+    output:
+        per_param_outputs(TRUTH, "an"),
+    run:
+        import numpy as np
+        from dummy import archive_fields, build_fields, read_message, truth_field
+
+        template = read_message(input.template)  # plain pyfdb, one message
+        seed = int(wildcards.date) * 100 + int(wildcards.time) // 100
+        for param in PARAMS:
+            rng = np.random.default_rng(seed * 1000 + int(param))
+            archive_fields(
+                build_fields(
+                    template=template,
+                    expver=TRUTH,
+                    date=wildcards.date,
+                    time=wildcards.time,
+                    type_="an",
+                    param=param,
+                    values_by_step={s: truth_field(rng, param, s) for s in STEPS},
+                )
+            )
+
+
+# The ML model: initial condition = truth at step 0, forecast = growing random error.
+# The input is the whole truth query (all steps), not a step=0 sub-query: Snakemake
+# links inputs to outputs by query text, so a sub-query of what `truth` produces would
+# have no producer in the DAG (docs/patterns.md, "One field, one rule"). The job reads
+# its inputs (the query strings) and picks the step it needs.
+rule run_model:
+    input:
+        template=storage.fdb(TEMPLATE, retrieve=False),
+        truth=per_param(TRUTH, "an"),
+    output:
+        per_param_outputs(EXPVER, "fc"),
+    run:
+        import numpy as np
+        from dummy import (
+            archive_fields,
+            build_fields,
+            forecast_field,
+            read_message,
+            read_query,
+        )
+
+        template = read_message(input.template)
+        rng = np.random.default_rng(int(hashlib.sha256(EXPVER.encode()).hexdigest()[:8], 16))
+        for param, truth_query in zip(PARAMS, input.truth):
+            initial = read_query(truth_query)[0]  # the analysis at step 0
+            archive_fields(
+                build_fields(
+                    template=template,
+                    expver=EXPVER,
+                    date=wildcards.date,
+                    time=wildcards.time,
+                    type_="fc",
+                    param=param,
+                    values_by_step={s: forecast_field(rng, initial, s) for s in STEPS},
+                )
+            )
+
+
+# Verification: RMSE per parameter and step, forecast against truth.
+rule verify:
+    input:
+        forecast=per_param(EXPVER, "fc"),
+        truth=per_param(TRUTH, "an"),
+    output:
+        "metrics/{init_time}.csv",
+    run:
+        import numpy as np
+        from dummy import read_query
+
+        with open(output[0], "w") as f:
+            print("init_time,expver,param,step,rmse", file=f)
+            for param, fc_query, an_query in zip(PARAMS, input.forecast, input.truth):
+                fc, an = read_query(fc_query), read_query(an_query)
+                for s in STEPS:
+                    rmse = float(np.sqrt(np.mean((fc[s] - an[s]) ** 2)))
+                    print(f"{wildcards.init_time},{EXPVER},{param},{s},{rmse:.4f}", file=f)
+
+
+# Animation: one GIF per init time, one frame per step, one panel per parameter.
+rule animate:
+    input:
+        per_param(EXPVER, "fc"),
+    output:
+        "animations/{init_time}.gif",
+    run:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation, PillowWriter
+        from dummy import GRID, read_query
+
+        fields = {p: read_query(q) for p, q in zip(PARAMS, input)}
+        fig, axes = plt.subplots(1, len(PARAMS), figsize=(4 * len(PARAMS), 3.2), squeeze=False)
+        images = []
+        for ax, p in zip(axes[0], PARAMS):
+            data = fields[p]
+            vmin, vmax = min(v.min() for v in data.values()), max(v.max() for v in data.values())
+            images.append(ax.imshow(data[STEPS[0]].reshape(GRID), vmin=vmin, vmax=vmax))
+            ax.set_xticks([]), ax.set_yticks([])
+        title = fig.suptitle("")
+
+        def frame(step):
+            for im, p in zip(images, PARAMS):
+                im.set_data(fields[p][step].reshape(GRID))
+            title.set_text(f"{wildcards.init_time} expver={EXPVER} step={step} params={','.join(PARAMS)}")
+            return images
+
+        FuncAnimation(fig, frame, frames=STEPS, blit=False).save(output[0], writer=PillowWriter(fps=1))
+        plt.close(fig)
