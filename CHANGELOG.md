@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Jobs no longer need the plugin: a `run:` or `script:` body parses its MARS request
+  from the query string it holds as input, reads FDB with plain `pyfdb` or earthkit-data
+  and archives with plain `pyfdb`, declaring such an output `touch(storage.fdb(query))`
+  (the empty file makes the store step check instead of archive; see the user guide).
+- `api.query(request)`: the query string of a MARS request given as a dict (values
+  joined with `/`, wildcards allowed), the inverse of `api.request(query)`.
+
+### Changed
+
+- The provider exports its FDB configuration as YAML text in `FDB5_CONFIG` (a file's
+  relative paths made absolute), plus `FDB_CONFIG_FILE` for a configuration file,
+  instead of `FDB_CONFIG_FILE`/`FDB_CONFIG` alone: earthkit-data's `fdb` source reads
+  only `FDB5_CONFIG`, so `from_source("fdb", request)` now works in a job without an
+  argument, and fdb5 reads the text first, so pyfdb opens the same FDB.
+- The user guide's "Direct access from run and script rules", the reference's direct
+  access section and the direct-access patterns are written around plain pyfdb, eccodes
+  and earthkit-data; the `api` module is documented as an optional convenience for
+  Snakefiles and for pre-checked archives.
+
+### Removed
+
+- `api.open`, `api.retrieve` and `api.earthkit`. They encouraged plugin imports inside
+  jobs and are one call of the libraries themselves: `pyfdb.FDB().retrieve(request)`,
+  a retrieval into a file where a job really needs one, and
+  `earthkit.data.from_source("fdb", request)`. `api.request(query)` gives the request
+  for all three.
+
 ## [0.3.0] - 2026-09-16
 
 Direct FDB access from jobs, field-based rerun decisions, a tested patterns guide and

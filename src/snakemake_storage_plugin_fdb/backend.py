@@ -186,6 +186,38 @@ def _fdb_config(config: ConfigValue, env: Mapping[str, str]) -> dict[str, Any]:
     return {}
 
 
+def config_text(config: ConfigValue) -> str | None:
+    """The YAML text of ``config`` for the ``FDB5_CONFIG`` export (FR-DIRECT-003).
+
+    Inline text is exported as it is. A file's mapping is dumped with its relative
+    paths (``schema``, the roots' ``path``) made absolute against the working
+    directory, which is where fdb5 resolves them (architecture.md §13.7), so that a job
+    running elsewhere opens the same FDB. ``None`` for a file that holds no mapping.
+    """
+    if isinstance(config, str):
+        return config
+    mapping = _load_mapping(config)
+    return yaml.safe_dump(_absolute_paths(mapping)) if mapping else None
+
+
+_PATH_KEYS = frozenset({"schema", "path"})  # path-valued keys of a local fdb5 config
+
+
+def _absolute_paths(node: Any) -> Any:
+    """``node`` with the relative ``_PATH_KEYS`` values made absolute; ``~`` paths
+    (``~fdb`` expands inside fdb5) are left alone."""
+    if isinstance(node, dict):
+        return {
+            k: os.path.abspath(v)
+            if k in _PATH_KEYS and isinstance(v, str) and not v.startswith("~")
+            else _absolute_paths(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_absolute_paths(item) for item in node]
+    return node
+
+
 def local_roots(
     config: ConfigValue, env: Mapping[str, str] | None = None
 ) -> list[Path]:

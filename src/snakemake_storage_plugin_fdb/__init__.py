@@ -42,6 +42,7 @@ from .backend import (
     Backend,
     Field,
     SchemaInfo,
+    config_text,
     count_fields,
     distinct_values,
     fallback_expand,
@@ -86,9 +87,9 @@ _SPELLING_WARNED: set[str] = set()
 _REMOVE_WARNED: set[str] = set()
 _PARTIAL_WARNED: set[str] = set()
 # The FDB configuration this process exported for direct access (FR-DIRECT-003), as
-# (variable, value), and whether providers disagreed on it (then nothing is exported).
+# {variable: value}, and whether providers disagreed on it (then nothing is exported).
 FDB_CONFIG_VARS = ("FDB_CONFIG", "FDB5_CONFIG", "FDB_CONFIG_FILE", "FDB5_CONFIG_FILE")
-_FDB_EXPORTED: tuple[str, str] | None = None
+_FDB_EXPORTED: dict[str, str] | None = None
 _FDB_EXPORT_CONFLICT = False
 _WARNED_LOCK = threading.Lock()
 FieldId = tuple[tuple[str, str], ...]  # one field of a query: its key=value pairs
@@ -334,6 +335,9 @@ class StorageProvider(StorageProviderBase):
             self.config, self.user_config, self.logger, self.schema_info
         )
         self.guard = make_guard(settings)
+        # Reference time of the empty-output convention (FR-DIRECT-004, L-31): fields a
+        # directly archiving job produced carry an index timestamp from after this.
+        self.run_time = fdb_time()
 
     # --- construction helpers ------------------------------------------------------
 
@@ -394,23 +398,30 @@ class StorageProvider(StorageProviderBase):
         """Put this provider's FDB configuration in the environment (FR-DIRECT-003);
         called under ``_ENV_LOCK`` after the other variables are exported.
 
-        ``FDB_CONFIG_FILE`` for a configuration file, ``FDB_CONFIG`` for inline YAML, so
-        that ``pyfdb.FDB()`` and earthkit's ``fdb`` source open the same FDB in a
-        ``run:`` or ``script:`` job without being configured (fdb5 has no variable for
-        the user configuration, architecture.md §13.7). A configuration the environment
-        already names is never overwritten, and providers with different
+        The configuration goes out as YAML text in ``FDB5_CONFIG``, the one variable
+        both pyfdb and earthkit-data's ``fdb`` source read (architecture.md §13.7,
+        §13.13), and a configuration file also as ``FDB_CONFIG_FILE`` for tools that
+        want the path; fdb5 reads the text first, so both name the same FDB. A job then
+        opens it with an unconfigured ``pyfdb.FDB()`` or ``from_source("fdb", ...)``
+        (fdb5 has no variable for the user configuration). A configuration the
+        environment already names is never overwritten, and providers with different
         configurations (tagged providers) export nothing at all: one process has one
         environment (architecture.md §8.3).
         """
         global _FDB_EXPORTED, _FDB_EXPORT_CONFLICT
-        name = "FDB_CONFIG_FILE" if isinstance(self.config, Path) else "FDB_CONFIG"
-        value = str(self.config)
-        if _FDB_EXPORT_CONFLICT or os.environ.get(name) == value:
+        exports = {}
+        if text := config_text(self.config):
+            exports["FDB5_CONFIG"] = text
+        if isinstance(self.config, Path):
+            exports["FDB_CONFIG_FILE"] = str(self.config)
+        if _FDB_EXPORT_CONFLICT or all(
+            os.environ.get(n) == v for n, v in exports.items()
+        ):
             return  # nothing to do: a spawned job, or the same configuration again
-        if _FDB_EXPORTED is not None and _FDB_EXPORTED != (name, value):
-            exported, before = _FDB_EXPORTED
-            if os.environ.get(exported) == before:
-                del os.environ[exported]
+        if _FDB_EXPORTED is not None and _FDB_EXPORTED != exports:
+            for name, before in _FDB_EXPORTED.items():
+                if os.environ.get(name) == before:
+                    del os.environ[name]
             _FDB_EXPORTED, _FDB_EXPORT_CONFLICT = None, True
             self.logger.debug(
                 "FDB storage: providers in one process use different FDB "
@@ -420,13 +431,15 @@ class StorageProvider(StorageProviderBase):
             return
         if foreign := [n for n in FDB_CONFIG_VARS if n in os.environ]:
             self.logger.debug(
-                f"FDB storage: {', '.join(foreign)} already set; not exporting {name} "
-                "for direct access"
+                f"FDB storage: {', '.join(foreign)} already set; not exporting "
+                f"{', '.join(exports)} for direct access"
             )
             return
-        os.environ[name] = value
-        _FDB_EXPORTED = (name, value)
-        self.logger.debug(f"FDB storage: exported {name} for direct FDB access")
+        os.environ.update(exports)
+        _FDB_EXPORTED = exports
+        self.logger.debug(
+            f"FDB storage: exported {', '.join(exports)} for direct FDB access"
+        )
 
     @staticmethod
     def _absolute(value: Path | str | None) -> Path | str | None:
@@ -774,10 +787,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             )
         return 0.0
 
-    def _missing_message(self, fields: list[Field]) -> str:
-        """Retrieve error: found/expected counts, the first missing combinations
-        (keys with several values only) and, if nothing matched, the optional
-        schema keys the query does not name (FR-READ-008)."""
+    def _missing_list(self, fields: list[Field], label: str) -> str:
+        """``; <label>: <combination>; ...[ (and <k> more)]`` for the field
+        combinations of the query that no field of ``fields`` has (keys with several
+        values only); empty when the expansion names no such combination."""
         expanded = self._expanded()
         keys = self.provider.key_order.sorted(expanded)
         values = distinct_values(expanded, keys)
@@ -788,19 +801,29 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             ",".join(f"{keys[i]}={c[i]}" for i in varying)
             for c in itertools.islice(combos, MISSING_SHOWN)
         ]
-        expected = self._expected()
-        missing = expected - len(fields)
-        message = f"{self.query}: {len(fields)} of {expected} fields found in FDB"
-        if shown:
-            message += f"; missing: {'; '.join(shown)}"
-            if missing > len(shown):
-                message += f" (and {missing - len(shown)} more)"
+        if not shown:
+            return ""
+        text = f"; {label}: {'; '.join(shown)}"
+        if (missing := self._expected() - len(fields)) > len(shown):
+            text += f" (and {missing - len(shown)} more)"
+        return text
+
+    def _missing_message(self, fields: list[Field]) -> str:
+        """Retrieve error: found/expected counts, the first missing combinations
+        (keys with several values only) and, if nothing matched, the optional
+        schema keys the query does not name (FR-READ-008)."""
+        message = (
+            f"{self.query}: {len(fields)} of {self._expected()} fields found in FDB"
+        )
+        message += self._missing_list(fields, "missing")
         info = self.provider.schema_info
-        if not fields and info is not None and (optional := info.optional - set(keys)):
-            message += (
-                ". FDB matches keys exactly; optional schema keys not in the query: "
-                + ", ".join(sorted(optional))
-            )
+        if not fields and info is not None:
+            keys = self.provider.key_order.sorted(self._expanded())
+            if optional := info.optional - set(keys):
+                message += (
+                    ". FDB matches keys exactly; optional schema keys not in the "
+                    "query: " + ", ".join(sorted(optional))
+                )
         return message
 
     def _exists(self, fields: list[Field]) -> bool:
@@ -879,10 +902,14 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         requires every message to be reachable by the query with a timestamp from this
         store.
 
-        A local file that is an archive marker means the job archived the fields itself
-        (FR-DIRECT-002): nothing is archived here, only the post-check runs.
+        An empty local file means the job archived the fields itself with plain pyfdb
+        (FR-DIRECT-004), an archive marker that it used ``api.archive`` (FR-DIRECT-002):
+        nothing is archived here, only the post-check runs.
         """
         local = self.local_path()
+        if local.is_file() and local.stat().st_size == 0:
+            self._post_check_empty(local)
+            return
         marker = read_marker(local)
         if marker is not None:
             self._post_check_marker(marker, local)
@@ -939,12 +966,47 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         """FR-STORE-009: every archived message must be reachable by the query with a
         timestamp from this store. ``keyed`` (absent for a marker) names the offenders.
         """
-        fresh = [f for f in self._fields() if self._field_time(f) >= t_start]
+        fresh, _ = self._fresh(t_start)
         if len(fresh) < n:
             raise WorkflowError(
                 f"{self.query}: {counts}; {n - len(fresh)} landed outside the query "
                 f"or are duplicates{self._offenders(keyed or [], fresh)} ({STAY_NOTE})"
             )
+
+    def _fresh(self, since: float) -> tuple[list[Field], list[Field]]:
+        """The query's fields in FDB with an index timestamp from ``since`` on, and
+        the older ones: one ``inspect`` (architecture.md §8.7)."""
+        fresh: list[Field] = []
+        stale: list[Field] = []
+        for f in self._fields():
+            (fresh if self._field_time(f) >= since else stale).append(f)
+        return fresh, stale
+
+    def _post_check_empty(self, local: Path) -> None:
+        """Post-check of fields a job archived with plain pyfdb (FR-DIRECT-004).
+
+        An empty local file is the job's statement that it archived the query's fields
+        itself. Nothing was checked before those archives, so everything is checked
+        here: every field of the query must be in FDB with an index timestamp not older
+        than the reference time of this run (the FDB clock when the provider of this
+        process was constructed, L-31).
+        """
+        since = self.provider.run_time
+        self.provider.logger.debug(
+            f"FDB storage: {self.query}: {local} is empty; the fields must have index "
+            f"timestamps >= {since} (this run's reference, pid {os.getpid()})"
+        )
+        fresh, stale = self._fresh(since)
+        if len(fresh) >= self._expected():
+            return
+        message = (
+            f"{self.query}: {local} is empty, so the job is taken to have archived "
+            f"the fields itself; {len(fresh)} of {self._expected()} found in FDB with "
+            f"timestamps from this run{self._missing_list(fresh, 'missing or older')}"
+        )
+        if stale:
+            message += f"; {len(stale)} of the query's fields are from before this run"
+        raise WorkflowError(message)
 
     def _post_check_marker(self, marker: Marker, local: Path) -> None:
         """Post-check of fields a job archived itself (FR-DIRECT-002): the marker must

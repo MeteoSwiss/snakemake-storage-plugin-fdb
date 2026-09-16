@@ -456,15 +456,19 @@ with open(snakemake.input[0], "rb") as fi, open(snakemake.output[0], "w") as fo:
         eccodes.codes_release(handle)
 ```
 
-### Direct access: no local files
+### Direct access: plain libraries, no local files
 
-A `run:` or `script:` body can read the fields straight from FDB. Flag the input
-`retrieve=False` — the job then gets the **query string** instead of a path — and read it
-with the plugin's `api` module ([user
-guide](user-guide.md#direct-access-from-run-and-script-rules)). Nothing is written under
-`.snakemake/storage`, which the rule below prints (`STAGED: 0`).
+A `run:` or `script:` body can read the fields straight from FDB and archive straight
+into FDB with **plain pyfdb, eccodes or earthkit-data**; no rule imports the plugin
+([user guide](user-guide.md#direct-access-from-run-and-script-rules)). Flag the input
+`retrieve=False` — the job then gets the query string instead of a path — and derive
+the MARS request from that string in the job (strip `fdb://`, split on `,` and `=`; `/`
+lists stay strings, which pyfdb and earthkit-data take as MARS lists). The provider puts
+its FDB configuration in the job environment, so `pyfdb.FDB()` and
+`from_source("fdb", request)` need no arguments. Nothing GRIB-shaped is written under
+`.snakemake/storage`, which the rules below print (`GRIB FILES: 0`).
 
-<!-- pattern: run-direct; expect: STEPS: 0 6 12; expect: STAGED: 0 -->
+<!-- pattern: run-plain; expect: STEPS: 0 6 12; expect: GRIB FILES: 0 -->
 ```snakemake
 storage:
     provider="fdb"
@@ -484,25 +488,26 @@ rule steps:
         from pathlib import Path
 
         import eccodes
+        import pyfdb
 
-        from snakemake_storage_plugin_fdb import api
-
-        steps = []
-        for message in api.messages(input[0]):  # input[0] is the query text
-            handle = eccodes.codes_new_from_message(message)
-            steps.append(eccodes.codes_get_string(handle, "step"))
-            eccodes.codes_release(handle)
+        query = input[0].removeprefix("fdb://")  # input[0] is the query text
+        request = dict(item.split("=", 1) for item in query.split(","))
+        with pyfdb.FDB().retrieve(request) as source:
+            data = source.read()  # every field of the request, one buffer
+        steps = [str(message.get("step")) for message in eccodes.MemoryReader(data)]
         Path(output[0]).write_text(" ".join(steps) + "\n")
 
-        staged = [p for p in Path(".snakemake/storage").rglob("*") if p.is_file()]
+        storage = Path(".snakemake/storage")
+        grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
         print("STEPS:", *steps, file=sys.stderr)
-        print("STAGED:", len(staged), file=sys.stderr)
+        print("GRIB FILES:", len(grib), file=sys.stderr)
 ```
 
-A `script:` rule gets the query in `snakemake.input[0]`. The provider also puts its FDB
-configuration in the environment, so plain `pyfdb` works without being configured:
+A `script:` rule gets the query in `snakemake.input[0]`. This one reads with
+earthkit-data where it is installed and with pyfdb otherwise; both are configured by the
+environment the provider prepared.
 
-<!-- pattern: script-direct; expect: MEANS: 3 -->
+<!-- pattern: script-plain; expect: MEANS: 3; expect: GRIB FILES: 0 -->
 ```snakemake
 storage:
     provider="fdb"
@@ -518,39 +523,104 @@ rule mean:
     output:
         "mean.txt",
     script:
-        "scripts/direct_mean.py"
+        "scripts/plain_mean.py"
 ```
 
-<!-- pattern: script-direct; file: scripts/direct_mean.py -->
+<!-- pattern: script-plain; file: scripts/plain_mean.py -->
 ```python
-"""The mean of every field of the query, read straight from FDB with pyfdb."""
+"""The mean of every field of the job's input query, read straight from FDB."""
 
 import sys
+from pathlib import Path
+
+query = snakemake.input[0].removeprefix("fdb://")
+request = dict(item.split("=", 1) for item in query.split(","))
+
+try:
+    from earthkit.data import from_source
+except ImportError:
+    import eccodes
+    import pyfdb
+
+    with pyfdb.FDB().retrieve(request) as source:
+        data = source.read()
+    means = [m.get_array("values").mean() for m in eccodes.MemoryReader(data)]
+else:
+    means = [f.to_numpy().mean() for f in from_source("fdb", request).to_fieldlist()]
+
+Path(snakemake.output[0]).write_text("".join(f"{m:.3f}\n" for m in means))
+storage = Path(".snakemake/storage")
+grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
+print("MEANS:", len(means), file=sys.stderr)
+print("GRIB FILES:", len(grib), file=sys.stderr)
+```
+
+Outputs work the same way: the job archives with `pyfdb.FDB().archive(...)` and the
+output is declared `touch(storage.fdb(...))`. The empty file Snakemake leaves at the
+output's local path tells the store step that the job archived the fields itself; the
+store archives nothing and checks that every field of the query is in FDB with a
+timestamp from this run. This is the [first write pattern](#one-rule-one-query) without
+a GRIB file anywhere.
+
+<!-- pattern: script-plain-archive; rerun: nothing; expect: Storing in storage: fdb://class=ea,expver=0023; expect: GRIB FILES: 0 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+QUERY = (
+    "fdb://class=ea,expver={expver},stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule shift_expver:
+    input:
+        storage.fdb(QUERY.format(expver="0001"), retrieve=False),
+    params:
+        expver="0023",  # a plain value: fine in params, unlike the request
+    output:
+        touch(storage.fdb(QUERY.format(expver="0023"))),
+    script:
+        "scripts/plain_shift.py"
+```
+
+<!-- pattern: script-plain-archive; file: scripts/plain_shift.py -->
+```python
+"""Relabel every field of the job's input query and archive it, with plain pyfdb."""
+
+import sys
+from pathlib import Path
 
 import eccodes
 import pyfdb
 
-from snakemake_storage_plugin_fdb import api
-from snakemake_storage_plugin_fdb.grib import stream_messages
+query = snakemake.input[0].removeprefix("fdb://")
+request = dict(item.split("=", 1) for item in query.split(","))
 
-request = api.request(snakemake.input[0])  # the expanded MARS request
-means = []
-with pyfdb.FDB().retrieve(request) as data:
-    for message in stream_messages(data):
-        handle = eccodes.codes_new_from_message(message)
-        means.append(f"{eccodes.codes_get_values(handle).mean():.3f}")
-        eccodes.codes_release(handle)
+fdb = pyfdb.FDB()  # configured by the environment the provider prepared
+with fdb.retrieve(request) as source:
+    data = source.read()
+archived = 0
+for message in eccodes.MemoryReader(data):
+    message.set("expver", snakemake.params.expver)
+    fdb.archive(message.get_buffer())
+    archived += 1
+fdb.flush()  # before the job ends: the store step looks the fields up
 
-with open(snakemake.output[0], "w") as f:
-    print("\n".join(means), file=f)
-print("MEANS:", len(means), file=sys.stderr)
+storage = Path(".snakemake/storage")
+grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
+print("ARCHIVED:", archived, file=sys.stderr)
+print("GRIB FILES:", len(grib), file=sys.stderr)
 ```
 
-Outputs work the same way: `api.archive` archives the messages and leaves a small marker
-at the output's local path, which the plugin's store step recognises. This is the
-[first write pattern](#one-rule-one-query) without a GRIB file anywhere.
+Nothing is checked before such an archive, so a job that writes the wrong fields puts
+them in FDB and the store step's post-check reports them afterwards. Where that matters,
+the plugin's optional `api.archive` runs the checks of a file-based store first (field
+count, every message's keys against the query, duplicates), archives nothing if one
+fails and leaves an archive marker instead of an empty file:
 
-<!-- pattern: run-direct-archive; rerun: nothing; expect: Storing in storage: fdb://class=ea,expver=0022; expect: STAGED: 1 -->
+<!-- pattern: run-api-archive; expect: Storing in storage: fdb://class=ea,expver=0022; expect: GRIB FILES: 0 -->
 ```snakemake
 storage:
     provider="fdb"
@@ -585,14 +655,15 @@ rule shift_expver:
 
         marker = api.archive(output[0], shifted())  # checks, archives, writes the marker
 
-        staged = [p for p in Path(".snakemake/storage").rglob("*") if p.is_file()]
-        print("STAGED:", len(staged), "->", marker.fields, "fields", file=sys.stderr)
+        storage = Path(".snakemake/storage")
+        grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
+        print("GRIB FILES:", len(grib), "->", marker.fields, "fields", file=sys.stderr)
 ```
 
-The only file under `.snakemake/storage` is the marker of the output (`STAGED: 1`), and
-Snakemake removes it with the other local copies at the end of the run. Where a job needs
-a real file after all — a `shell:` rule calling an external program — leave the input
-retrieved, or write it with `api.retrieve(query, path)`.
+The only file under `.snakemake/storage` is the empty file, or the marker, of the output,
+and Snakemake removes it with the other local copies at the end of the run. Where a job
+needs a real file after all — a `shell:` rule calling an external program — leave the
+input retrieved and the output a file, as in the sections above.
 
 ## Writing outputs
 

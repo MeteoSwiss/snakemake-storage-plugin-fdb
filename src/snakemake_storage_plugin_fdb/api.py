@@ -1,10 +1,19 @@
-"""Direct FDB access from ``run:`` and ``script:`` rule bodies (requirements.md §2.15).
+"""Optional helpers for FDB queries in a Snakefile and in rule bodies (§2.15).
 
-A job that names its inputs with ``storage.fdb(query, retrieve=False)`` receives the
-query string instead of a local file (FR-DIRECT-001) and reads the fields here;
-``archive`` writes fields straight into FDB and leaves a marker at the output's local
-path, which ``StorageObject.store_object`` recognises (FR-DIRECT-002). No GRIB file is
-written to the local filesystem either way (NFR-PERF-005).
+Jobs do not need this module: a rule body reads FDB with plain ``pyfdb`` or
+earthkit-data and archives with plain ``pyfdb``, because the provider puts its FDB
+configuration in the job environment (FR-DIRECT-003), the MARS request is a two-line
+parse of the query string the job holds as its input, and an empty output file tells
+the store step that the job archived the fields itself (FR-DIRECT-004). What is
+offered here is the convenience that needs the plugin's own knowledge of queries:
+
+- ``query(request)`` and ``request(query)``: a MARS request as a dict and as a query
+  string, for a Snakefile that keeps its requests as dicts; ``request`` also expands
+  the values through metkit (FR-DIRECT-001).
+- ``messages(query)``: the fields of a query with a retrieval's guarantees
+  (FR-DIRECT-001).
+- ``archive(output, messages)``: an archive with the pre-checks of the store path, which
+  leaves a marker at the output's local path (FR-DIRECT-002).
 
 The functions take the same query text as the Snakefile. Without ``config``/
 ``user_config`` they use the plugin settings in the environment
@@ -20,16 +29,16 @@ import io
 import logging
 import os
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO
+from typing import TYPE_CHECKING, Any
 
 from snakemake_interface_common.exceptions import WorkflowError
 
 from .backend import distinct_values
 from .grib import message_of, stream_messages
-from .query import QueryError, query_of_path
+from .query import QueryError, query_of_path, query_of_request
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import StorageObject, StorageProvider
@@ -168,18 +177,18 @@ def request(
     return dict(zip(keys, distinct_values(expanded, keys), strict=True))
 
 
-def open(  # noqa: A001 - the module's public name; `io.open` is used internally
-    query: str, *, config: str | None = None, user_config: str | None = None
-) -> BinaryIO:
-    """A readable binary stream of the GRIB messages FDB holds for ``query``.
-
-    The fields are not counted: whatever FDB returns is streamed, so a query whose
-    fields are not all in FDB gives a short stream. Use ``messages`` for the
-    completeness guarantee of a retrieval (FR-READ-001).
-    """
-    obj = _object(query, config, user_config)
-    with obj._mapping_errors():
-        return _stream(obj)
+def query(request: Mapping[str, Any]) -> str:
+    """The query string of a MARS ``request``, the inverse of ``request(query)``
+    (``query.query_of_request``): values are scalars or sequences (joined with ``/``)
+    and may hold Snakemake wildcards, so a Snakefile can keep its requests as dicts
+    and derive its ``storage.fdb(...)`` queries from them (FR-DIRECT-001). Pure text:
+    no FDB is opened, nothing is expanded or spelled canonically, and the keys are in
+    the generic order (the provider re-orders them in its own, FR-QUERY-007).
+    ``WorkflowError`` for what the grammar rejects."""
+    try:
+        return query_of_request(request)
+    except QueryError as e:
+        raise WorkflowError(f"invalid FDB request {request!r}: {e}") from e
 
 
 class _Stream(io.RawIOBase):
@@ -239,49 +248,6 @@ def _checked_stream(obj: StorageObject, expected: int) -> Iterator[bytes]:
             f"{obj.query}: FDB returned {count} messages, the query expands to "
             f"{expected} fields"
         )
-
-
-def retrieve(
-    query: str,
-    path: str | os.PathLike[str],
-    *,
-    config: str | None = None,
-    user_config: str | None = None,
-) -> Path:
-    """Retrieve the fields of ``query`` into the local GRIB file ``path``.
-
-    The same retrieval Snakemake performs for an input without ``retrieve=False``: all
-    fields must be in FDB, and the file appears atomically (FR-READ-007). For a job
-    that needs a file after all, e.g. to hand it to an external program.
-    """
-    obj = _object(query, config, user_config)
-    obj.set_local_path(Path(path))
-    obj.retrieve_object()
-    return Path(path)
-
-
-def earthkit(
-    query: str,
-    *,
-    config: str | None = None,
-    user_config: str | None = None,
-    **kwargs: Any,
-) -> Any:
-    """``earthkit.data.from_source("fdb", request(query), **kwargs)``.
-
-    earthkit-data is an optional dependency and opens its own FDB from the process
-    environment, which the provider configures (FR-DIRECT-003); ``config`` and
-    ``user_config`` only resolve the request here.
-    """
-    try:
-        from earthkit.data import from_source
-    except ImportError as e:  # pragma: no cover - exercised where earthkit is absent
-        raise WorkflowError(
-            f"earthkit-data is not installed, so earthkit() cannot be used: {e}"
-        ) from e
-    return from_source(
-        "fdb", request(query, config=config, user_config=user_config), **kwargs
-    )
 
 
 # --- writing (FR-DIRECT-002) ----------------------------------------------------------

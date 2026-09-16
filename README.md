@@ -20,7 +20,8 @@ fdb://class=od,expver=0001,stream=oper,date={date},time=0000,domain=g,type=fc,le
 - **Read and write:** retrieves inputs from FDB and archives outputs into it, through
   [`pyfdb`](https://github.com/ecmwf/fdb).
 - **No local copies where they are not needed:** `run:` and `script:` rules read fields
-  straight from FDB and archive straight into FDB through the plugin's `api` module.
+  straight from FDB and archive straight into FDB with plain `pyfdb`, `eccodes` or
+  earthkit-data — no rule body imports the plugin.
 - **Multi-field queries:** `/` lists, `to`/`by` ranges and Snakemake wildcards. One
   query maps to one local file.
 - **Snakemake semantics:** an input exists only when all its fields are in FDB.
@@ -123,7 +124,7 @@ src/snakemake_storage_plugin_fdb/
     backend.py           pyfdb access: configuration and schema, reads, archives, error mapping
     grib.py              GRIB message splitting and MARS keys (eccodes)
     guard.py             identifier guard hook (reserved)
-    api.py               direct access from run/script rules: reads, archive, marker
+    api.py               optional helpers: queries from requests, reads, checked archive
     rerun.py             input tracking by lookup (rerun triggers)
 scripts/init_dev_fdb.py  creates and seeds a local development FDB
 examples/ecmwf/          generic example workflow

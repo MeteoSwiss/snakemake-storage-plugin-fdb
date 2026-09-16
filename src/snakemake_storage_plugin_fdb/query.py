@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from snakemake_interface_storage_plugins.io import WILDCARD_REGEX
 
@@ -305,6 +306,20 @@ def query_of_path(path: str) -> str:
     query = SCHEME + ",".join(reversed(pairs))
     parse(query)
     return query
+
+
+def query_of_request(request: Mapping[str, Any]) -> str:
+    """The query of a MARS request given as a mapping, in the generic key order.
+
+    A value is a scalar or a sequence (joined with ``/``, as a query lists values) and
+    may hold Snakemake wildcards. Pure text: ``QueryError`` for what the grammar
+    rejects, nothing is expanded or spelled canonically.
+    """
+    pairs = []
+    for key, value in request.items():
+        values = [value] if isinstance(value, str | int | float) else list(value)
+        pairs.append(f"{key}={'/'.join(str(v) for v in values)}")
+    return parse(SCHEME + ",".join(pairs)).to_query()
 
 
 def _parse_value(key: str, pieces: list[_Piece]) -> str:
