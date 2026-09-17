@@ -11,8 +11,9 @@ initialisation times. Snakemake runs as a subprocess with the committed profile 
 explicit ``--storage-fdb-config`` (the command line wins over the profile's path).
 Logs are written to ``<tmp>/logs/``. The stages cover the documented behaviour: a full
 run, a second run with nothing to do, widening ``params`` (the model reruns because its
-FDB output is missing), narrowing them again (nothing reruns: input tracking by lookup,
-FR-RERUN-002) and a new model checkpoint (a new ``expver``: the model and everything
+FDB output is missing), narrowing them again (no FDB producer reruns — input tracking by
+lookup, FR-RERUN-002 — but ``scorecard`` does, because it aggregates one local file per
+parameter, L-33) and a new model checkpoint (a new ``expver``: the model and everything
 downstream rerun, the truth does not).
 """
 
@@ -34,6 +35,7 @@ INIT_TIMES = ["2020-01-01T00:00", "2020-01-02T12:00"]
 STEPS = [0, 6, 12]
 CHECKPOINT = "unet-v3-2026-08.ckpt"
 NEW_CHECKPOINT = "unet-v4-2026-09.ckpt"
+HEADER = "init_time,expver,param,step,rmse"
 
 
 def _expver(checkpoint: str) -> str:
@@ -86,26 +88,32 @@ def _storage_files(example: Path) -> list[Path]:
     return [p for p in (example / ".snakemake" / "storage").rglob("*") if p.is_file()]
 
 
-def _results(example: Path) -> dict[str, tuple[list[list[str]], int]]:
-    """Per initialisation time: the rows of its CSV and the size of its GIF.
+def _rows(path: Path) -> list[list[str]]:
+    """The data rows of one of the example's CSV files, header checked."""
+    lines = path.read_text().splitlines()
+    assert lines[0] == HEADER
+    return [line.split(",") for line in lines[1:]]
+
+
+def _results(example: Path, params: list[int]) -> dict[tuple[str, str], object]:
+    """Per (init time, param): the rows of its CSV and the size of its GIF.
 
     Read while the run that produced them is the last one: the later stages overwrite
     both files.
     """
-    results = {}
+    results: dict[tuple[str, str], object] = {}
     for init_time in INIT_TIMES:
-        lines = (example / "metrics" / f"{init_time}.csv").read_text().splitlines()
-        assert lines[0] == "init_time,expver,param,step,rmse"
-        rows = [line.split(",") for line in lines[1:]]
-        gif = example / "animations" / f"{init_time}.gif"
-        results[init_time] = (rows, gif.stat().st_size)
+        for param in params:
+            rows = _rows(example / "metrics" / init_time / f"{param}.csv")
+            gif = example / "animations" / init_time / f"{param}.gif"
+            results[(init_time, str(param))] = (rows, gif.stat().st_size)
     return results
 
 
 @pytest.fixture(scope="module")
 def example(tmp_path_factory, run_logged) -> dict:
     """Runs, in order: init, the example, a second run, a widened ``params`` (dry run
-    and run), the narrowed ``params`` again (dry run) and a new checkpoint (dry run)."""
+    and run), the narrowed ``params`` again (run) and a new checkpoint (dry run)."""
     tmp = tmp_path_factory.mktemp("forecast-evaluation")
     run = run_logged(tmp / "logs")
     config = tmp / ".fdb" / "config.yaml"
@@ -140,17 +148,23 @@ def example(tmp_path_factory, run_logged) -> dict:
     write_config([167])
     snakemake("run1")
     out["storage_after_run1"] = _storage_files(work)
-    out["results_after_run1"] = _results(work)
+    out["results_after_run1"] = _results(work, [167])
+    out["scorecard_after_run1"] = _rows(work / "scorecard.csv")
     snakemake("run2")
 
     write_config([167, 165])
     snakemake("widen_dry", "--dry-run")
     snakemake("widen")
     out["storage_after_widen"] = _storage_files(work)
-    out["results_after_widen"] = _results(work)
+    out["results_after_widen"] = _results(work, [167, 165])
+    out["scorecard_after_widen"] = _rows(work / "scorecard.csv")
 
     write_config([167])
-    snakemake("narrow_dry", "--dry-run")
+    snakemake("narrow")
+    out["scorecard_after_narrow"] = _rows(work / "scorecard.csv")
+    out["metrics_165_after_narrow"] = sorted(
+        str(p.relative_to(work)) for p in work.rglob("165.*")
+    )
 
     write_config([167], NEW_CHECKPOINT)
     snakemake("checkpoint_dry", "--dry-run")
@@ -158,16 +172,32 @@ def example(tmp_path_factory, run_logged) -> dict:
 
 
 def test_example_produces_metrics_and_animations(example):
-    """One CSV and one GIF per initialisation time; the CSV has a row per parameter
-    and step, with the model's expver and a finite RMSE."""
+    """One CSV and one GIF per initialisation time and parameter; the CSV has a row per
+    step, with the model's expver and a finite RMSE."""
     example["run1"].ok()
-    for init_time, (rows, gif_size) in example["results_after_run1"].items():
-        assert len(rows) == len(STEPS)  # one param x three steps
+    for (init_time, param), (rows, gif_size) in example["results_after_run1"].items():
+        assert len(rows) == len(STEPS)
         assert [row[0] for row in rows] == [init_time] * len(rows)
         assert {row[1] for row in rows} == {_expver(CHECKPOINT)}
+        assert {row[2] for row in rows} == {param}
         assert [int(row[3]) for row in rows] == STEPS
         assert all(0.0 <= float(row[4]) < 1e6 for row in rows)
         assert gif_size > 0
+
+
+def test_example_scorecard_aggregates_the_metrics_files(example):
+    """``scorecard.csv`` holds every metrics row plus a ``mean`` row per parameter and
+    step over the initialisation times."""
+    rows = example["scorecard_after_run1"]
+    detail = [row for row in rows if row[0] != "mean"]
+    means = [row for row in rows if row[0] == "mean"]
+    assert len(detail) == len(INIT_TIMES) * len(STEPS)
+    assert {row[0] for row in detail} == set(INIT_TIMES)
+    assert [int(row[3]) for row in means] == STEPS
+    for row in means:
+        step = int(row[3])
+        same = [float(d[4]) for d in detail if int(d[3]) == step]
+        assert float(row[4]) == pytest.approx(sum(same) / len(same), abs=1e-4)
 
 
 def test_example_writes_no_local_file_at_all(example):
@@ -195,21 +225,30 @@ def test_example_widening_params_reruns_everything(example):
     assert counts == {
         "truth": len(INIT_TIMES),
         "run_model": len(INIT_TIMES),
-        "verify": len(INIT_TIMES),
-        "animate": len(INIT_TIMES),
+        "verify": 2 * len(INIT_TIMES),
+        "animate": 2 * len(INIT_TIMES),
+        "scorecard": 1,
         "all": 1,
     }
     example["widen"].ok()
-    for rows, _ in example["results_after_widen"].values():
-        assert len(rows) == 2 * len(STEPS)
-        assert {row[2] for row in rows} == {"167", "165"}
+    assert len(example["results_after_widen"]) == 2 * len(INIT_TIMES)
+    scorecard = example["scorecard_after_widen"]
+    assert {row[2] for row in scorecard} == {"167", "165"}
+    assert len([row for row in scorecard if row[0] != "mean"]) == (
+        2 * len(INIT_TIMES) * len(STEPS)
+    )
 
 
-def test_example_narrowing_params_reruns_nothing(example):
-    """FR-RERUN-002: the narrowed queries name fields FDB already holds, so nothing is
-    out of date although the query text changed."""
-    narrow = example["narrow_dry"]
-    assert narrow.NOTHING_TO_BE_DONE in narrow.ok()
+def test_example_narrowing_params_reruns_only_the_scorecard(example):
+    """L-33: the narrowed queries name fields FDB already holds, so no FDB producer is
+    out of date (FR-RERUN-002), but ``scorecard`` aggregates one local file per
+    parameter, and that input set changed."""
+    counts = _job_counts(example["narrow"].ok())
+    assert counts == {"scorecard": 1, "all": 1}
+    scorecard = example["scorecard_after_narrow"]
+    assert {row[2] for row in scorecard} == {"167"}
+    # The dropped parameter's own files stay on disk; they are simply not aggregated.
+    assert example["metrics_165_after_narrow"]
 
 
 def test_example_new_checkpoint_reruns_the_model_only(example):
@@ -222,5 +261,6 @@ def test_example_new_checkpoint_reruns_the_model_only(example):
         "run_model": len(INIT_TIMES),
         "verify": len(INIT_TIMES),
         "animate": len(INIT_TIMES),
+        "scorecard": 1,
         "all": 1,
     }

@@ -4,5 +4,7 @@ storage-fdb-config: ../../.fdb/config.yaml
 # Try the alternatives:
 # storage-fdb-input-tracking: query      # Snakemake's input-set trigger: narrowing the
 #                                        # params would then rerun the model too
-# storage-fdb-archive-mode: identifier   # label keys from the query instead of the GRIB
 # storage-fdb-canonical-spelling: error  # reject param=2t, time=00, ...
+# storage-fdb-archive-mode and storage-fdb-identifier-check have no effect here: the
+# jobs archive with plain pyfdb and the plugin's store step never runs (only api.archive
+# reads them). See the user guide, "Direct access from run and script rules".

@@ -701,6 +701,12 @@ rule shift_expver:
         print("GRIB FILES:", len(grib), "->", marker.fields, "fields", file=sys.stderr)
 ```
 
+Two things such a job does not get: the plugin's mapped error messages — a failure in
+plain `pyfdb` surfaces as fdb5/eckit text such as `Failed system call: mkdir … (Success)`
+— and the store-level settings `archive_mode` and `identifier_check`, whose store step
+never runs (only `api.archive` reads them). A rule may also have a direct FDB output and
+a local file output together; the two are then checked independently.
+
 With `retrieve=False` outputs nothing is written under `.snakemake/storage` at all; with
 `touch()` or `api.archive` the only file there is the output's empty file or marker,
 which Snakemake removes with the other local copies at the end of the run. Where a job
@@ -1010,7 +1016,7 @@ patterns add to that table:
 | [wildcards and config](#wildcards-and-config) | a parameter added to a list that a query interpolates reruns the rules that read it, and their producers, although their outputs exist |
 | [discovering what is in FDB](#discovering-what-is-in-fdb) | new fields appear in the DAG on the next run, because globbing happens while the Snakefile is read |
 | [writing outputs](#writing-outputs) | a rerun archives the fields again and masks the previous copy; the output keeps existing, so `--delete-all-output` does not make the producer rerun (use `--forceall`, see [removing outputs](user-guide.md#removing-outputs)) |
-| [one field, one rule](#one-field-one-rule) | per-step jobs rerun per step; a whole-forecast rule reruns as one job |
+| [one field, one rule](#one-field-one-rule) | per-step jobs rerun per step; a whole-forecast rule reruns as one job. Extending the step list rebuilds the whole forecast with a multi-step query and only the new step with a `{step}` wildcard in the output query, at the price of more jobs and more FDB round trips |
 | [a chain through FDB](#a-chain-through-fdb) | re-archiving the first query reruns the whole chain, one job per link |
 
 Two edits deserve care, because nothing flags them: a **narrowed input** query reruns
@@ -1019,6 +1025,21 @@ nothing, so the output keeps the extra fields the wider query produced (see
 archived under the old query in FDB forever (see
 [writing outputs](user-guide.md#writing-outputs)). Prefer a wildcard or a config value
 over rewriting the query of a rule that has already run.
+
+The first of the two reaches local files as well: a metrics table or a report computed
+straight from FDB inputs also keeps the wider result after a narrowing, and nothing says
+so. Shape such a workflow the other way round — **a summary over the declared set
+aggregates local per-field artefacts, not FDB inputs directly**. One local file per field
+or parameter, then a rule whose input is `expand(...)` over the declaration: its input
+set shrinks with the configuration, Snakemake's own input-set trigger reruns it, and the
+FDB producers still do not rerun.
+[`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) does this
+with its `scorecard` rule.
+
+Rerun decisions also need Snakemake's provenance records under `.snakemake/`. In a
+workflow whose intermediates all live in FDB, nothing local is missing when a field is,
+so a fresh clone or a moved working directory reports "Nothing to be done" instead of
+rebuilding. Run `--forceall` or `-R <rule>` once after such a move.
 
 `--storage-fdb-input-tracking query` restores Snakemake's default behaviour, in which
 any change to the text of the input queries reruns the job. It is a per-provider

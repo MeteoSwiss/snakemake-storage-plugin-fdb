@@ -1,5 +1,6 @@
-# Forecast initialisation times (ISO 8601): one truth, one model run, one verification
-# and one animation job each. Any value works as an explicit target.
+# Forecast initialisation times (ISO 8601, quoted, to the minute): one truth and one
+# model run job each, one verification and one animation job per parameter. Any value
+# works as an explicit target.
 init_times:
   - "2020-01-01T00:00"
   - "2020-01-01T12:00"
@@ -7,9 +8,10 @@ init_times:
   - "2020-01-02T12:00"
   - "2020-01-03T00:00"
 
-# Parameters under evaluation. The model writes exactly these (one FDB output per
-# parameter). Adding one later makes the model rerun (its output is missing in FDB);
-# removing one does not (input tracking by lookup).
+# Parameters under evaluation, as numeric paramIds (167, not 2t). The model writes
+# exactly these (one FDB output per parameter). Adding one later makes the model rerun
+# (its output is missing in FDB); removing one does not (input tracking by lookup), but
+# it does rebuild scorecard.csv, whose local inputs are one file per parameter.
 params:
   - 167 # 2 m temperature
   # - 165 # 10 m u wind

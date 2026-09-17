@@ -275,6 +275,24 @@ the job environment so that an unconfigured `pyfdb.FDB()` or
 [`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) is a
 runnable workflow whose every rule works this way.
 
+Two consequences of using the plain libraries:
+
+- **Which settings reach such a job.** `config` and `user_config` do, through the
+  environment the provider exports (`FDB5_CONFIG`, `FDB_CONFIG_FILE`), so an
+  unconfigured `pyfdb.FDB()` opens the workflow's FDB. `canonical_spelling`, `key_order`
+  and `glob_required_keys` apply to the queries, which the plugin handles in the
+  Snakefile process, so they are enforced whatever the job does. `archive_mode` and
+  `identifier_check` describe the plugin's own store step, which never runs for a
+  `retrieve=False` output: `--storage-fdb-archive-mode identifier` has no effect at all
+  on a job archiving with plain `pyfdb`. Only [`api.archive`](#the-optional-api-module)
+  reads them in a job.
+- **Which errors such a job raises.** They are fdb5's and eckit's own text, not the
+  plugin's mapped messages: an unwritable FDB root gives `Failed system call: mkdir
+  /…/root/ea:0002:… (Success)` where the plugin would say `FDB I/O error for fdb://…:
+  … (check permissions, free space and the roots in the FDB configuration)`. The
+  `(Success)` suffix is eckit's `errno` reporting and means nothing. Use
+  `api.messages`/`api.archive` where the mapped errors are wanted.
+
 ### Declaring the fields
 
 The rule is the same on both sides: **an FDB object the job reads or writes itself is
@@ -394,8 +412,22 @@ that read it ("Input files updated by another job"), a missing field is reported
 `Missing output files: fdb://... (in storage)`, and a second run reports "Nothing to be
 done".
 
-`flush()` before the job ends is still required: what is not flushed is not in FDB, for
-the check and for the jobs downstream.
+`flush()` before the job ends is still the rule to follow: what is not flushed is not in
+FDB, for the check and for the jobs downstream. fdb5 also flushes when the `FDB` object
+is destroyed, so a job process that exits normally is usually safe in practice — but do
+not rely on it: a job that reads back what it archived, or an executor that keeps the
+process alive, needs the explicit call.
+
+A rule may have a direct FDB output and a local file output at the same time. That is
+allowed, and the two are checked independently: the fields can be in FDB without the
+local file (nothing reruns the job, because nothing needs that file), and asking for the
+local file rebuilds it and re-archives the fields along the way.
+
+If such an output is declared *without* `retrieve=False` and without `touch()`,
+Snakemake waits for a local GRIB file no one writes and the job fails with `(missing
+locally, parent dir contents: )` after the latency wait. The message names no FDB cause
+at all: for an `fdb://` output it means the declaration is wrong, not that the latency is
+too short.
 
 Existence is all that is checked. A job that exits 0 having archived nothing — or the
 wrong fields — passes whenever FDB happens to hold the query's fields already, for
@@ -418,11 +450,18 @@ so the job is taken to have archived the fields itself; 2 of 3 found in FDB with
 timestamps from this run; missing or older: step=12
 ```
 
-Two things to know about this check:
+Four things to know about this check:
 
 - Nothing is checked **before** the job's archives, unlike a file-based output or
   `api.archive`. Fields a mistaken job archived are in FDB; the message says which of
   the query's fields are missing, and the next successful run masks what was written.
+- **Extra fields are never reported**, in either direct variant: a job that archives a
+  `step=18` field under a `step=0/6/12` query exits 0 and the stray field stays in FDB
+  for good. A file-based store would refuse the file (`landed outside the query or are
+  duplicates`); the check here only asks whether the query's own fields are there.
+- The check only runs for jobs that **run**. It cannot detect fields an earlier, failed
+  run left behind: if those happen to satisfy the query, the DAG never schedules the
+  producer in the first place and no check of any kind takes place.
 - The check is by timestamp, not by identity: a field another job of the same run
   archived under the same query would satisfy it. `flush()` before the job ends, or the
   fields may not be visible to the store step yet.
@@ -467,11 +506,13 @@ time: 1789581415
 
 The store step recognises the marker, archives nothing and post-checks with the marker's
 field count and timestamp; a marker for another query, or with a field count other than
-the query's, is an error. A job archives as the workflow does — `archive_mode`,
-`identifier_check`, `canonical_spelling` and `key_order` reach it through
-`SNAKEMAKE_STORAGE_FDB_*` — so a workflow run with
-`--storage-fdb-archive-mode identifier` labels its direct archives in identifier mode
-too; `api.archive(..., archive_mode=...)` overrides it for one call.
+the query's, is an error. **`api.archive` archives as the workflow does** — `archive_mode`, `identifier_check`,
+`canonical_spelling` and `key_order` reach it through the `SNAKEMAKE_STORAGE_FDB_*`
+variables Snakemake carries into every job — so a workflow run with
+`--storage-fdb-archive-mode identifier` labels these archives in identifier mode too;
+`api.archive(..., archive_mode=...)` overrides it for one call. A job archiving with
+plain `pyfdb` reads none of those settings (see
+[Direct access](#direct-access-from-run-and-script-rules)).
 
 ### When a local file is still needed
 
@@ -602,7 +643,24 @@ not its inputs.
 
 One consequence is not flagged: after narrowing, the output keeps the extra fields the
 wider query produced, because nothing reruns. Force the rule (`snakemake -R <rule>` or
-`--force <target>`) if the output must match the new query.
+`--force <target>`) if the output must match the new query. The same holds for **derived
+local outputs** computed straight from FDB inputs — a metrics table, a plot, a report:
+after narrowing they still describe the wider set, and nothing says so. The remedy is a
+shape, not a setting: let the local artefacts mirror the declared granularity (one file
+per field or per parameter) and let the summary aggregate those *local* files with
+`expand()`. Its input set then shrinks with the declaration and Snakemake's own
+input-set trigger reruns it, while the FDB producers still do not rerun.
+[`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) is built
+this way. `--storage-fdb-input-tracking query` is the workflow-wide alternative, at the
+price of rerunning every job whose query text changed.
+
+Rerun decisions need Snakemake's **provenance records**. In a workflow whose
+intermediates all live in FDB there is no local file whose absence would force a
+rebuild, so without those records — a fresh clone, a deleted `.snakemake/`, a working
+directory moved under the `db` backend — a genuinely missing FDB field is reported as
+"Nothing to be done" rather than rebuilt, because no consumer is out of date. (Snakemake
+behaves the same way for local intermediates; it is just more visible here.) Run
+`--forceall` or `-R <rule>` once after such a move.
 
 `--storage-fdb-input-tracking query` restores Snakemake's default behaviour, in which
 any change to the text of the input queries reruns the job. The plugin needs a private
@@ -729,6 +787,14 @@ Most of Snakemake works unchanged with FDB objects; these are the exceptions.
   the query itself, and on an output it means "no local file, check the fields in FDB
   after the job" — which is what
   [direct access](#direct-access-from-run-and-script-rules) builds on.
+- **`--summary`** describes FDB objects properly: the `fdb://` query in the output
+  column and the FDB index timestamp as the date.
+- **`--list-input-changes`** prints FDB inputs as their local paths
+  (`.snakemake/storage/fdb/class=ea/.../param=167.grib`), not as queries, so its output
+  is not usable as a query and does not match what `--summary` shows for the same
+  object. The same rendering appears in a failed job's `Error in rule` block, including
+  for `retrieve=False` inputs that have no local file at all; the `CalledProcessError`
+  line above it shows the command that actually ran, with the query in it.
 - `touch()`, `ancient()` and `report()` work on FDB objects; `temp()`, `protected()`,
   `directory()` and `pipe()` are rejected (see
   [Removing outputs](#removing-outputs)), and `multiext()` silently drops the storage
@@ -812,7 +878,10 @@ explain the two example workflows.
 | `Touching output files is impossible ...` | `--touch` is not supported and the check covers the whole workflow (see [Snakemake flags and features](#snakemake-flags-and-features)). |
 | `MissingRuleException: No rule to produce fdb:/...` | An FDB query was used as a command-line target; Snakemake normalised it. Target the rule by name or a local file. |
 | `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
-| `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem: declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
+| `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem, and the message names no FDB cause: for an `fdb://` output, `(missing locally, parent dir contents: )` means the declaration is wrong. Declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
+| `RuntimeError ... Failed system call: mkdir /.../root/... (Success)` raised inside a job | An error from plain `pyfdb` in the job, not from the plugin, so it is fdb5/eckit's own text and the `(Success)` suffix means nothing. Usually the FDB root: permissions or free space. `api.messages`/`api.archive` give the plugin's mapped messages instead (see [Direct access](#direct-access-from-run-and-script-rules)). |
+| A rule that failed once is silently skipped later | The archives of a failed direct-output job stay in FDB — FDB has no delete. If those fields satisfy another query, the producing rule is never scheduled again, and `touch()` cannot help because the job does not run. Force it (`-R <rule>`, `--forceall`), or archive under a fresh `expver`. |
+| A failed job's `Error in rule` block names a `.snakemake/storage/...` path for an input that has no local file | Snakemake's own formatting of a `retrieve=False` input; the path never existed. The `CalledProcessError` line above shows the command that ran, with the query in it. |
 | `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
 | "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
 | A rule reruns after a query edit although the fields are unchanged | Input tracking by lookup is off; see the warning in the log and [Reruns](#reruns). |
@@ -823,8 +892,10 @@ explain the two example workflows.
   whole workflow); FDB queries cannot be command-line targets.
 - No deletion; reruns mask old fields.
 - Modification times have one-second resolution.
-- A narrowed query does not rerun, so the output keeps the extra fields (see
-  [Reruns](#reruns)).
+- A narrowed query does not rerun, so the output — and any local file derived from it —
+  keeps the wider result (see [Reruns](#reruns)).
+- Rerun decisions need the provenance records: without them a missing FDB field is
+  reported as "Nothing to be done" (see [Reruns](#reruns)).
 - Remote FDB backends are untested.
 - Tagged settings are lost in spawned jobs (Snakemake 9.27).
 - An unreadable database directory inside an FDB root looks like missing data.

@@ -1142,16 +1142,21 @@ fetcher (`fetch_ogd_samples.py`); `docs/sites/meteoswiss.md` documents them.
 #### FR-DEV-003 Forecast-evaluation example
 
 `examples/forecast-evaluation/` is a generic workflow whose every rule reads and writes
-FDB directly (§2.15): a dummy truth, an "ML model", a verification and an animation
-rule, one job each per initialisation time, with every FDB object declared
-`retrieve=False` — inputs the jobs read themselves and outputs they archive themselves
-with plain pyfdb (FR-DIRECT-005) — and the GRIB template read from FDB too, so it needs
-no file outside its directory. It
+FDB directly (§2.15): a dummy truth and an "ML model" (one job each per initialisation
+time), a verification and an animation rule (one job per initialisation time and
+parameter) and a `scorecard` rule aggregating the local metrics files, with every FDB
+object declared `retrieve=False` — inputs the jobs read themselves and outputs they
+archive themselves with plain pyfdb (FR-DIRECT-005) — and the GRIB template read from
+FDB too, so it needs no file outside its directory. Its configuration values are
+validated where the Snakefile is read, so a mistyped parameter or initialisation time
+gives a sentence instead of a traceback. It
 needs a development FDB (FR-DEV-001, `--seed --variants`) and the `examples` dependency
 group (earthkit-data, matplotlib).
 
 - Rationale: one runnable workflow showing what the plugin is for — no local copies,
-  reruns by lookup (FR-RERUN-002), FDB as the only data store.
+  reruns by lookup (FR-RERUN-002), FDB as the only data store — and the aggregation
+  shape that keeps a summary of the declared set exact under those rerun semantics
+  (L-33).
 - Verification: test `tests/test_evaluation_example.py` (skips without the group).
 
 ### 2.15 Direct access from rule bodies
@@ -1585,6 +1590,8 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-29 | Direct access (FR-DIRECT-001/002/004/005) is for rule bodies written in Python (`run:`, `script:`, `notebook:`) or for programs that use pyfdb themselves. A `shell:` rule that hands the fields to an external program still needs a file: leave the input retrieved and the output a plain FDB output. A directly archived output declared with one of the checked variants leaves an empty file or a marker at the local path, and `--keep-storage-local-copies` keeps those like any other local copy; `--delete-all-output` deletes neither the FDB fields (FR-REMOVE-001) nor kept local copies. |
 | L-31 | The empty-output convention (FR-DIRECT-004) checks by timestamp, not by identity: the post-check accepts every field of the query whose index timestamp is not older than the run's reference time, so a field an earlier job of the same run archived under the same query, or a field archived by another process during the run, satisfies it. Nothing is checked before the job's archives either, so a job that writes wrong fields puts them in FDB (they stay until masked) and only the missing ones are reported. `api.archive` (FR-DIRECT-002) is stricter (pre-checks and a marker naming query, count and time), a file-based store strictest. The reference time is one FDB clock second, so a field archived in the same second as the provider's construction passes even if it predates the run. |
 | L-32 | An output declared `retrieve=False` (FR-DIRECT-005) is checked for existence only: the plugin's store step never runs for it, so the freshness post-check of FR-DIRECT-004 does not either. A job that exits 0 having archived nothing, or the wrong fields, therefore passes whenever FDB already holds the query's fields — from an earlier run of the same workflow, say — and the workflow reports success. Declaring the output `touch(storage.fdb(query))` is the interim mitigation (the check costs an empty local file); the fix is an upstream post-job verify hook for storage outputs (D-015). |
+| L-33 | Input tracking by lookup (FR-RERUN-001) leaves **derived local outputs** stale after a narrowing: a metrics table, plot or report computed straight from FDB inputs still describes the wider set, because nothing reruns, and nothing flags it. Mitigation by workflow shape, not by the plugin: let the local artefacts mirror the declared granularity (one file per field or parameter) and let the summary aggregate those local files with `expand()`, so that Snakemake's own input-set trigger fires when the declaration narrows (`examples/forecast-evaluation/`, rule `scorecard`, FR-DEV-003). `input_tracking=query` is the workflow-wide alternative and reruns the producers too, which FR-RERUN-001 exists to avoid. |
+| L-34 | Rerun decisions read Snakemake's provenance records, and FDB fields cannot be deleted; two consequences, both Snakemake's own semantics made sharper by a workflow whose every intermediate lives in FDB. (a) Without the records — a fresh clone, a deleted `.snakemake/`, a working directory moved under the `db` backend, which keys its records by the absolute workdir path — a missing FDB field is reported as "Nothing to be done", because no consumer is out of date and no local file is missing; `--forceall` or `-R <rule>` once repairs it. (b) The archives of a *failed* direct-output job stay in FDB, so if those fields satisfy a later query the producing rule is never scheduled again and the checked variant (FR-DIRECT-004) cannot help, since it only runs for jobs that run. Force the rule or archive under a fresh `expver`. |
 
 ---
 

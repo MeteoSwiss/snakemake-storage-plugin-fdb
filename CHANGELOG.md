@@ -10,10 +10,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `examples/forecast-evaluation/`: a dummy forecast-evaluation workflow (truth, model,
-  verification, animation; one job each per initialisation time) in which every rule
+  verification, animation, scorecard) in which every rule
   reads and writes FDB directly with plain pyfdb and earthkit-data, and no GRIB file is
   ever written locally. It also shows the rerun behaviour: adding a parameter reruns the
-  model, removing one reruns nothing, a new model checkpoint is a new `expver`.
+  model, removing one reruns no FDB producer, a new model checkpoint is a new `expver`.
 - The `examples` dependency group (earthkit-data, matplotlib) for that example;
   `tests/test_evaluation_example.py` runs it end to end and skips without the group.
 
@@ -25,12 +25,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the checked variant, which also proves the fields were archived during this run;
   `api.archive` outputs keep their plain declaration. The example, the patterns and the
   documentation follow.
+- `examples/forecast-evaluation/`: `verify` and `animate` now run per parameter
+  (`metrics/{init_time}/{param}.csv`, `animations/{init_time}/{param}.gif`) and a new
+  `scorecard` rule aggregates those local files into `scorecard.csv`. A summary over the
+  declared set therefore follows the declaration: narrowing `params` still reruns no FDB
+  producer, but the scorecard is rebuilt and matches `config.yaml`. The example also
+  validates its configuration where the Snakefile is read, so a non-numeric `param`, a
+  short `truth_expver` or a malformed init time gives a sentence instead of a traceback.
 
 ### Fixed
 
 - The documentation claimed that Snakemake has no output-side counterpart of
   `retrieve=False` and that a direct output must therefore leave a local file. It has
   one, at least since Snakemake 9.27.
+- Documentation around direct access: `flush()` is advice, not a requirement whose
+  omission fails the check (fdb5 flushes when the `FDB` object is destroyed); only
+  `api.archive`, not a job archiving with plain pyfdb, reads `archive_mode` and
+  `identifier_check`; errors raised by plain pyfdb in a job are fdb5/eckit text, not the
+  plugin's mapped messages. New notes on extra fields never being reported, on a failed
+  job's archives making its rule skipped later, on mixing a direct FDB output with a
+  local one, on derived local outputs after a narrowing (L-33), on reruns without
+  provenance records (L-34), on `--summary` and `--list-input-changes`, and
+  troubleshooting rows to match. The example profile no longer suggests
+  `storage-fdb-archive-mode`, which has no effect on its jobs.
 
 ## [0.3.1] - 2026-09-16
 

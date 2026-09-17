@@ -1,7 +1,7 @@
 """A dummy forecast-evaluation pipeline on a development FDB (../../.fdb).
 
     uv run snakemake --profile profile -c4
-    uv run snakemake --profile profile -c1 metrics/2020-01-04T00:00.csv   # any init time
+    uv run snakemake --profile profile -c1 metrics/2020-01-04T00:00/167.csv   # any init time
 
 All fields are read from and written to FDB directly, with plain pyfdb, eccodes and
 earthkit-data: no rule sees a local GRIB file and nothing here imports the storage
@@ -11,25 +11,35 @@ them, and Snakemake checks an output by looking its fields up in FDB instead of 
 filesystem (see the user guide, "Direct access from run and script rules").
 Nothing data-related goes through `params:`, whose rerun trigger would fire on any edit.
 
-Stages, each one job per initialisation time (the {init_time} wildcard, ISO 8601), all
-data passing through FDB:
+Stages, all data passing through FDB:
 
-    truth      random analyses (type=an) for the requested params and steps
-                 -> expver=<truth_expver>
+    truth      random analyses (type=an) for the requested params and steps, one job
+                 per initialisation time -> expver=<truth_expver>
     run_model  the "ML model": reads the truth at step 0 as initial condition, writes
-                 forecasts (type=fc) for the requested params and steps
+                 forecasts (type=fc), one job per initialisation time
                  -> expver=<hash of the model checkpoint>
-    verify     RMSE of the forecast against the truth -> metrics/{init_time}.csv
-    animate    one GIF per init time with a frame per step -> animations/{init_time}.gif
+    verify     RMSE of the forecast against the truth, one job per (init time, param)
+                 -> metrics/{init_time}/{param}.csv
+    animate    one GIF per (init time, param), a frame per step
+                 -> animations/{init_time}/{param}.gif
+    scorecard  one job over all the metrics files -> scorecard.csv
+
+The local artefacts mirror the declared granularity on purpose, and the summary
+aggregates *local* files rather than FDB inputs: reruns of an FDB input follow the
+fields a query names, so narrowing `params` reruns nothing, whereas the set of local
+files `scorecard` reads changes and Snakemake's own input-set trigger fires.
 
 config.yaml decides the init times, params, steps and the model checkpoint. The
 params are what gets evaluated and what the model writes: adding one makes the model
-rerun (its FDB output is missing), removing one does not (input tracking by lookup).
+rerun (its FDB output is missing), removing one does not (input tracking by lookup)
+but does rebuild the scorecard.
 """
 
 import hashlib
 import sys
 from datetime import datetime
+
+from snakemake.exceptions import WorkflowError
 
 sys.path.insert(0, workflow.basedir)  # dummy.py next to this Snakefile
 
@@ -42,9 +52,44 @@ storage:
 
 wildcard_constraints:
     init_time=r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}",
+    param=r"\d+",
     date=r"\d{8}",
     time=r"\d{4}",
 
+
+def require(ok, message):
+    """Fail while the Snakefile is read, with a sentence instead of a traceback."""
+    if not ok:
+        raise WorkflowError(f"config.yaml: {message}")
+
+
+def parsed_init_time(value):
+    """The init time as a datetime, or None if it is not one this workflow accepts."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.strftime("%Y-%m-%dT%H:%M") == str(value) else None
+
+
+require(config["params"], "params is empty; list at least one paramId to evaluate")
+require(
+    all(str(p).isdigit() for p in config["params"]),
+    "params must be numeric paramIds (167, not 2t or 167/165)",
+)
+require(
+    all(str(s).isdigit() for s in config["steps"]), "steps must be whole hours (0, 6, 12)"
+)
+require(
+    len(str(config["truth_expver"])) == 4,
+    f"truth_expver must be four characters ('0002', not {config['truth_expver']!r})",
+)
+require(config["init_times"], "init_times is empty")
+require(
+    all(parsed_init_time(t) for t in config["init_times"]),
+    "every init_times entry must be an ISO 8601 date and time to the minute, "
+    "quoted, e.g. \"2020-01-01T00:00\"",
+)
 
 PARAMS = [str(p) for p in config["params"]]
 STEPS = [int(s) for s in config["steps"]]
@@ -94,6 +139,16 @@ def per_param(expver, type_):
     return inputs
 
 
+def one_param(expver, type_):
+    """Input function factory: the one query of the job's {init_time} and {param}."""
+
+    def inputs(wildcards):
+        date, time = mars_date_time(wildcards.init_time)
+        return storage.fdb(query(expver, type_, date, time, wildcards.param), retrieve=False)
+
+    return inputs
+
+
 def per_param_outputs(expver, type_):
     """Output list: one query per parameter, with {date}/{time} as wildcards.
 
@@ -110,8 +165,12 @@ def per_param_outputs(expver, type_):
 
 rule all:
     input:
-        expand("metrics/{init_time}.csv", init_time=config["init_times"]),
-        expand("animations/{init_time}.gif", init_time=config["init_times"]),
+        "scorecard.csv",
+        expand(
+            "animations/{init_time}/{param}.gif",
+            init_time=config["init_times"],
+            param=PARAMS,
+        ),
 
 
 # Simulated truth: random analyses for every requested parameter and step.
@@ -179,32 +238,66 @@ rule run_model:
             )
 
 
-# Verification: RMSE per parameter and step, forecast against truth.
+# Verification: RMSE per step of one parameter, forecast against truth. One job per
+# (init time, parameter), so that the local files mirror the declared parameters.
 rule verify:
     input:
-        forecast=per_param(EXPVER, "fc"),
-        truth=per_param(TRUTH, "an"),
+        forecast=one_param(EXPVER, "fc"),
+        truth=one_param(TRUTH, "an"),
     output:
-        "metrics/{init_time}.csv",
+        "metrics/{init_time}/{param}.csv",
     run:
         import numpy as np
         from dummy import read_query
 
+        fc, an = read_query(input.forecast), read_query(input.truth)
         with open(output[0], "w") as f:
             print("init_time,expver,param,step,rmse", file=f)
-            for param, fc_query, an_query in zip(PARAMS, input.forecast, input.truth):
-                fc, an = read_query(fc_query), read_query(an_query)
-                for s in STEPS:
-                    rmse = float(np.sqrt(np.mean((fc[s] - an[s]) ** 2)))
-                    print(f"{wildcards.init_time},{EXPVER},{param},{s},{rmse:.4f}", file=f)
+            for s in STEPS:
+                rmse = float(np.sqrt(np.mean((fc[s] - an[s]) ** 2)))
+                print(
+                    f"{wildcards.init_time},{EXPVER},{wildcards.param},{s},{rmse:.4f}",
+                    file=f,
+                )
 
 
-# Animation: one GIF per init time, one frame per step, one panel per parameter.
+# The summary of the declared set: it aggregates the *local* metrics files, not the FDB
+# inputs. Narrowing `params` reruns no FDB producer (the fields are all still there),
+# but this rule's input set shrinks, so Snakemake reruns it and the scorecard matches
+# config.yaml again.
+rule scorecard:
+    input:
+        expand(
+            "metrics/{init_time}/{param}.csv",
+            init_time=config["init_times"],
+            param=PARAMS,
+        ),
+    output:
+        "scorecard.csv",
+    run:
+        rows = []
+        for path in input:
+            with open(path) as f:
+                rows += [line.strip().split(",") for line in f.readlines()[1:]]
+        by_param_step = {}
+        for init_time, expver, param, step, rmse in rows:
+            by_param_step.setdefault((param, int(step)), []).append(float(rmse))
+        with open(output[0], "w") as f:
+            print("init_time,expver,param,step,rmse", file=f)
+            for row in rows:
+                print(",".join(row), file=f)
+            # The mean over the initialisation times, one row per (param, step).
+            for (param, step), values in sorted(by_param_step.items()):
+                mean = sum(values) / len(values)
+                print(f"mean,{EXPVER},{param},{step},{mean:.4f}", file=f)
+
+
+# Animation: one GIF per (init time, parameter), one frame per step.
 rule animate:
     input:
-        per_param(EXPVER, "fc"),
+        one_param(EXPVER, "fc"),
     output:
-        "animations/{init_time}.gif",
+        "animations/{init_time}/{param}.gif",
     run:
         import matplotlib
 
@@ -213,21 +306,19 @@ rule animate:
         from matplotlib.animation import FuncAnimation, PillowWriter
         from dummy import GRID, read_query
 
-        fields = {p: read_query(q) for p, q in zip(PARAMS, input)}
-        fig, axes = plt.subplots(1, len(PARAMS), figsize=(4 * len(PARAMS), 3.2), squeeze=False)
-        images = []
-        for ax, p in zip(axes[0], PARAMS):
-            data = fields[p]
-            vmin, vmax = min(v.min() for v in data.values()), max(v.max() for v in data.values())
-            images.append(ax.imshow(data[STEPS[0]].reshape(GRID), vmin=vmin, vmax=vmax))
-            ax.set_xticks([]), ax.set_yticks([])
+        data = read_query(input[0])
+        fig, ax = plt.subplots(figsize=(4, 3.2))
+        vmin, vmax = min(v.min() for v in data.values()), max(v.max() for v in data.values())
+        image = ax.imshow(data[STEPS[0]].reshape(GRID), vmin=vmin, vmax=vmax)
+        ax.set_xticks([]), ax.set_yticks([])
         title = fig.suptitle("")
 
         def frame(step):
-            for im, p in zip(images, PARAMS):
-                im.set_data(fields[p][step].reshape(GRID))
-            title.set_text(f"{wildcards.init_time} expver={EXPVER} step={step} params={','.join(PARAMS)}")
-            return images
+            image.set_data(data[step].reshape(GRID))
+            title.set_text(
+                f"{wildcards.init_time} expver={EXPVER} param={wildcards.param} step={step}"
+            )
+            return [image]
 
         FuncAnimation(fig, frame, frames=STEPS, blit=False).save(output[0], writer=PillowWriter(fps=1))
         plt.close(fig)
