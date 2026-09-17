@@ -127,6 +127,7 @@ def test_parse_schema_test_schema():
         optional=frozenset({"domain", "quantile", "number", "levelist"}),
         removed=frozenset(),
         defaults={},
+        first_level=frozenset({"class", "expver", "stream", "date", "time", "domain"}),
     )  # fmt: skip
     assert info.keys == KeyOrder.from_schema(text).keys
 
@@ -366,13 +367,13 @@ def test_map_error_without_local_and_unknown():
 
 def test_map_error_detail_is_shortened():
     """FR-ERR-001: the plugin sentence first, the metkit dump cut off."""
-    vocabulary = ",".join(f"key{i}" for i in range(200))
+    values = "/".join(f"value{i}" for i in range(200))
     exc = RuntimeError(
-        f"UserError: UserError: Cannot match [bogus] in [{vocabulary}] "
+        f"UserError: UserError: Bad value: {values} "
         f"request=retrieve,bogus=42, expanded=retrieve,"
     )
     message = str(map_error(exc, "fdb://q"))
-    assert message.startswith("Invalid MARS request fdb://q: Cannot match [bogus] in [")
+    assert message.startswith("Invalid MARS request fdb://q: Bad value: value0/")
     assert "request=" not in message
     assert len(message) < 300 and message.endswith("…")
 

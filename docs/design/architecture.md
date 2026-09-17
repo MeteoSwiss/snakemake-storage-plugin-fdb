@@ -108,6 +108,9 @@ flowchart TB
         apimod["api.py<br/>query/request helpers, reads, archive, marker (FR-DIRECT-*)"]
         guard["guard.py<br/>IdentifierGuard, NoGuard, StrictGuard (reserved)"]
         rerun["rerun.py<br/>install_lookup_input_tracking"]
+        summary["summary.py<br/>RunState, the end-of-run block (FR-IFACE-007)"]
+        framesmod["frames.py<br/>clean_errors (FR-ERR-007)"]
+        main["__main__.py<br/>inspect / list (FR-DEV-004)"]
     end
     init --> apimod
     init --> query
@@ -115,6 +118,9 @@ flowchart TB
     init --> grib
     init --> guard
     init --> rerun
+    init --> summary
+    init --> framesmod
+    main --> apimod
     backend --> query
     backend --> grib
     apimod --> query
@@ -124,8 +130,9 @@ flowchart TB
     scripts --> grib
 ```
 
-Dependencies point one way: `query.py`, `grib.py` and `rerun.py` import nothing from the
-package (`guard.py` imports types only; `rerun.py` imports Snakemake lazily);
+Dependencies point one way: `query.py`, `grib.py`, `rerun.py`, `summary.py` and
+`frames.py` import nothing from the package (`guard.py` imports types only; `rerun.py`
+and `summary.py` import Snakemake lazily);
 `backend.py` uses `query` and `grib`; `__init__.py`
 composes all of them. `api.py` is the one back edge: it needs a provider and a storage
 object, which it imports inside its functions, and `__init__.py` re-exports it as
@@ -198,6 +205,28 @@ its object's `covered_by()` says that the recorded queries do not cover its fiel
 (FR-RERUN-001, ADR-034, §8.10). `decide(objects, current, recorded)` holds that
 comparison; the import of Snakemake happens inside the installer.
 
+### 5.6a `summary.py` — the end-of-run block
+
+`RUN` is the process's `RunState`: what every lookup and store told it (fields archived
+per query, fields older than the run's reference time per query, the queries found
+incomplete, the archive modes in use, which outputs the plugin archived and which their
+jobs did). `lines()` turns it into the block of FR-IFACE-007 and `emit(logger)` logs it
+once. `install(logger)` wraps `snakemake.logging.LoggerManager.stop` so the block is
+logged while the handlers are still attached, and falls back to `atexit` (ADR-041,
+L-35); `reset()` forgets the run, for tests.
+
+### 5.6b `frames.py` — errors without the plugin's frames
+
+`clean_errors(method)` wraps a method Snakemake calls so that a `WorkflowError` leaving
+it is re-raised from a function compiled under the file name
+`<snakemake-storage-plugin-fdb>`; the original goes to the debug log (FR-ERR-007,
+ADR-042, L-36).
+
+### 5.6c `__main__.py` — the command line
+
+`inspect` and `list` (FR-DEV-004) over `api.exists` and `Backend.list`; plain
+`argparse`, exit codes 0/1/2, errors as the plugin's messages.
+
 ### 5.7 `api.py` — optional helpers for Snakefiles and rule bodies
 
 Jobs read and archive with plain pyfdb, eccodes or earthkit-data (FR-DIRECT-003,
@@ -212,6 +241,9 @@ rather than repeating them.
 - Queries and requests: `request(query)` (the storage object's expansion) and its
   inverse `query(request)`, which is pure text — it parses what it builds, so an invalid
   request is an error at Snakefile time (FR-DIRECT-001).
+- Lookups: `exists(query)` returns the `Lookup` of FR-DIRECT-006 (counts, missing
+  combinations, per-field keys and timestamps) from the storage object's own `_fields`
+  and `_missing_combinations`; `__main__.py` prints it.
 - Reads: `messages` (completeness check, then `stream_messages` over a `_Stream`, a
   `RawIOBase` wrapper over an opened pyfdb data handle that keeps the FDB handle alive,
   then a count check) (FR-DIRECT-001).
@@ -226,12 +258,12 @@ rather than repeating them.
 
 - `StorageProviderSettings`: the plugin settings, all `Optional[str]`
   ([reference](../reference.md#settings)).
-- `StorageProvider.__post_init__` runs: choice settings and `identifier_check` →
+- `StorageProvider.__post_init__` runs: choice settings →
   `glob_required_keys` → `input_tracking` (§8.10) → `config`/`user_config` →
   environment, including the export of the FDB configuration (§8.3, FR-DIRECT-003) →
-  schema path and
+  the "is there any configuration at all" check (FR-CONF-010) → schema path and
   `SchemaInfo` → `key_order` → lazy import of `eccodes` and `pyfdb` → `Backend` →
-  guard. `postprocess_query` records its results for `is_normalised` (FR-PATH-004), and
+  guard → the startup line and, outside a spawned job, the summary hook. `postprocess_query` records its results for `is_normalised` (FR-PATH-004), and
   `field_set(query)` caches the fields of a query for the rerun decision (§8.10).
 - `StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob)`: the parse
   result and the request expansion are cached per query text (FR-PATH-005, §8.2);
@@ -241,8 +273,10 @@ rather than repeating them.
   `covered_by` (§8.10) asks the provider's `field_set` instead.
 - Module-level state, each lock-protected: `_APPLIED` (values applied by providers, to
   warn on disagreement), `_FDB_EXPORTED` and `_FDB_EXPORT_CONFLICT` (the FDB
-  configuration exported for direct access, §8.3), `_SPELLING_WARNED` and `_REMOVE_WARNED`
-  (once-per-process warnings).
+  configuration exported for direct access, §8.3), `_SPELLING_WARNED`, `_REMOVE_WARNED`,
+  `_PARTIAL_WARNED`, `_KEY_HINT_WARNED`, `_ALIAS_WARNED` and `_STARTUP_LOGGED`
+  (once-per-query or once-per-process messages). `_spawned_job()` reads `--mode` from
+  `sys.argv` to tell a job process from the main one (FR-CONF-010).
 
 ### 5.9 Outside the package
 
@@ -399,10 +433,12 @@ runs none of it: step 0's post-check is all the plugin can say about such an out
 
 Snakemake's code path calls `managed_remove()` before a job runs on every output that
 exists in storage, on job-failure cleanup, for `--delete-all-output` and for temporary
-outputs (§13.8); of these only `--delete-all-output` is observed to reach an FDB output
-in 9.27, and temporary storage outputs cannot be written at all. `remove()` applies
-`remove_policy` and never deletes (FR-REMOVE-001). A rerun archives new fields that mask
-the old ones.
+outputs (§13.8); of these `--delete-all-output` and the failed-job cleanup reach an FDB
+output in 9.27 (the cleanup only for an output the lookup finds complete, and it lists
+such an output twice, so `remove()` is called twice), and temporary storage outputs
+cannot be written at all. `remove()` applies `remove_policy`, never deletes
+(FR-REMOVE-001) and branches its message on one lookup: complete, partial or nothing
+(FR-REMOVE-002), once per query. A rerun archives new fields that mask the old ones.
 
 ## 7. Deployment view
 
@@ -515,7 +551,7 @@ plain `RuntimeError` (§13.11); matching is by substring, in order:
 
 | message contains | raised as |
 |---|---|
-| `UserError` | `Invalid MARS request <query>: <detail>` (+ `metkit_home` hint if `cannot expand`) |
+| `UserError` | `Invalid MARS request <query>: <detail>` (+ `metkit_home` hint if `cannot expand`); `<detail>` is the plugin's own wording for an unknown key, a key refused by another key's context and a value of the wrong shape (FR-ERR-007) |
 | `Cannot find a metkit SplitterBuilder` | `<local file or query> is not GRIB` |
 | `Keywords not used`, `Could not find [`, `Could not find a rule` | `GRIB keys do not match the FDB schema for <query> (<local>): <detail>` |
 | `Cannot open`, `No writable roots available` | `FDB configuration error: <detail>` (+ the no-configuration hint if the detail names `fdb5lib/etc/fdb/schema`) |
@@ -534,7 +570,12 @@ characters with `…`, so the plugin's sentence and any hint after it stay reada
 error, logs the full text at debug level on the provider's logger.
 
 `resolve_config` adds the mangled-tagged-setting hint of FR-ERR-005 when a value that is
-neither a file nor a YAML mapping matches `TAG:<existing file>` (L-19).
+neither a file nor a YAML mapping matches `TAG:<existing file>` (L-19), and
+`missing_default_schema()` raises the same configuration error before pyfdb is imported
+when nothing names an FDB at all (FR-CONF-010).
+
+The methods Snakemake calls during DAG building are wrapped by `frames.clean_errors`, so
+the mapped error reaches the user without the plugin's traceback frames (ADR-042).
 
 ### 8.5 Retries
 
@@ -1260,6 +1301,47 @@ design round, provided requirements, architecture and code are updated together.
 - Consequences: L-25 shrinks to the command-line-target half; `--touch` does not make an
   FDB output up to date, which is harmless because reruns follow the fields (§8.10).
 
+### ADR-041 The end-of-run summary is logged from Snakemake's logger shutdown
+
+- Context: the plugin knows what a run archived, masked and found incomplete
+  (FR-IFACE-007), but the storage interface has no provider teardown: `StorageObject`
+  has only `cleanup()`, called per object from `dag.cleanup_storage_objects()`, which
+  does not run for a dry run or with `--keep-storage-local-copies` and gives no "last"
+  call. An `atexit` handler runs after `SnakemakeApi._cleanup` has called
+  `LoggerManager.stop()`, which removes every handler from Snakemake's logger [verified
+  2026-09-17: an `atexit` handler's `logger.info` is lost and its `logger.warning`
+  reaches stderr only through `logging.lastResort`, unformatted and not in the log
+  file].
+- Decision: wrap `snakemake.logging.LoggerManager.stop` once per process (as ADR-034
+  wraps the persistence hook: signature checked, failures are a debug line, never an
+  error) and log the block just before the handlers go. Fall back to `atexit` if the
+  wrapper cannot be installed. Only the main process installs it (`--mode` on the
+  command line marks a spawned job).
+- Alternatives: `atexit` alone (rejected: the block is lost or unformatted); the last
+  `StorageObject.cleanup()` (rejected: no "last", and it never runs for a dry run, which
+  is where the incomplete-query list matters most); a `--report`-style file (rejected:
+  nobody reads it after "Nothing to be done").
+- Status: accepted (reversible), 2026-09-17.
+- Consequences: one more private Snakemake API (R-18, L-35); drop it for an upstream
+  teardown hook (D-018).
+
+### ADR-042 Errors are re-raised from a frame Snakemake cannot show
+
+- Context: `snakemake/exceptions.py` renders a `WorkflowError` with every traceback
+  frame between the `raise` and Snakemake's own call (`cut_traceback`), so a mistyped
+  MARS value arrived with five `__init__.py` frames and looked like a plugin bug.
+- Decision: `frames.clean_errors` wraps the methods Snakemake calls during DAG building;
+  it catches a `WorkflowError`, logs the original with its traceback at debug level and
+  raises a fresh one from a wrapper compiled under the file name
+  `<snakemake-storage-plugin-fdb>` and named `fdb_storage_error`, so the single frame
+  that remains names the plugin rather than pointing into it.
+- Alternatives: leave the frames (rejected: they mislead); give the wrapper a file name
+  inside Snakemake's package directory, which `cut_traceback` would drop entirely
+  (rejected: a fake path in another package's directory is dishonest); ask Snakemake not
+  to show the traceback of a plugin error (D-011-style upstream change, not available).
+- Status: accepted (reversible), 2026-09-17.
+- Consequences: one frame remains (L-36); the real traceback is one `--verbose` away.
+
 ## 10. Quality requirements
 
 Quality scenarios are the non-functional requirements in
@@ -1287,6 +1369,7 @@ reliability, security and licensing, maintainability), each with its verificatio
 | R-15 | FDB request semantics: `inspect`/`retrieve` match through query keys the indexed fields lack while `list` does not (§13.4, L-22); the plugin's own key check (FR-READ-001) depends on that asymmetry not changing meaning across FDB versions. | `test_exists_does_not_match_through_absent_key` pins both behaviours; the `pyfdb-latest` canary runs it on 5.23; report upstream (requirements.md D-012). |
 | R-16 | **Silently unreadable databases.** An unreadable database directory under an FDB root makes `inspect` return fewer fields with no exception to map, so partial data looks like missing data and a workflow that can also produce the query would recompute and re-archive it (L-24) [verified: `chmod 000` on one `root/ea:...` directory, `read-glob-config` stress test]. `ECKIT_EXCEPTION_IS_SILENT=1` hides eckit's own message. | The partial-input warning (FR-READ-008) names the missing fields; documented in the troubleshooting table. |
 | R-17 | **The local file of a direct output is a convention.** Only where one is asked for: since ADR-037 a direct output is declared `retrieve=False` and has no local file at all, and the convention applies to the two checked variants, in which a job that archives itself leaves an empty file (ADR-036, FR-DIRECT-004) or a small text marker (ADR-035, FR-DIRECT-002) where Snakemake expects the output's GRIB; `store_object` decides by the size and the header line. A future Snakemake that inspects or hashes a storage output's local copy would see something that is not GRIB; a rule that writes an empty GRIB file by mistake, or one that writes both a marker and real messages, is read as a direct archive. | Both are distinctive (a GRIB file is never empty and never starts with the header line); the marker names its query and field count and is rejected if either disagrees, and the empty file's post-check (FR-STORE-009, FR-DIRECT-004) still proves every field of the query is in FDB with a timestamp from this run; `tests/test_direct.py` covers the accepted and the rejected cases of both. |
+| R-18 | **Private Snakemake API.** The end-of-run summary wraps `snakemake.logging.LoggerManager.stop` (ADR-041); a rename or a signature change loses the block or falls back to `atexit`, where only a warning is visible. | Guarded installation with a debug note and the `atexit` fallback (L-35); `tests/test_messages.py::test_summary_hook_is_the_snakemake_logger_shutdown` and the end-to-end assertion in `tests/test_workflow.py`; upstream teardown hook (requirements.md D-018). |
 | TD-1 | `SchemaInfo.defaults` is parsed but not used by the plugin; `Backend.expected_count` is used only by tests. | Keep for the strict guard (D-001) or remove. |
 | TD-2 | No ECMWF sample fetch script. | D-008. |
 

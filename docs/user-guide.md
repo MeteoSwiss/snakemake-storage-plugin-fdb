@@ -78,6 +78,24 @@ Unset the variable to silence this.
 Unset the variable to silence the warning; a job that really must read another FDB opens
 it itself (`pyfdb.FDB(config=...)`).
 
+Every run says once which FDB it opened, at the top of the log:
+
+```text
+FDB storage: using /path/to/fdb/config.yaml (roots: /path/to/fdb/root; schema:
+/path/to/fdb/schema; input tracking: lookup)
+```
+
+That is the line to look for when a workflow writes where it should not, or reads
+nothing where it should read something. If no configuration reaches the plugin at all —
+no `config` setting and none of `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`,
+`FDB5_CONFIG_FILE`, `FDB_HOME` — the run stops at the Snakefile line with one sentence
+instead of opening a database that does not exist:
+
+```text
+FDB configuration error: Cannot open /.../fdb5lib/etc/fdb/schema (No such file or
+directory) (no FDB configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)
+```
+
 The plugin reads the schema named by the configuration to order query keys
 (see [Writing queries](#writing-queries)). A relative path resolves against
 Snakemake's working directory, which is the directory the command was typed in unless
@@ -266,10 +284,19 @@ wildcards`, and a first rule that is not the collecting rule builds only itself.
   ```
 
 - If **nothing** matches, that is the normal state of data not produced yet, so there is
-  no warning. Run with `--verbose` to get the same report at debug level; when the
-  schema is known it also lists the optional schema keys the query does not name
-  (`domain`, `number`, `timespan`), which is the usual cause. Otherwise check with
-  `fdb list` using the query's constant keys.
+  no warning — unless the query cannot match at all because it omits a key the FDB
+  schema's first rule level requires, which the plugin says once:
+
+  ```text
+  FDB storage: fdb://...: no fields in FDB; the query does not name domain, which the
+  FDB schema's first rule level requires. FDB matches keys exactly, so nothing can match.
+  ```
+
+  Otherwise run with `--verbose` for the same report at debug level; when the schema is
+  known it also lists the optional schema keys the query does not name (`number`,
+  `timespan`), which is the usual cause. `python -m snakemake_storage_plugin_fdb list`
+  ([Snakemake flags and features](#snakemake-flags-and-features)) shows what FDB holds
+  under the query's constant keys.
 - The local file holds the messages in request order, never sorted: each key's values in
   the order the query lists them, keys nested in canonical key order with the last key
   varying fastest. `step=12/0/6,param=165/167` gives `12/165, 12/167, 0/165, 0/167,
@@ -386,7 +413,7 @@ rule shift_expver:
 - `api.archive(output, messages)` runs the checks of a file-based store **before** the
   first archive — field count, every message's keys against the query, duplicates — so
   a failure archives nothing, and the post-check runs in the job and names the offending
-  messages. It archives as the workflow does: `archive_mode`, `identifier_check`,
+  messages. It archives as the workflow does: `archive_mode`,
   `canonical_spelling` and `key_order` reach it through the `SNAKEMAKE_STORAGE_FDB_*`
   variables Snakemake carries into every job, and `api.archive(..., archive_mode=...)`
   overrides that for one call. Errors are the plugin's mapped messages.
@@ -594,11 +621,11 @@ marker instead of an empty file, where the job may import the plugin.
   environment the provider exports (`FDB5_CONFIG`, `FDB_CONFIG_FILE`), so an
   unconfigured `pyfdb.FDB()` opens the workflow's FDB. `canonical_spelling`, `key_order`
   and `glob_required_keys` apply to the queries, which the plugin handles in the
-  Snakefile process, so they are enforced whatever the job does. `archive_mode` and
-  `identifier_check` describe the plugin's own store step, which never runs for a
+  Snakefile process, so they are enforced whatever the job does.
+  `archive_mode` describes the plugin's own store step, which never runs for a
   `retrieve=False` output: `--storage-fdb-archive-mode identifier` has no effect at all
-  on a job archiving with plain `pyfdb`. Only
-  [`api.archive`](#a-run-body-with-the-api-module) reads them in a job.
+  on a job archiving with plain `pyfdb`, and the run summary says so once at the end.
+  Only [`api.archive`](#a-run-body-with-the-api-module) reads it in a job.
 - **Which errors such a job raises.** They are fdb5's and eckit's own text, not the
   plugin's mapped messages: an unwritable FDB root gives `Failed system call: mkdir
   /…/root/ea:0002:… (Success)` where the plugin would say `FDB I/O error for fdb://…:
@@ -715,7 +742,9 @@ streams).
   such as GRIB that lacks a key the schema requires; with multi-rule schemas it fails
   with `cannot determine <key>`.
 
-`identifier_check` is reserved for a stricter identifier check; only `none` is accepted.
+A stricter identifier check against the GRIB metadata is designed but not implemented,
+and has no setting ([FR-CONF-004](design/requirements.md#fr-conf-004-reserved-identifier-check));
+the built-in pre-check of every message's keys against the query runs in both modes.
 
 ## Reruns
 
@@ -853,21 +882,35 @@ lists them back, and write them the same way everywhere.
 
 ## Removing outputs
 
-FDB cannot delete individual fields, so the plugin never deletes anything. In Snakemake
-9.27, `--delete-all-output` is the only thing that asks the plugin to remove an FDB
-output; `remove_policy=warn` (default) then logs once per query:
+FDB cannot delete individual fields, so the plugin never deletes anything. Two things
+ask it to: `--delete-all-output`, and Snakemake's cleanup of the outputs of a **failed
+job** (for every output whose fields the lookup then finds complete — Snakemake's own
+`Removing output files of failed job ... (in storage)` line, which removes nothing from
+FDB). Rerunning a job does not; `temp()` outputs cannot occur —
+`temp(storage.fdb(...))` is a `SyntaxError` ("Storage and temporary flags are mutually
+exclusive"), as are `protected()` and `directory()`, and `pipe()` gives "Pipes may not
+be in storage".
+
+`remove_policy=warn` (the default) then says, once per query, what is actually the case.
+When every field of the query is in FDB:
 
 ```text
-FDB cannot delete individual fields; existing fields for <query> will be masked by the next archive. Use `fdb purge` to reclaim space.
+FDB storage: <query>: all 3 fields are in FDB. Nothing was removed: FDB cannot delete
+individual fields. Later archives of the same fields mask these; `fdb purge` reclaims
+the space. This output therefore still looks complete, and the rule that writes it will
+not be scheduled again: after a failed job, rerun it with `-R <rule>` (every job of the
+rule) or archive the retry under a fresh expver.
 ```
 
-`remove_policy=ignore` stays silent; `remove_policy=error` makes removal an error.
+When only some fields are there, the message names the missing ones; when none is, it is
+a clause at info level (`FDB storage: nothing to remove: no field of <query> is in
+FDB.`). `remove_policy=ignore` stays silent; `remove_policy=error` makes removal an
+error with the same text.
 
-Neither rerunning a job nor a failed job removes anything: no `remove()` call, no
-warning, and Snakemake's own `Removing output files of failed job ... (in storage)` line
-removes nothing from FDB. `temp()` outputs cannot occur — `temp(storage.fdb(...))` is a
-`SyntaxError` ("Storage and temporary flags are mutually exclusive"), as are
-`protected()` and `directory()`, and `pipe()` gives "Pipes may not be in storage".
+The second half of the first message is the one to remember: **a job that archived into
+FDB and then failed leaves an output that looks complete**, and its rule is not
+scheduled again, whatever the job's exit code was. `-R <rule>` reruns every job of that
+rule; a fresh `expver` separates the retry from the failed attempt.
 
 `--delete-all-output` therefore deletes local outputs and leaves the FDB fields in
 place, and because the FDB output still exists the producing job is **not** rerun
@@ -885,6 +928,13 @@ Most of Snakemake works unchanged with FDB objects; these are the exceptions.
   reported as `Output files not touched because they don't exist`. Since reruns follow
   the fields a query names, not their timestamps, this is enough to stop a cosmetic
   Snakefile edit from rebuilding everything.
+- **`python -m snakemake_storage_plugin_fdb inspect "fdb://..."`** answers "is this in
+  FDB?" without a workflow: the field count the plugin's own lookup gives, the missing
+  fields and each present field's index timestamp (exit 1 when incomplete). `list` takes
+  a query with keys left out and prints the distinct values FDB holds under it. Both
+  take `--config`/`--user-config`, or read the `SNAKEMAKE_STORAGE_FDB_*` variables
+  ([reference](reference.md#command-line)); `api.exists(query)` is the same answer in
+  Python.
 - **FDB queries cannot be command-line targets**, because Snakemake sends targets
   through path normalisation and `fdb://...` becomes `fdb:/...`
   (`MissingRuleException: No rule to produce fdb:/class=...`). Drive such a workflow by
@@ -974,8 +1024,12 @@ explain the two example workflows.
 | symptom | cause and fix |
 |---|---|
 | `Invalid MARS request ...: TypeEnum[name=...]: cannot expand '<value>' (if this value is valid ...)` | A typo, or a value your MARS language does not define (e.g. a site `model`). Fix the value or set `metkit_home`. |
-| `Invalid MARS request ...: Key [number] not acceptable with context ...` | The key is not valid with the other values (e.g. `number` with `type=cf`). Remove it. |
-| `...: 0 of N fields found in FDB ... optional schema keys not in the query: ...` | The fields carry keys the query does not name. Add them (`domain=g`, `number=...`, `timespan=fs`). Only visible with `--verbose`, or when a rule retrieves the query. |
+| `Invalid MARS request ...: number is not allowed with type=an` | The key is not valid with the other values. Remove it, or change the value it clashes with. |
+| `Invalid MARS request ...: unknown MARS key 'x'; did you mean 'y'? (the FDB schema names: ...)` | A misspelled or invented key. The message lists the keys to choose from. |
+| `Invalid MARS request ...: Bad value: Invalid date ... (MARS dates are YYYYMMDD, times HHMM ...)` | A wildcard expanded to something MARS does not accept (`2020-01-01T00:00`). Convert human-readable wildcards to MARS values in an input function. |
+| `...: 0 of N fields found in FDB ... optional schema keys not in the query: ...` | The fields carry keys the query does not name. Add them (`domain=g`, `number=...`, `timespan=fs`). Visible with `--verbose`, when a rule retrieves the query, or through `python -m snakemake_storage_plugin_fdb inspect`. |
+| `...: no fields in FDB; the query does not name <keys>, which the FDB schema's first rule level requires` | The query cannot match anything: FDB matches keys exactly and those keys select the database. Add them. |
+| `... uses MARS key alias(es): levtyp (canonical: levtype)` | metkit accepted an alias; FDB matched the canonical key, but the query text (and the local path) keeps the alias. Write the canonical key. |
 | `...: n of N fields found in FDB; missing: ...` | Some fields are not archived; the message names them. Snakemake still reports the whole query as a missing input. |
 | A query you know is complete is reported partial, or missing | A database directory under the FDB root may be unreadable: FDB skips it silently. Check the permissions of the `root/<class>:<expver>:...` directories. |
 | `FDB I/O error for ...: ... (check permissions, free space and the roots ...)` | The FDB root is unreadable, read-only or full. Check the roots in the configuration, the permissions and the free space. |
@@ -999,14 +1053,15 @@ explain the two example workflows.
 | `--touch` left the FDB outputs alone | By design: FDB index timestamps cannot be set (see [Snakemake flags and features](#snakemake-flags-and-features)). The local outputs were touched. |
 | `MissingRuleException: No rule to produce fdb:/...` | An FDB query was used as a command-line target; Snakemake normalised it. Target the rule by name or a local file. |
 | `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
-| `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem, and the message names no FDB cause: for an `fdb://` output, `(missing locally, parent dir contents: )` means the declaration is wrong. Declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
+| `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem, and the message names no FDB cause: for an `fdb://` output, `(missing locally, parent dir contents: )` means the declaration is wrong. The plugin's run summary at the end of the run says the same in full. Archive with [`api.archive(output[0], messages)`](#the-optional-api-module), which keeps the plain declaration and pre-checks the messages, or declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
 | `RuntimeError ... Failed system call: mkdir /.../root/... (Success)` raised inside a job | An error from plain `pyfdb` in the job, not from the plugin, so it is fdb5/eckit's own text and the `(Success)` suffix means nothing. Usually the FDB root: permissions or free space. `api.messages`/`api.archive` give the plugin's mapped messages instead (see [Direct access](#direct-access-from-run-and-script-rules)). |
-| A rule that failed once is silently skipped later | The archives of a failed direct-output job stay in FDB — FDB has no delete. If those fields satisfy another query, the producing rule is never scheduled again, and `touch()` cannot help because the job does not run. Force it (`-R <rule>`, `--forceall`), or archive under a fresh `expver`. |
+| A rule that failed once is silently skipped later | The archives of a failed direct-output job stay in FDB — FDB has no delete. If those fields satisfy another query, the producing rule is never scheduled again, and `touch()` cannot help because the job does not run. The removal message of the failed run says so (see [Removing outputs](#removing-outputs)). Force it (`-R <rule>`, `--forceall`), or archive under a fresh `expver`. |
 | A failed job's `Error in rule` block names a `.snakemake/storage/...` path for an input that has no local file | Snakemake's own formatting of a `retrieve=False` input; the path never existed. The `CalledProcessError` line above shows the command that ran, with the query in it. |
 | `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
+| "Nothing to be done" after a run that warned about incomplete queries | The plugin's run summary lists them again at the end, with `Run -R <rule> or --forceall to produce them.` Snakemake schedules no job for a query whose consumer is up to date. |
 | "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
 | A rule reruns after a query edit although the fields are unchanged | Input tracking by lookup is off; see the warning in the log and [Reruns](#reruns). |
-| `Job ... completed successfully, but some output files are missing ... fdb://... (missing in storage)` | The job of a `retrieve=False` output did not archive every field of its query: wrong keys (`expver`, `time`, `param`), too few fields, another FDB (check `env \| grep FDB`; see [Choosing the FDB](#choosing-the-fdb)), or no `flush()` in a long-lived process. The latency is not the problem, so `--latency-wait` does not help. Re-run with `--verbose` for the plugin's `n of N fields found in FDB; missing: ...` line, or declare the output `touch(storage.fdb(query))`, which names the missing fields at once (see [The checked variant](#the-checked-variant-touch)). |
+| `Job ... completed successfully, but some output files are missing ... fdb://... (missing in storage)` | The job of a `retrieve=False` output did not archive every field of its query: wrong keys (`expver`, `time`, `param`), too few fields, another FDB (check `env \| grep FDB`; see [Choosing the FDB](#choosing-the-fdb)), or no `flush()` in a long-lived process. The latency is not the problem, so `--latency-wait` does not help. The plugin's `n of N fields found in FDB; missing: ...` line right above names the missing fields; `touch(storage.fdb(query))` or [`api.archive`](#the-optional-api-module) check the archive at once (see [The checked variant](#the-checked-variant-touch)). |
 
 ## Limitations
 

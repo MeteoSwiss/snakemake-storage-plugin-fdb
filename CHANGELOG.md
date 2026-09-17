@@ -38,6 +38,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The `touch()` check does not cover the fields a *failed* job archived: the rule is
   never scheduled again, so no check runs. The example's README says what to do instead.
 
+### Added
+
+- One line per run naming the FDB in use: `FDB storage: using <config> (roots: ...;
+  schema: ...; input tracking: ...)`, at info level in the main process.
+- An end-of-run summary, logged once when there is anything to say: how many fields the
+  run archived and how many of them masked fields that were already in FDB (reclaimed
+  only by `fdb purge`), the queries FDB holds only in part although no job produced
+  them (with `Run -R <rule> or --forceall to produce them.`), a file-based output whose
+  job archived it itself, and an `archive_mode` no output of the run could use.
+- A message when a lookup finds nothing *because* the query omits a key the FDB
+  schema's first rule level requires (the usual `domain=g` case), and a warning when
+  metkit maps a MARS key alias (`levtyp` for `levtype`) to another key than the query
+  names.
+- `python -m snakemake_storage_plugin_fdb inspect|list [--config PATH] "fdb://..."`:
+  what FDB holds for a query — field counts, missing fields and index timestamps, or
+  the distinct values under a partial query — with exit code 1 when a query is
+  incomplete. `api.exists(query) -> Lookup` is the same answer in Python.
+
+### Changed
+
+- Removing an FDB output says what removal actually means for it: whether every field,
+  some or none are in FDB, and, when the output looks complete, that its rule will not
+  be scheduled again (after a failed job: `-R <rule>` or a fresh `expver`). Snakemake's
+  cleanup of a *failed* job's outputs does reach the plugin, which the documentation
+  denied.
+- Invalid MARS requests are reported in the plugin's own words: an unknown key with the
+  keys to choose from (never truncated) and a nearest match, a key refused by another
+  key's value (`levelist is not allowed with levtype=sfc`), and the MARS shape hint for
+  dates and times (`MARS dates are YYYYMMDD, times HHMM ...`).
+- An error raised during DAG building no longer shows the plugin's traceback frames;
+  one frame named `<snakemake-storage-plugin-fdb>` is left and the original traceback
+  goes to the debug log.
+- The archive pre-check error says how to fix the mismatch (`grib_set -s expver=0003`,
+  or declare the output under the keys the data carries).
+- A run without any FDB configuration fails at the Snakefile line with the one-line
+  configuration error instead of 41 lines of eckit backtrace.
+- `StorageObject.__repr__` is the query, so Snakemake's own messages that print a
+  storage object are readable.
+- The canonical-spelling warning is prefixed `FDB storage:` like every other message of
+  the plugin.
+- `--help`: the settings that describe a site (`eccodes-definitions`, `metkit-home`,
+  `key-order`, `env`, `glob-required-keys`) start with `(site setup)`, and
+  `archive-mode` recommends its default.
+
+### Removed
+
+- The `identifier_check` setting (`--storage-fdb-identifier-check`, its profile key and
+  `SNAKEMAKE_STORAGE_FDB_IDENTIFIER_CHECK`): it accepted one value and its help text was
+  mostly about a value that raised. The guard hook and its design note stay; the setting
+  comes back with `strict`.
+
 ## [0.4.0] - 2026-09-17
 
 The forecast-evaluation example, `retrieve=False` for direct outputs, and the

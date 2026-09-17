@@ -9,6 +9,7 @@ import os
 import typing
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -31,7 +32,6 @@ SETTINGS = {
     "config": None,
     "user_config": None,
     "archive_mode": "native",  # ADR-009
-    "identifier_check": "none",
     "canonical_spelling": "warn",
     "remove_policy": "warn",
     "input_tracking": "lookup",  # FR-RERUN-002
@@ -48,7 +48,6 @@ ENV_VAR_SETTINGS = {
     "config",
     "user_config",
     "archive_mode",
-    "identifier_check",
     "canonical_spelling",
     "eccodes_definitions",
     "metkit_home",
@@ -97,6 +96,24 @@ def test_settings_help_names_the_default():
         assert f.metadata["help"].endswith(")"), f.name
 
 
+SITE_SETUP = {"eccodes_definitions", "metkit_home", "key_order", "env"}
+SITE_SETUP |= {"glob_required_keys"}
+
+
+def test_settings_help_marks_site_setup(make_provider):
+    """FR-CONF-001: ``snakemake --help`` groups nothing, so the settings that describe
+    a site rather than a workflow say so themselves."""
+    for f in fields(StorageProviderSettings):
+        if f.name == "max_requests_per_second":
+            continue
+        assert f.metadata["help"].startswith("(site setup)") == (
+            f.name in SITE_SETUP
+        ), f.name
+    archive_mode = StorageProviderSettings.__dataclass_fields__["archive_mode"]
+    assert "'native' (default;" in archive_mode.metadata["help"]
+    assert "use this)" in archive_mode.metadata["help"]
+
+
 def test_settings_defaults_construct(make_provider):
     provider = make_provider()
     assert provider.archive_mode == "native"
@@ -119,7 +136,6 @@ def test_settings_none_means_default(make_provider):
         ("archive_mode", "copy"),
         ("canonical_spelling", "fix"),
         ("remove_policy", "wipe"),
-        ("identifier_check", "loose"),
         ("input_tracking", "text"),
     ],
 )
@@ -159,10 +175,13 @@ def test_settings_invalid_values(make_provider, name, value, message):
 # --- guard ------------------------------------------------------------------------
 
 
-def test_identifier_check_strict_is_reserved(make_provider):
-    with pytest.raises(WorkflowError, match="reserved") as e:
-        make_provider(identifier_check="strict")
-    assert "identifier_check=strict" in str(e.value)
+def test_identifier_check_is_not_a_setting():
+    """FR-CONF-004: the reserved check is no longer on the settings surface; the guard
+    hook keeps it (D-001)."""
+    assert "identifier_check" not in {f.name for f in fields(StorageProviderSettings)}
+    assert "identifier-check" not in " ".join(
+        f.metadata.get("help", "") for f in fields(StorageProviderSettings)
+    )
 
 
 def test_guard_hook():
@@ -175,9 +194,9 @@ def test_guard_hook():
     assert isinstance(make_guard(StorageProviderSettings()), NoGuard)
     assert isinstance(make_guard(None), NoGuard)
     with pytest.raises(NotImplementedError):
-        make_guard(StorageProviderSettings(identifier_check="strict"))
+        make_guard(SimpleNamespace(identifier_check="strict"))
     with pytest.raises(ValueError, match="unknown identifier_check"):
-        make_guard(StorageProviderSettings(identifier_check="loose"))
+        make_guard(SimpleNamespace(identifier_check="loose"))
 
 
 def test_guard_identifier_mismatch():

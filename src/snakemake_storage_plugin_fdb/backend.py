@@ -10,13 +10,15 @@ this module changes the process environment; ``resolve_schema_path`` only reads 
 from __future__ import annotations
 
 import ctypes
+import difflib
+import importlib.util
 import logging
 import math
 import os
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
 ConfigValue = Path | str | dict[str, Any] | None
 
 CHUNK = 8 * 1024 * 1024  # retrieve buffer (FR-READ-007)
+# The FDB configuration variables, in fdb5's own precedence order (§13.7).
+_CONFIG_VARS = ("FDB_CONFIG", "FDB5_CONFIG", "FDB_CONFIG_FILE", "FDB5_CONFIG_FILE")
 PART_SUFFIX = ".part"
 
 _TIMESTAMP_RE = re.compile(r"timestamp=(\d+)\s*$")
@@ -63,8 +67,17 @@ _KINDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _IO_HINT = " (check permissions, free space and the roots in the FDB configuration)"
 # The schema pyfdb falls back to when no FDB configuration is given at all.
 _BUNDLED_SCHEMA = "fdb5lib/etc/fdb/schema"
-_NO_CONFIG_HINT = (
+NO_CONFIG_HINT = (
     " (no FDB configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)"
+)
+# Metkit refusals the plugin says in its own words (FR-ERR-007):
+_CANNOT_MATCH_RE = re.compile(r"Cannot match \[(\w+)\] in \[([^\]]*)")
+_CONTEXT_RE = re.compile(r"Key \[(\w+)\] not acceptable with context.*?key=(\w+)", re.S)
+_CONTEXT_VALS_RE = re.compile(r"vals=\[\{([^}]*)\}\]")
+_BAD_SHAPE_RE = re.compile(r"Invalid date|Invalid time|Wrong input for (?:time|date)")
+_SHAPE_HINT = (
+    " (MARS dates are YYYYMMDD, times HHMM; a wildcard used in a query must expand to "
+    "a MARS value)"
 )
 DETAIL_MAX = 200  # characters of pyfdb detail kept in a message (architecture.md §8.4)
 _DETAIL_CUT = re.compile(r"\srequest=|;")
@@ -107,6 +120,10 @@ class SchemaInfo:
     optional: frozenset[str]  # ``key?`` and ``key?default``
     removed: frozenset[str]  # ``key-``
     defaults: dict[str, str]  # ``key?default``
+    # Keys of the schema's first rule level (the database key: class, expver, ...),
+    # ``key-`` excluded. A query that omits one of them (and that the schema gives no
+    # default) can match nothing at all (FR-ERR-008).
+    first_level: frozenset[str] = frozenset()
 
 
 def resolve_config(value: str | None) -> Path | str | None:
@@ -273,6 +290,28 @@ def resolve_schema_path(
     return path if _is_file(path) else None
 
 
+def missing_default_schema(env: Mapping[str, str] | None = None) -> str | None:
+    """The bundled schema path pyfdb would fall back to, if nothing names an FDB and
+    that file does not exist (FR-CONF-010); ``None`` when a configuration is in reach.
+
+    ``pyfdb.FDB()`` without a configuration loads ``<fdb5lib>/etc/fdb/schema``, which
+    the wheels do not ship: eckit then dumps a 40-line backtrace before the plugin can
+    map the error (L-7). The provider calls this before pyfdb is imported, so it can
+    raise the one-line configuration error at the Snakefile line instead (FR-ERR-005).
+    """
+    env = os.environ if env is None else env
+    if any(env.get(name) for name in (*_CONFIG_VARS, "FDB_HOME")):
+        return None
+    try:
+        spec = importlib.util.find_spec("fdb5lib")
+    except (ImportError, ValueError):  # pragma: no cover - broken installation
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    schema = Path(list(spec.submodule_search_locations)[0], "etc", "fdb", "schema")
+    return None if _is_file(schema) else str(schema)
+
+
 def parse_schema(schema_text: str) -> SchemaInfo:
     """Keys and decorations (``key?``, ``key?default``, ``key-``) of an FDB schema.
 
@@ -283,6 +322,7 @@ def parse_schema(schema_text: str) -> SchemaInfo:
     optional: set[str] = set()
     removed: set[str] = set()
     defaults: dict[str, str] = {}
+    first_level: set[str] = set()
     depth = 0
     token: list[str] = []
 
@@ -292,6 +332,8 @@ def parse_schema(schema_text: str) -> SchemaInfo:
         if depth <= 0 or not m:
             return
         key, rest = m.group(1).lower(), m.group(2).strip()
+        if depth == 1 and not rest.startswith("-"):
+            first_level.add(key)
         if rest.startswith("?"):
             optional.add(key)
             default = rest[1:].split(":", 1)[0].strip()
@@ -307,7 +349,13 @@ def parse_schema(schema_text: str) -> SchemaInfo:
         elif depth > 0:
             token.append(ch)
     flush()
-    return SchemaInfo(keys, frozenset(optional), frozenset(removed), defaults)
+    return SchemaInfo(
+        keys,
+        frozenset(optional),
+        frozenset(removed),
+        defaults,
+        frozenset(first_level),
+    )
 
 
 def fallback_expand(request: Mapping[str, str]) -> dict[str, list[str]]:
@@ -408,13 +456,50 @@ def _kind(exc: BaseException) -> str | None:
     return None
 
 
+def _request_detail(
+    text: str,
+    detail: str,
+    request: Mapping[str, str] | None,
+    schema_keys: Iterable[str] | None,
+) -> str:
+    """The plugin's words for the common metkit refusals (FR-ERR-007).
+
+    An unknown key is named with the keys to choose from and a nearest match; a key
+    refused by the context of another one names that other key's value from the request;
+    a value of the wrong shape gets the MARS date/time shape hint. Anything else keeps
+    the short ``<detail>`` of FR-ERR-001.
+    """
+    if m := _CANNOT_MATCH_RE.search(text):
+        name, listed = m.group(1), [k for k in m.group(2).split(",") if k]
+        close = difflib.get_close_matches(name, listed, n=1, cutoff=0.7)
+        suggestion = f"; did you mean '{close[0]}'?" if close else ""
+        keys = list(schema_keys) if schema_keys else listed
+        named = "the FDB schema names" if schema_keys else "the MARS language accepts"
+        return f"unknown MARS key '{name}'{suggestion} ({named}: {', '.join(keys)})"
+    if m := _CONTEXT_RE.search(text):
+        key, context = m.group(1), m.group(2)
+        value = (request or {}).get(context)
+        if value is None and (vals := _CONTEXT_VALS_RE.search(text)):
+            return f"{key} is not allowed with these {context} values ({vals.group(1)})"
+        return f"{key} is not allowed with {context}={value}"
+    if _BAD_SHAPE_RE.search(text):
+        return detail + _SHAPE_HINT
+    return detail
+
+
 def map_error(
-    exc: BaseException, query: str, local: str | os.PathLike[str] | None = None
+    exc: BaseException,
+    query: str,
+    local: str | os.PathLike[str] | None = None,
+    *,
+    request: Mapping[str, str] | None = None,
+    schema_keys: Iterable[str] | None = None,
 ) -> WorkflowError | None:
     """``WorkflowError`` for a known pyfdb/GRIB failure, ``None`` otherwise.
 
     The caller raises the result ``from exc`` or re-raises ``exc`` when ``None``
-    (mapping table: architecture.md §8.4).
+    (mapping table: architecture.md §8.4). ``request`` (the query's MARS request) and
+    ``schema_keys`` sharpen the invalid-request messages (FR-ERR-007).
     """
     kind = _kind(exc)
     if kind is None:
@@ -430,6 +515,7 @@ def map_error(
                 " (if this value is valid for your FDB, point metkit_home at a MARS "
                 "language that defines it)"
             )
+        detail = _request_detail(text, detail, request, schema_keys)
         return WorkflowError(f"Invalid MARS request {query}: {detail}{hint}")
     if kind == "not_grib":
         return WorkflowError(f"{local if local is not None else query} is not GRIB")
@@ -439,7 +525,7 @@ def map_error(
             f"GRIB keys do not match the FDB schema for {query}{where}: {detail}"
         )
     if kind == "config":
-        hint = _NO_CONFIG_HINT if _BUNDLED_SCHEMA in text else ""
+        hint = NO_CONFIG_HINT if _BUNDLED_SCHEMA in text else ""
         return WorkflowError(f"FDB configuration error: {detail}{hint}")
     return WorkflowError(f"FDB I/O error for {query}: {detail}{_IO_HINT}")
 

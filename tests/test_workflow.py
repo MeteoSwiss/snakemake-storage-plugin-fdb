@@ -47,9 +47,10 @@ LOCAL_PREFIX = (
     "domain=g/type=an/levtype=sfc/"
 )
 OUTPUT_LOCAL = LOCAL_PREFIX + "step=0+6+12/param=167.grib"
+# FR-REMOVE-002: --delete-all-output on a complete FDB output
 REMOVE_WARNING = (
-    f"FDB cannot delete individual fields; existing fields for {OUTPUT_QUERY} will be "
-    "masked by the next archive. Use `fdb purge` to reclaim space."
+    f"FDB storage: {OUTPUT_QUERY}: all 3 fields are in FDB. Nothing was removed: FDB "
+    "cannot delete individual fields."
 )
 GLOB_SNAKEFILE = """\
 storage:
@@ -122,6 +123,56 @@ def test_workflow_spelling_error_names_the_snakefile(tmp_path, run_logged):
     assert len(spelling.log.splitlines()) < 20  # no traceback
 
 
+QUERY_ERROR_SNAKEFILE = """\
+storage:
+    provider="fdb"
+
+
+rule t2m:
+    input:
+        storage.fdb(
+            "fdb://class=ea,expver=0002,stream=oper,date=20200101,time=0000,domain=g,"
+            "type=an,levtype=sfc,levelist=500,step=0,param=167"
+        ),
+    output:
+        "t2m.grib",
+    shell:
+        "cp {input} {output}"
+"""
+
+PARTIAL_SNAKEFILE = """\
+storage:
+    provider="fdb"
+
+
+rule steps:
+    input:
+        storage.fdb(
+            "fdb://class=ea,expver=0002,stream=oper,date=20200101,time=0000,domain=g,"
+            "type=an,levtype=sfc,step=0/6/12/18,param=167"
+        ),
+    output:
+        "steps.txt",
+    shell:
+        "ls -l {input} > {output}"
+"""
+
+
+def test_workflow_query_error_has_no_plugin_frames(tmp_path, run_logged):
+    """FR-ERR-007: a query metkit refuses gives a sentence, not plugin frames."""
+    run = run_logged(tmp_path / "logs")
+    run("init", [sys.executable, INIT_DEV_FDB, "--root", tmp_path / ".fdb"], tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "Snakefile").write_text(QUERY_ERROR_SNAKEFILE)
+    bad = run("query_error", _cmd(tmp_path / ".fdb" / "config.yaml"), work)
+    assert bad.returncode != 0
+    assert "levelist is not allowed with levtype=sfc" in bad.log
+    assert "snakemake_storage_plugin_fdb/__init__.py" not in bad.log
+    assert "Context[" not in bad.log
+    assert len(bad.log.splitlines()) < 30
+
+
 def _fields(config: Path) -> list[dict[str, str]]:
     from snakemake_storage_plugin_fdb.backend import Backend
 
@@ -184,6 +235,12 @@ def workflow(request, tmp_path_factory, run_logged) -> dict:
         no_config.mkdir()
         (no_config / "Snakefile").write_text(GLOB_SNAKEFILE)
         snakemake("no_config", no_config, "--dry-run", config=None)
+
+        # FR-READ-008, FR-IFACE-007: a partially present input in a plain run
+        partial = tmp / "examples" / "partial"
+        partial.mkdir()
+        (partial / "Snakefile").write_text(PARTIAL_SNAKEFILE)
+        snakemake("partial", partial, "--dry-run")
 
     snakemake("delete", example, "--delete-all-output")
     return out
@@ -257,6 +314,43 @@ def test_workflow_without_any_configuration_hints(workflow):
     log = workflow["no_config"].log
     assert workflow["no_config"].returncode != 0
     assert "no FDB configuration was given: set --storage-fdb-config" in log
+    # FR-CONF-010: raised before pyfdb is touched, so eckit dumps nothing
+    assert "backtrace" not in log
+    assert "WorkflowError in file" in log
+
+
+def test_workflow_startup_line_names_the_fdb_once(workflow):
+    """FR-CONF-010: every run says which FDB it opened, once, in the plain log."""
+    log = workflow["run1"].ok()
+    lines = [x for x in log.splitlines() if x.startswith("FDB storage: using ")]
+    assert len(lines) == 1
+    assert ".fdb/config.yaml" in lines[0]
+    assert "input tracking: lookup" in lines[0]
+
+
+def test_workflow_run_summary(workflow):
+    """FR-IFACE-007: what the run archived, and nothing when there is nothing to say."""
+    summary = [x for x in workflow["run1"].ok().splitlines() if "run summary" in x]
+    assert len(summary) == 1
+    log = workflow["run1"].log
+    assert "3 fields archived (1 query), 0 of which masked fields already in FDB" in log
+    assert "reclaimed only by `fdb purge`" in log
+    assert (
+        "run summary" not in workflow["run2"].ok()
+    )  # nothing to be done, nothing said
+
+
+def test_workflow_partial_input_is_reported_and_summarised(workflow):
+    """FR-READ-008: the partial lookup reaches the default log, once, and the summary
+    repeats it with what to do about it."""
+    _file_backend_only(workflow)
+    partial = workflow["partial"]
+    assert partial.returncode != 0  # MissingInputException
+    lines = [x for x in partial.log.splitlines() if "3 of 4 fields found in FDB" in x]
+    assert len(lines) == 2  # the lookup, then the summary
+    assert "missing: step=18" in lines[0]
+    assert "1 query was incomplete in FDB and no job produced them:" in partial.log
+    assert "Run -R <rule> or --forceall to produce them." in partial.log
 
 
 def test_workflow_delete_all_output_leaves_fields(workflow):

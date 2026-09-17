@@ -711,7 +711,7 @@ anything reaches FDB.
 
 Two things a plain-library job does not get: the plugin's mapped error messages — a
 failure in plain `pyfdb` surfaces as fdb5/eckit text such as `Failed system call: mkdir
-… (Success)` — and the store-level settings `archive_mode` and `identifier_check`, whose
+… (Success)` — and the store-level setting `archive_mode`, whose
 store step never runs (only `api.archive` reads them). A rule may also have a direct FDB
 output and a local file output together; the two are then checked independently.
 

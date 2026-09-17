@@ -357,12 +357,15 @@ value raises
 
 #### FR-CONF-004 Reserved identifier check
 
-`identifier_check` accepts `none`. `strict` is reserved and raises
-`identifier_check=strict is reserved and not implemented in this version` at provider
-construction. The guard hook (FR-STORE-008) exists so the check can be added later.
+`identifier_check` is **not** a setting: the plugin has no CLI flag, profile key or
+environment variable for it. The guard hook (FR-STORE-008) stays, and `make_guard`
+still reads an `identifier_check` attribute from whatever settings object it is given,
+so the check can be added later (D-001) together with the setting.
 
-- Rationale: deferred work D-001 (§6.2) without a settings change.
-- Verification: test `tests/test_settings.py::test_identifier_check_strict_is_reserved`,
+- Rationale: a flag with one accepted value, whose help text is mostly about a value
+  that raises, is noise in `snakemake --help`; pre-1.0 it can go and come back with
+  `strict`.
+- Verification: test `tests/test_settings.py::test_identifier_check_is_not_a_setting`,
   `::test_guard_hook`, `::test_guard_identifier_mismatch`.
 
 #### FR-CONF-005 No FDB access at construction
@@ -420,6 +423,36 @@ has ` (resolved to <absolute path>, working directory <cwd>)` appended to the
   (`-d`), not the shell's, which is invisible in the message otherwise.
 - Verification: test
   `tests/test_backend.py::test_resolve_config_error_names_the_resolved_path`.
+
+#### FR-CONF-010 Naming the FDB, and failing early without one
+
+The provider logs one line per process when it is built, at info level in the main
+Snakemake process and at debug level in a spawned job (`--mode` on its command line),
+which inherits the same configuration:
+
+```text
+FDB storage: using <config path | "inline configuration" | "FDB's own environment">
+(roots: <local roots | "none in the configuration">; schema: <path | "not readable
+here">; input tracking: <lookup | query>)
+```
+
+With no `config` setting and no `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`,
+`FDB5_CONFIG_FILE` or `FDB_HOME` in the environment, the provider checks that the schema
+pyfdb would fall back to (`<fdb5lib>/etc/fdb/schema`, which the wheels do not ship)
+exists, before `pyfdb` is imported. If it does not, construction raises
+`FDB configuration error: Cannot open <path> (No such file or directory) (no FDB
+configuration was given: set --storage-fdb-config or FDB_CONFIG_FILE)` — the message
+FR-ERR-005 gives, but at the Snakefile line and without eckit's backtrace. A site whose
+compiled-in default schema exists keeps working (FR-CONF-002).
+
+- Rationale: a run's log could not answer "which FDB did this write into?"; and the most
+  likely first command of a new user printed 41 lines of eckit C++ backtrace before the
+  one-line cause, which no environment variable silences (L-7).
+- Verification: test `tests/test_messages.py::test_startup_line_names_the_fdb`,
+  `::test_startup_line_for_inline_configuration`,
+  `::test_missing_default_schema_is_reported_before_pyfdb`,
+  `::test_missing_default_schema_skipped_when_the_environment_names_an_fdb`,
+  `tests/test_workflow.py::test_workflow_without_any_configuration_hints`.
 
 ### 2.4 Process environment
 
@@ -599,13 +632,15 @@ schema keys the query does not name. It appears:
 - as a `WorkflowError` from `retrieve_object()` on an incomplete object;
 - as a warning from `exists()` and `inventory()`, once per query and process, when FDB
   holds some but not all fields (`0 < n < E`);
-- as a debug message from `exists()` and `inventory()` when `n = 0`.
+- as a debug message from `exists()` and `inventory()` when `n = 0`, except for the
+  query that names no key of the schema's first rule level, which is reported at info
+  level instead (FR-ERR-008).
 
 - Rationale: Snakemake calls `retrieve_object()` only for objects `exists()` reported
   as present, so a partial input would otherwise be a bare "missing input" naming the
   whole query. Nothing found is the normal state of an output not produced yet and must
-  not warn, but its optional-schema-key hint (the usual cause: omitted `number`,
-  `timespan`, `domain`) stays available with `--verbose`.
+  not warn; its optional-schema-key hint stays available with `--verbose`, and the case
+  in which nothing *can* be found is raised out of debug by FR-ERR-008.
 - Verification: test `tests/test_plugin.py::test_exists_partial_retrieve_names_missing`,
   `::test_exists_partial_warns_once`, `::test_exists_absent_object_does_not_warn`,
   `::test_exists_missing_optional_key_and_mtime_not_found`.
@@ -819,18 +854,47 @@ and succeed concurrently.
 #### FR-REMOVE-001 Never delete
 
 `remove()` never deletes data and never calls FDB `wipe` or `purge`.
-`remove_policy=warn` (default) logs `FDB cannot delete individual fields; ...` once per
-query per process; `ignore` does nothing; `error` raises `remove_policy=error: <that
-text>`.
+`remove_policy=warn` (default) says what that means for this output (FR-REMOVE-002)
+once per query per process; `ignore` does nothing; `error` raises
+`remove_policy=error: <that text>`.
 
 - Rationale: FDB has no per-field deletion and `wipe` can delete unrelated fields or the
   whole database (architecture.md §13.6, ADR-008). Consequence: `--delete-all-output`
   leaves the fields in FDB and, because the output still exists, does not make the
-  producing job rerun. In Snakemake 9.27 it is the only trigger that reaches `remove()`:
-  reruns and failed-job cleanup do not call it, and temporary outputs cannot exist
-  (`temp()` and storage flags are mutually exclusive).
+  producing job rerun. In Snakemake 9.27 two things reach `remove()`:
+  `--delete-all-output`, and the cleanup of a *failed* job's outputs, for every output
+  whose fields the lookup then finds complete (`jobs.py`, "Removing output files of
+  failed job"; it lists such an output twice, so `remove()` is called twice). Reruns do
+  not call it, and temporary outputs cannot exist (`temp()` and storage flags are
+  mutually exclusive).
 - Verification: test `tests/test_plugin.py::test_remove_policy`,
   `tests/sites/meteoswiss/test_write.py::test_write_remove_policy_warn`,
+  `tests/test_workflow.py::test_workflow_delete_all_output_leaves_fields`.
+
+#### FR-REMOVE-002 What removal says
+
+The message of `remove_policy=warn`/`error` branches on one lookup of the query and
+names the query once (Snakemake prints the list of outputs itself):
+
+| FDB holds | message |
+|---|---|
+| every field | `FDB storage: <query>: all <E> fields are in FDB. Nothing was removed: FDB cannot delete individual fields. Later archives of the same fields mask these; `fdb purge` reclaims the space. This output therefore still looks complete, and the rule that writes it will not be scheduled again: after a failed job, rerun it with `-R <rule>` (every job of the rule) or archive the retry under a fresh expver.` |
+| some fields | `FDB storage: <query>: <n> of <E> fields are in FDB; missing: <combinations>. Nothing was removed: ...` |
+| no field | `FDB storage: nothing to remove: no field of <query> is in FDB.`, at info level |
+
+A failed lookup falls back to the first text without the counts. The plugin cannot tell
+a failed job's cleanup from `--delete-all-output`, so the wording is true of both.
+
+- Rationale: the previous text promised a repair that does not always come ("will be
+  masked by the next archive" — there is no next archive when the rule is never
+  scheduled again), and said nothing about the consequence a user actually faces after a
+  job that archived and then failed (architecture.md ADR-008, L-34).
+- Verification: test
+  `tests/test_messages.py::test_remove_complete_query_explains_the_consequence`,
+  `::test_remove_partial_query_names_the_missing_fields`,
+  `::test_remove_absent_query_is_a_clause_not_a_warning`,
+  `::test_remove_policy_error_keeps_the_counts`,
+  `tests/test_plugin.py::test_remove_policy`,
   `tests/test_workflow.py::test_workflow_delete_all_output_leaves_fields`.
 
 ### 2.8 Glob
@@ -996,6 +1060,67 @@ Configuration errors carry a hint where the cause is known:
   `::test_map_error_table`,
   `tests/test_workflow.py::test_workflow_without_any_configuration_hints`.
 
+#### FR-ERR-007 Messages in the plugin's words, without its frames
+
+Errors the plugin raises from the methods Snakemake calls during DAG building
+(`exists`, `inventory`, `retrieve_object`, `list_candidate_matches`) carry none of the
+plugin's traceback frames: the error is re-raised from a wrapper compiled under the
+file name `<snakemake-storage-plugin-fdb>`, so Snakemake renders one self-describing
+frame (`File "<snakemake-storage-plugin-fdb>", line N, in fdb_storage_error`) instead of
+five `__init__.py` ones; the original error with its traceback goes to the debug log
+(architecture.md ADR-042).
+
+The invalid-request message (FR-ERR-001) says what metkit means:
+
+| metkit | message |
+|---|---|
+| `Cannot match [x] in [<keys>]` | `Invalid MARS request <query>: unknown MARS key 'x'[; did you mean '<key>'?] (the FDB schema names: <schema keys> \| the MARS language accepts: <every key metkit listed>)`, never truncated |
+| `Key [a] not acceptable with context: Context[...key=b...]` | `Invalid MARS request <query>: a is not allowed with b=<the query's value>` (without the query's value: `a is not allowed with these b values (<vals>)`) |
+| `Bad value: Invalid date ...`, `Invalid time`, `Wrong input for time/date` | the detail plus ` (MARS dates are YYYYMMDD, times HHMM; a wildcard used in a query must expand to a MARS value)` |
+
+A message that contradicts a query key when archiving ends with
+` - set the key in the GRIB before archiving (e.g. grib_set -s <key>=<value>), or
+declare the output under the keys the data carries` (the example only for a
+single-valued key, FR-STORE-005). `StorageObject.__repr__` is `<fdb://...>`, so
+Snakemake's own messages that print a storage object show the query.
+
+- Rationale: the traceback made a one-value mistake look like a plugin bug; the metkit
+  texts are unreadable without knowing metkit, and the unknown-key list was truncated
+  exactly where a "did you mean" belongs; the pre-check error said what was wrong but
+  not what to do about it.
+- Verification: test `tests/test_messages.py::test_clean_errors_leaves_no_plugin_frames`,
+  `::test_map_error_names_an_unknown_key_with_the_schema_keys`,
+  `::test_map_error_translates_a_key_refused_by_another_key`,
+  `::test_map_error_adds_the_mars_shape_hint`, `::test_storage_object_repr_is_the_query`,
+  `tests/test_plugin.py::test_store_object_message_key_mismatch`,
+  `tests/test_workflow.py::test_workflow_query_error_has_no_plugin_frames`.
+
+#### FR-ERR-008 Saying why nothing was found
+
+Three cases in which the plugin knows more than the "missing input" Snakemake prints:
+
+- **a key the schema requires is not in the query**: a lookup that finds nothing while
+  the query omits a key of the schema's first rule level (that the schema gives no
+  default) logs, once per query and process, at info level:
+  `FDB storage: <query>: no fields in FDB; the query does not name <keys>, which the
+  FDB schema's first rule level requires. FDB matches keys exactly, so nothing can
+  match.` Without a readable schema (L-15) nothing is said.
+- **a MARS key alias**: when metkit's expansion has a key the query does not and drops
+  one the query has (`levtyp` for `levtype`), one warning per query names both
+  spellings (L-27).
+- **a file-based output the job archived itself**: the end-of-run summary (FR-IFACE-007)
+  names an output declared without `retrieve=False` that has no local file and whose
+  fields are partly in FDB with timestamps from this run.
+
+- Rationale: the zero-field lookup of an input is where a newcomer is stuck, and the
+  hint was in the debug log; an alias silently changes which key a query names; and the
+  "job archived it itself" mistake is the one the user guide describes as expected,
+  which deserves a message rather than a paragraph.
+- Verification: test
+  `tests/test_messages.py::test_absent_query_missing_first_level_key_is_reported`,
+  `::test_absent_query_with_every_key_stays_quiet`, `::test_key_alias_warns_once`,
+  `::test_summary_diagnoses_a_file_based_output_the_job_archived_itself`.
+
 ### 2.11 Reruns
 
 #### FR-RERUN-001 Reruns of FDB inputs follow the fields, not the query text
@@ -1135,6 +1260,43 @@ fields are in FDB and reports the other FDB outputs as not touched.
 - Verification: test `tests/test_plugin.py::test_interface_conformance`,
   `tests/test_direct.py::test_direct_workflow_touch_leaves_fdb_alone`.
 
+#### FR-IFACE-007 End-of-run summary
+
+At the end of a run the plugin logs one block at info level, omitted when it has
+nothing to say:
+
+```text
+FDB storage: run summary:
+  <n> fields archived (<k> queries), <m> of which masked fields already in FDB (masked
+  fields are reclaimed only by `fdb purge`).
+  <query> was declared as a file-based output, no local file was written, and <n> of
+  <E> of its fields are in FDB. If the job archives into FDB itself, declare the output
+  retrieve=False (or touch(), or use api.archive).
+  <k> queries were incomplete in FDB and no job produced them:
+    <the missing-field report of each>
+  Run -R <rule> or --forceall to produce them.
+  archive_mode=<mode> had no effect: every FDB output of this run was archived by its
+  job, which the plugin's store step does not touch.
+```
+
+The counts come from the lookups and stores of the process, per query and as the
+largest value seen: fields with an index timestamp from this run are what the run
+archived (including the outputs no store step sees, FR-DIRECT-005), fields older than
+it are what its archives masked. A query a job produced is not listed as incomplete.
+The block is logged from Snakemake's logger shutdown, so it reaches the console and the
+log file (architecture.md ADR-041); a process that is a spawned job summarises nothing.
+
+- Rationale: a run that re-archives fields, or that finds a declared query incomplete
+  and schedules no job for it, ends with "Nothing to be done" and no trace of either;
+  masked copies are permanent and were invisible.
+- Verification: test `tests/test_messages.py::test_summary_counts_archived_and_masked_fields`,
+  `::test_summary_lists_incomplete_queries_and_omits_produced_ones`,
+  `::test_summary_diagnoses_a_file_based_output_the_job_archived_itself`,
+  `::test_summary_warns_about_an_archive_mode_no_output_can_use`,
+  `::test_summary_is_empty_and_emitted_once`,
+  `::test_summary_hook_is_the_snakemake_logger_shutdown`,
+  `tests/test_workflow.py::test_workflow_run_summary`.
+
 ### 2.13 Site support
 
 #### FR-SITE-001 MeteoSwiss end to end
@@ -1212,6 +1374,28 @@ group (earthkit-data, matplotlib).
   distinguishes two runs of the same workflow is a wildcard of the local artefact paths
   too, since FDB keeps both copies while a local path would keep only the last one.
 - Verification: test `tests/test_evaluation_example.py` (skips without the group).
+
+#### FR-DEV-004 Asking FDB what it holds
+
+`python -m snakemake_storage_plugin_fdb` takes `--config`/`--user-config` (else the
+`SNAKEMAKE_STORAGE_FDB_*` variables, else FDB's own environment) and one query:
+
+- `inspect <query>` prints `<n> of <E> fields in FDB for <query>`, one line per field
+  with its index timestamp, length and keys, and one `missing: <combination>` line per
+  missing field. It exits 0 when the query is complete, 1 when it is not, 2 on an
+  error, whose message is the plugin's (FR-ERR-001), not a traceback.
+- `list <query>` takes a query that may leave keys out and prints the number of fields
+  FDB holds under it and the distinct values per key, in the canonical key order. Exit
+  1 when FDB holds nothing under it.
+
+- Rationale: "what is in FDB for this query?" was the operation most often wanted and
+  had no answer short of a workflow; raw pyfdb gives a different field count (index
+  granularity) than the plugin's lookup does.
+- Verification: test `tests/test_cli.py` (`test_cli_inspect_complete`,
+  `::test_cli_inspect_incomplete_exits_1`, `::test_cli_inspect_reports_an_invalid_query`,
+  `::test_cli_inspect_uses_the_environment`, `::test_cli_list_distinct_values`,
+  `::test_cli_list_without_fields_exits_1`, `::test_cli_list_maps_fdb_errors`,
+  `::test_cli_help_lists_both_commands`).
 
 ### 2.15 Direct access from rule bodies
 
@@ -1405,6 +1589,20 @@ start of the workflow.
   `test_direct_workflow_too_few_fields_is_reported`,
   `test_direct_workflow_writes_no_data_file`); `docs/patterns.md`
   (`run-plain-checked`).
+
+#### FR-DIRECT-006 Asking FDB what it holds from Python
+
+`api.exists(query, *, config=None, user_config=None) -> Lookup` performs the lookup of
+FR-READ-001 and returns `query` (normalised), `found`, `expected`, `missing` (the
+missing field combinations, at most `MISSING_MAX` = 1000), `fields` (one `FieldInfo`
+per field: `keys`, `timestamp`, `length`) and `complete` (also its truth value).
+Nothing is retrieved.
+
+- Rationale: a Snakefile or a script that has to decide what to ask for needs the
+  plugin's own answer, not a second implementation of it; the CLI (FR-DEV-004) is this
+  function.
+- Verification: test `tests/test_cli.py::test_api_exists_complete`,
+  `::test_api_exists_partial_names_the_missing_fields`, `::test_api_exists_absent`.
 
 ---
 
@@ -1629,7 +1827,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-4 | `E` is a cross product; context-dependent keys may over-count. |
 | L-5 | The fallback expansion (no internal `FDBToolRequest`) resolves no aliases or non-integer ranges; identifier mode then archives query values verbatim. |
 | L-6 | Wildcard values must be single values without `/`. |
-| L-7 | eckit `SeriousBug` backtraces (e.g. schema mismatch on archive) cannot be silenced from the environment. |
+| L-7 | eckit backtraces (a schema mismatch on archive, a schema file that cannot be opened) cannot be silenced from the environment: neither `ECKIT_EXCEPTION_IS_SILENT=1` nor `ECKIT_BACKTRACE_IS_SILENT=1` suppresses them [verified 2026-09-17: a run without any FDB configuration printed 41 backtrace lines before the plugin's sentence]. The plugin can only avoid the call: FR-CONF-010 checks the missing default schema itself. |
 | L-8 | A `METKIT_HOME` without `language.yaml` hangs FDB; the plugin checks the file exists but cannot validate its content. |
 | L-9 | Request expansion parses the repr of pyfdb's internal `FDBToolRequest` (pinned version range). |
 | L-10 | Not usable as `--default-storage-provider`; files only. |
@@ -1646,7 +1844,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-21 | Input tracking by lookup (FR-RERUN-001) patches the private `snakemake.persistence.PersistenceBase._input_changed`, verified for snakemake 9.27 (architecture.md ADR-034, R-14). Where the attribute is missing or its signature differs, the plugin warns and falls back to query tracking, so any query edit triggers a rerun again. Residual effects, none of them flagged: a narrowed query does not rerun, so the output keeps the extra fields the wider query produced; a query that cannot be expanded (metkit rejects it) or names more than `COVERAGE_MAX` (100 000) fields covers nothing but its own text, so such a query reruns its job whenever its text changes, as under `input_tracking=query`. |
 | L-22 | `inspect`/`retrieve` match through query keys the indexed fields do not have (`quantile=1:10` finds quantile-less fields), unlike `list` (architecture.md §13.4). Mitigated by the key check of FR-READ-001; a retrieval whose `inspect` returns matching and non-matching fields together fails on the byte count instead (FR-READ-007). |
 | L-23 | Native mode cannot label a key the message does not carry: naming such a key in the query is an error (FR-STORE-003). Use `archive_mode=identifier`, set the key in the GRIB, or drop it from the query. |
-| L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error on every FDB version, because the plugin checks the configured roots itself (FR-ERR-004). |
+| L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (nothing is raised, and eckit reports nothing for a skipped directory). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error on every FDB version, because the plugin checks the configured roots itself (FR-ERR-004). |
 | L-25 | `--touch` cannot refresh an FDB field: index timestamps are written by the archive and cannot be set, so the plugin's `touch()` is a no-op (FR-IFACE-006) and only the local outputs of the workflow are touched. FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
@@ -1656,6 +1854,9 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-32 | An output declared `retrieve=False` (FR-DIRECT-005) is checked for existence only: the plugin's store step never runs for it, so the freshness post-check of FR-DIRECT-004 does not either. A job that exits 0 having archived nothing, or the wrong fields, therefore passes whenever FDB already holds the query's fields — from an earlier run of the same workflow, say — and the workflow reports success. Declaring the output `touch(storage.fdb(query))` is the interim mitigation (the check costs an empty local file); the fix is an upstream post-job verify hook for storage outputs (D-015). |
 | L-33 | Input tracking by lookup (FR-RERUN-001) leaves **derived local outputs** stale after a narrowing: a metrics table, plot or report computed straight from FDB inputs still describes the wider set, because nothing reruns, and nothing flags it. Mitigation by workflow shape, not by the plugin: let the local artefacts mirror the declared granularity (one file per field or parameter) and let the summary aggregate those local files with `expand()`, so that Snakemake's own input-set trigger fires when the declaration narrows (`examples/forecast-evaluation/`, rule `scorecard`, FR-DEV-003). `input_tracking=query` is the workflow-wide alternative and reruns the producers too, which FR-RERUN-001 exists to avoid. |
 | L-34 | Rerun decisions read Snakemake's provenance records, and FDB fields cannot be deleted; two consequences, both Snakemake's own semantics made sharper by a workflow whose every intermediate lives in FDB. (a) Without the records — a fresh clone, a deleted `.snakemake/`, a working directory moved under the `db` backend, which keys its records by the absolute workdir path — a missing FDB field is reported as "Nothing to be done", because no consumer is out of date and no local file is missing; `--forceall` or `-R <rule>` once repairs it. (b) The archives of a *failed* direct-output job stay in FDB, so if those fields satisfy a later query the producing rule is never scheduled again and the checked variant (FR-DIRECT-004) cannot help, since it only runs for jobs that run. Force the rule or archive under a fresh `expver`. |
+| L-35 | The end-of-run summary (FR-IFACE-007) counts what this process looked up and stored. Consequences: a field archived by a job in another process (a cluster executor) is counted only if some lookup of the main process sees it; the masked count comes from the lookups made *before* a store, because FDB's listings hide a masked field, so an output that no lookup saw before its job (a `--forceall` run under an executor that skips the DAG lookup) counts as masking nothing; and a query archived by one job and read by another is counted once. The block is logged by a wrapper of `snakemake.logging.LoggerManager.stop`, verified for snakemake 9.27 (ADR-041): where that fails, the plugin falls back to `atexit`, where the log handlers are gone and only a warning would still be visible, so the block can be lost. |
+| L-36 | An error the plugin raises during DAG building still shows one traceback frame, `File "<snakemake-storage-plugin-fdb>", line N, in fdb_storage_error` (FR-ERR-007): Snakemake renders every frame between the `raise` and its own call, so zero frames would need a file name inside Snakemake's own package directory. |
+| L-37 | The plugin cannot tell an input from an output: the interface gives a storage object no direction, so the file-based-output diagnosis of FR-ERR-008 is inferred (a plain object, no local file, fields from this run) and the `-R <rule>` advice of FR-REMOVE-002 and FR-IFACE-007 cannot name the rule. |
 
 ---
 
@@ -1696,4 +1897,6 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |
 | D-015 | An upstream post-job verify hook for storage outputs | The "no local output" flag exists: `storage.fdb(query, retrieve=False)` on an output makes Snakemake check `exists_in_storage()` after the job instead of a local path (FR-DIRECT-005, ADR-037, architecture.md §13.8). What is missing is a way to run the plugin's own post-check there, since `store_object` is skipped and `exists()` cannot tell a post-job check from a DAG lookup: propose a hook such as `StorageObjectWrite.verify_stored()`, called from `dag.handle_storage` for outputs with `should_not_be_retrieved_from_storage`, so that the freshness check of FR-DIRECT-004 can run without any local file (L-32). Until then, `touch()` plus an empty file is the checked variant (ADR-036); FIFOs (`pipe()`) were considered and rejected: a storage object cannot carry `pipe()` (architecture.md §13.8). |
 | D-016 | Verify the empty-output convention under other executors | The store step runs in the main Snakemake process under the local executor, so the reference time of FR-DIRECT-004 is the start of the workflow; under cluster and cloud executors the store may run in the job process, whose provider gives a later reference time (still before the job's archives). Verify per executor when one is tested (L-19 limits tagged settings there anyway). |
+| D-018 | An upstream provider teardown hook | A storage provider has no "the run is over" callback, so the summary of FR-IFACE-007 is logged from a wrapper of `LoggerManager.stop` (ADR-041, L-35). Propose `StorageProviderBase.teardown()` (or a `workflow_finished` hook) called from `Workflow.execute` before the logger is stopped, and drop the patch once a released Snakemake has it. |
+| D-019 | Tell the plugin which side an object is on | `StorageObjectRead`/`Write` are mixins of one class and no call says whether a lookup is for an input, an output or a post-job check, which is why FR-ERR-008's diagnosis is a heuristic and FR-IFACE-007 cannot name the rule to rerun (L-37). Propose passing the direction (and the rule) to `exists()`/`inventory()`, or a `StorageObjectWrite.declared_by(rule)` hook. |
 | D-017 | An `export_config` policy setting | ADR-038 makes the workflow's FDB configuration win over the environment for every site. If a site needs the old precedence (jobs that must follow an inherited `FDB5_CONFIG`), a setting `export_config: always\|missing\|never` would express it; until such a site exists, the direct API's `config=` argument covers the case. |

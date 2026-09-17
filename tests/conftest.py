@@ -166,7 +166,7 @@ def clean_env(monkeypatch) -> pytest.MonkeyPatch:
     so tests do not see each other's warnings or environment.
     """
     import snakemake_storage_plugin_fdb as plugin
-    from snakemake_storage_plugin_fdb import api
+    from snakemake_storage_plugin_fdb import api, summary
 
     for name in PROVIDER_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
@@ -180,6 +180,10 @@ def clean_env(monkeypatch) -> pytest.MonkeyPatch:
     monkeypatch.setattr(plugin, "_SPELLING_WARNED", set())
     monkeypatch.setattr(plugin, "_REMOVE_WARNED", set())
     monkeypatch.setattr(plugin, "_PARTIAL_WARNED", set())
+    monkeypatch.setattr(plugin, "_KEY_HINT_WARNED", set())
+    monkeypatch.setattr(plugin, "_ALIAS_WARNED", set())
+    monkeypatch.setattr(plugin, "_STARTUP_LOGGED", False)
+    summary.reset()  # the end-of-run summary sees one test at a time (FR-IFACE-007)
     return monkeypatch
 
 

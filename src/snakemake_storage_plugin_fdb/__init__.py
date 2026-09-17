@@ -11,6 +11,7 @@ import itertools
 import logging
 import os
 import re
+import sys
 import threading
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -38,8 +39,10 @@ from snakemake_interface_storage_plugins.storage_provider import (
 from tenacity import retry_if_exception
 
 from . import api as api  # the direct-access API (FR-DIRECT-001/002)
+from . import summary
 from .api import Marker, read_marker
 from .backend import (
+    NO_CONFIG_HINT,
     Backend,
     Field,
     SchemaInfo,
@@ -49,13 +52,16 @@ from .backend import (
     fallback_expand,
     fdb_time,
     is_transient,
+    local_roots,
     map_error,
+    missing_default_schema,
     parse_schema,
     resolve_config,
 )
 from .backend import resolve_schema_path as _resolve_schema_path
+from .frames import clean_errors
 from .grib import GribError, GribMessage, split_messages
-from .guard import IDENTIFIER_CHECKS, IdentifierMismatch, make_guard
+from .guard import IdentifierMismatch, make_guard
 from .query import (
     NAME_MAX,
     KeyOrder,
@@ -98,12 +104,28 @@ _FDB_ENV_BEFORE: dict[str, str] | None = None
 _FDB_REPLACED_WARNED = False
 # Whether ``--touch`` was already explained in this process (FR-IFACE-006).
 _TOUCH_NOTED = False
+# Whether the startup line was already logged in this process (FR-CONF-010).
+_STARTUP_LOGGED = False
+# Queries whose missing-key hint was already given (FR-ERR-008).
+_KEY_HINT_WARNED: set[str] = set()
+_ALIAS_WARNED: set[str] = set()
 _WARNED_LOCK = threading.Lock()
 FieldId = tuple[tuple[str, str], ...]  # one field of a query: its key=value pairs
 COVERAGE_MAX = 100_000  # fields enumerated for the input-set trigger (§8.10)
 MISSING_SHOWN = 10  # missing field combinations listed in a retrieve error
 OFFENDERS_SHOWN = 3  # messages named in a post-check error
 STAY_NOTE = "they stay in FDB until the next successful store masks them"
+
+
+def _spawned_job() -> bool:
+    """Whether this process is a Snakemake job process rather than the main one.
+
+    Snakemake spawns jobs with ``--mode remote|subprocess``
+    (``snakemake_interface_executor_plugins/executors/real.py``); such a process builds
+    its own provider from the same settings and must not repeat what the run has
+    already said, nor summarise a run it does not see the end of (FR-CONF-010).
+    """
+    return any(arg == "--mode" or arg.startswith("--mode=") for arg in sys.argv[1:])
 
 
 def _first_time(registry: set[str], query: str) -> bool:
@@ -156,20 +178,10 @@ class StorageProviderSettings(StorageProviderSettingsBase):
     archive_mode: Optional[str] = field(  # noqa: UP045
         default="native",
         metadata={
-            "help": "How outputs are archived: 'native' (FDB derives the keys from the "
-            "GRIB) or 'identifier' (the plugin builds the FDB key of every message; "
-            "use it only with schemas whose rules share one key set, or supply the "
-            "other keys in the query). (default: native)",
+            "help": "How outputs are archived: 'native' (default; FDB derives the keys "
+            "from the GRIB - use this) or 'identifier' (the plugin builds the FDB key "
+            "of every message; see the reference). (default: native)",
             "env_var": True,  # reaches jobs for the direct API (FR-DIRECT-003)
-        },
-    )
-    identifier_check: Optional[str] = field(  # noqa: UP045
-        default="none",
-        metadata={
-            "help": "Check of identifiers against GRIB metadata before archiving: "
-            "'none'. 'strict' is reserved and not implemented in this version. "
-            "(default: none)",
-            "env_var": True,
         },
     )
     canonical_spelling: Optional[str] = field(  # noqa: UP045
@@ -200,41 +212,42 @@ class StorageProviderSettings(StorageProviderSettingsBase):
     glob_required_keys: Optional[str] = field(  # noqa: UP045
         default="class",
         metadata={
-            "help": "Comma list of keys that must be constant in glob_wildcards "
-            "patterns. (default: class)",
+            "help": "(site setup) Comma list of keys that must be constant in "
+            "glob_wildcards patterns. (default: class)",
             "env_var": True,
         },
     )
     eccodes_definitions: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
-            "help": "Colon-separated eccodes definitions directories, prepended in "
-            "order to ECCODES_DEFINITION_PATH. (default: unset)",
+            "help": "(site setup) Colon-separated eccodes definitions directories, "
+            "prepended in order to ECCODES_DEFINITION_PATH. (default: unset)",
             "env_var": True,
         },
     )
     metkit_home: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
-            "help": "Directory exported as METKIT_HOME for a custom MARS language; "
-            "must contain share/metkit/language.yaml. (default: unset)",
+            "help": "(site setup) Directory exported as METKIT_HOME for a custom MARS "
+            "language; must contain share/metkit/language.yaml. (default: unset)",
             "env_var": True,
         },
     )
     key_order: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
-            "help": "Comma list of keys defining the canonical key order of queries "
-            "and local paths. (default: unset, the FDB schema's rule order, else a "
-            "generic MARS order)",
+            "help": "(site setup) Comma list of keys defining the canonical key order "
+            "of queries and local paths. (default: unset, the FDB schema's rule "
+            "order, else a generic MARS order)",
             "env_var": True,
         },
     )
     env: Optional[str] = field(  # noqa: UP045
         default=None,
         metadata={
-            "help": "Environment overrides NAME=VALUE[,NAME=VALUE] exported before the "
-            "FDB libraries load (e.g. FDB_HOME=/path). (default: unset)",
+            "help": "(site setup) Environment overrides NAME=VALUE[,NAME=VALUE] "
+            "exported before the FDB libraries load (e.g. FDB_HOME=/path). "
+            "(default: unset)",
             "env_var": True,
         },
     )
@@ -303,12 +316,6 @@ class StorageProvider(StorageProviderBase):
             settings, "canonical_spelling", CANONICAL_SPELLINGS
         )
         self.remove_policy = _choice(settings, "remove_policy", REMOVE_POLICIES)
-        identifier_check = _choice(settings, "identifier_check", IDENTIFIER_CHECKS)
-        if identifier_check == "strict":
-            raise WorkflowError(
-                "identifier_check=strict is reserved and not implemented in this "
-                "version"
-            )
         self.glob_required_keys = _key_list(
             "glob_required_keys", settings.glob_required_keys
         )
@@ -321,6 +328,7 @@ class StorageProvider(StorageProviderBase):
         self.config = self._absolute(resolve_config(settings.config))
         self.user_config = self._absolute(resolve_config(settings.user_config))
         self._prepare_environment(settings)  # before anything reads the environment
+        self._require_a_configuration()  # before pyfdb is touched (FR-CONF-010)
         self.schema_path = _resolve_schema_path(self.config)
         self.schema_info = self._read_schema(self.schema_path)
         if settings.key_order:
@@ -345,8 +353,64 @@ class StorageProvider(StorageProviderBase):
         # Reference time of the empty-output convention (FR-DIRECT-004, L-31): fields a
         # directly archiving job produced carry an index timestamp from after this.
         self.run_time = fdb_time()
+        summary.RUN.archive_modes.add(self.archive_mode)
+        self._log_startup()
+        if not _spawned_job():  # one summary, from the process that ends the run
+            summary.install(self.logger)
 
     # --- construction helpers ------------------------------------------------------
+
+    def _require_a_configuration(self) -> None:
+        """Fail on "no FDB at all" before pyfdb is imported (FR-CONF-010).
+
+        With no ``config`` setting and nothing in FDB's own environment, ``pyfdb.FDB()``
+        loads the schema bundled with its wheel, which does not exist: eckit dumps a
+        40-line backtrace no environment variable silences (L-7) and the plugin's own
+        sentence is the last line of it. The same sentence is raised here instead, where
+        Snakemake shows it at the Snakefile line (FR-ERR-005). A site whose compiled-in
+        default really exists keeps working (FR-CONF-002).
+        """
+        if self.config is not None:
+            return
+        schema = missing_default_schema()
+        if schema is None:
+            return
+        raise WorkflowError(
+            f"FDB configuration error: Cannot open {schema} (No such file or "
+            f"directory){NO_CONFIG_HINT}"
+        )
+
+    def _log_startup(self) -> None:
+        """One line naming the FDB this process opened (FR-CONF-010).
+
+        Once per process, at info level in the main Snakemake process and at debug
+        level in a spawned job, which inherits the same configuration (FR-DIRECT-003)
+        and would otherwise repeat the line for every job.
+        """
+        global _STARTUP_LOGGED
+        with _WARNED_LOCK:
+            first, _STARTUP_LOGGED = not _STARTUP_LOGGED, True
+        if not first:
+            return
+        if isinstance(self.config, Path):
+            where = str(self.config)
+        elif self.config is not None:
+            where = "inline configuration"
+        else:
+            where = "FDB's own environment"
+        roots = local_roots(self.config) or None
+        parts = [
+            f"roots: {', '.join(str(r) for r in roots)}"
+            if roots
+            else "roots: none in the configuration",
+            f"schema: {self.schema_path or 'not readable here'}",
+            f"input tracking: {self.input_tracking}",
+        ]
+        line = f"FDB storage: using {where} ({'; '.join(parts)})"
+        if _spawned_job():
+            self.logger.debug(line)
+        else:
+            self.logger.info(line)
 
     def _prepare_environment(self, settings: Any) -> None:
         """Validate everything, then export in one go (architecture.md §8.3)."""
@@ -699,6 +763,11 @@ class StorageObject(
             raise WorkflowError(f"FDB query {self.query} has unresolved wildcards")
         return parsed.to_request()
 
+    def __repr__(self) -> str:
+        """The query: Snakemake formats storage objects into user-facing text, e.g.
+        the flags of a pattern given to ``expand()`` (FR-IFACE-002)."""
+        return f"<{self.query}>"
+
     @contextmanager
     def _mapping_errors(
         self, local: str | os.PathLike[str] | None = None
@@ -708,7 +777,15 @@ class StorageObject(
         try:
             yield
         except (RuntimeError, GribError) as e:
-            mapped = map_error(e, self.query, local)
+            info = self.provider.schema_info
+            parsed = self._parse()
+            mapped = map_error(
+                e,
+                self.query,
+                local,
+                request=parsed.to_request() if parsed is not None else None,
+                schema_keys=info.keys if info is not None else None,
+            )
             if mapped is None:
                 raise
             self.provider.logger.debug(f"FDB storage: full error text: {e}")
@@ -773,6 +850,7 @@ class StorageObject(
             return
         if expanded is None:
             return  # _expanded() logs the missing expansion
+        self._check_key_aliases(expanded)
         diffs = self.provider.backend.spelling_diffs(self.parsed, expanded)
         if not diffs:
             return
@@ -780,13 +858,44 @@ class StorageObject(
         parts = [f"{key}={given} (canonical: {canonical})"]
         parts += [f"{k}={g} ({c})" for k, g, c in rest]
         message = (
-            f"Query {self.query} uses non-canonical spelling: {', '.join(parts)}. "
-            "Use canonical spellings to avoid duplicate local paths for the same field."
+            f"FDB storage: query {self.query} uses non-canonical spelling: "
+            f"{', '.join(parts)}. Use canonical spellings to avoid duplicate local "
+            "paths for the same field."
         )
         if policy == "error":
             raise WorkflowError(message)
         if _first_time(_SPELLING_WARNED, self.query):
             self.provider.logger.warning(message)
+
+    def _check_key_aliases(self, expanded: dict[str, list[str]] | None) -> None:
+        """Warn once per query about MARS key aliases (FR-ERR-008, L-27).
+
+        metkit accepts ``levtyp`` for ``levtype`` and maps it silently, so the query
+        matches fields although it names a key the user did not mean to name; the plugin
+        keeps the text, which gives the same fields a second local path. Keys of the
+        expansion the query does not have, against keys of the query the expansion
+        dropped, name both spellings.
+        """
+        if expanded is None:
+            return
+        parsed = self._parse()
+        if parsed is None:
+            return
+        mine = set(parsed.keys())
+        dropped = sorted(mine - set(expanded))
+        added = sorted(set(expanded) - mine)
+        if not dropped or not added:
+            return
+        pairs = ", ".join(
+            f"{key} (canonical: {added[i] if i < len(added) else '/'.join(added)})"
+            for i, key in enumerate(dropped)
+        )
+        if _first_time(_ALIAS_WARNED, self.query):
+            self.provider.logger.warning(
+                f"FDB storage: query {self.query} uses MARS key alias(es): {pairs}. "
+                "FDB matched the canonical key; write it in the query, or the same "
+                "fields get a second local path."
+            )
 
     @_retry_fdb_io
     def _inspect(self, request: Mapping[str, str]) -> list[Field]:
@@ -862,20 +971,26 @@ class StorageObject(
             )
         return 0.0
 
-    def _missing_list(self, fields: list[Field], label: str) -> str:
-        """``; <label>: <combination>; ...[ (and <k> more)]`` for the field
-        combinations of the query that no field of ``fields`` has (keys with several
-        values only); empty when the expansion names no such combination."""
+    def _missing_combinations(self, fields: list[Field], limit: int) -> list[str]:
+        """At most ``limit`` field combinations of the query that no field of
+        ``fields`` has, each naming the keys with several values (all keys for a
+        single-field query)."""
         expanded = self._expanded()
         keys = self.provider.key_order.sorted(expanded)
         values = distinct_values(expanded, keys)
         varying = [i for i, v in enumerate(values) if len(v) > 1] or range(len(keys))
         present = {tuple(f.key.get(k, "") for k in keys) for f in fields}
         combos = (c for c in itertools.product(*values) if c not in present)
-        shown = [
+        return [
             ",".join(f"{keys[i]}={c[i]}" for i in varying)
-            for c in itertools.islice(combos, MISSING_SHOWN)
+            for c in itertools.islice(combos, limit)
         ]
+
+    def _missing_list(self, fields: list[Field], label: str) -> str:
+        """``; <label>: <combination>; ...[ (and <k> more)]`` for the field
+        combinations of the query that no field of ``fields`` has (keys with several
+        values only); empty when the expansion names no such combination."""
+        shown = self._missing_combinations(fields, MISSING_SHOWN)
         if not shown:
             return ""
         text = f"; {label}: {'; '.join(shown)}"
@@ -901,27 +1016,100 @@ class StorageObject(
                 )
         return message
 
+    def _absent_keys(self) -> list[str]:
+        """Keys of the schema's first rule level the query does not name (FR-ERR-008).
+
+        Such a query cannot match a single field: FDB matches keys exactly and the
+        first level is the database key. Empty without a readable schema (L-15).
+        """
+        info = self.provider.schema_info
+        if info is None:
+            return []
+        return sorted(info.first_level - set(self._expanded()) - set(info.defaults))
+
+    def _report_absent(self, fields: list[Field]) -> None:
+        """Nothing found: at info level once per query when the query omits a key of
+        the schema's first level, at debug level otherwise (FR-ERR-008).
+
+        The gate keeps a healthy run silent: its outputs are looked up before they
+        exist, and they name every key of the first level.
+        """
+        logger = self.provider.logger
+        absent = self._absent_keys()
+        if absent and _first_time(_KEY_HINT_WARNED, self.query):
+            logger.info(
+                f"FDB storage: {self.query}: no fields in FDB; the query does not name "
+                f"{', '.join(absent)}, which the FDB schema's first rule level "
+                "requires. FDB matches keys exactly, so nothing can match."
+            )
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"FDB storage: {self._missing_message(fields)}")
+
     def _exists(self, fields: list[Field]) -> bool:
         """``_complete``, reporting an incomplete result (FR-READ-008).
 
         Snakemake reports an incomplete input as missing without ever calling
         ``retrieve_object``, so the error there would never be seen. A partial answer
         is warned about once per query; nothing found is the normal case of an output
-        that does not exist yet, so it only goes to the debug log (with the
-        optional-schema-key hint).
+        that does not exist yet and stays quiet unless the query omits a key the schema
+        requires (FR-ERR-008). Either way the answer is remembered for the end-of-run
+        summary (FR-IFACE-007).
         """
+        self._record_lookup(fields)
         if self._complete(fields):
+            summary.RUN.record_complete(self.query)
             return True
-        logger = self.provider.logger
         if fields:
             if _first_time(_PARTIAL_WARNED, self.query):
-                logger.warning(f"FDB storage: {self._missing_message(fields)}")
-        elif logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"FDB storage: {self._missing_message(fields)}")
+                self.provider.logger.warning(
+                    f"FDB storage: {self._missing_message(fields)}"
+                )
+        else:
+            self._report_absent(fields)
+        self._record_incomplete(fields)
         return False
+
+    def _record_lookup(self, fields: list[Field]) -> None:
+        """Feed a lookup to the end-of-run summary (FR-IFACE-007).
+
+        Fields older than this run's reference time are the ones a store of this run
+        would mask; fields from this run under an output no store step sees (an output
+        declared ``retrieve=False``, FR-DIRECT-005) are what its job archived itself.
+        """
+        since = self.provider.run_time
+        fresh = sum(1 for f in fields if self._field_time(f) >= since)
+        summary.RUN.record_lookup(self.query, len(fields) - fresh)
+        if fresh:
+            summary.RUN.record_archive(self.query, fresh)
+
+    def _record_incomplete(self, fields: list[Field]) -> None:
+        """Remember an incomplete lookup for the end-of-run summary (FR-IFACE-007).
+
+        ``fresh`` counts the fields whose index timestamp is from this run: together
+        with a plain declaration and a missing local file, that is the signature of a
+        job that archived its output itself under an output Snakemake wants as a file
+        (FR-ERR-009).
+        """
+        try:
+            local = self.local_path()
+        except Exception:  # pragma: no cover - a query without a path is not stored
+            return
+        since = self.provider.run_time
+        summary.RUN.record_incomplete(
+            self.query,
+            summary.Incomplete(
+                report=self._missing_message(fields),
+                found=len(fields),
+                expected=self._expected(),
+                plain=bool(getattr(self, "retrieve", True)),
+                local_file=local.exists(),
+                fresh=sum(1 for f in fields if self._field_time(f) >= since),
+            ),
+        )
 
     # --- read path (requirements.md §2.5) ---------------------------------------------
 
+    @clean_errors
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
         """One ``inspect`` fills existence, mtime and size (FR-READ-009)."""
         key = self.cache_key()
@@ -941,6 +1129,7 @@ class StorageObject(
         """Nothing to clean: archiving handles are per thread and flushed after every
         store; reads use a fresh handle each."""
 
+    @clean_errors
     def exists(self) -> bool:
         """All fields the query expands to are in FDB (FR-READ-001)."""
         return self._exists(self._fields())
@@ -958,6 +1147,7 @@ class StorageObject(
         """``None``: Snakemake hashes the local copy instead (FR-READ-006)."""
         return None
 
+    @clean_errors
     def retrieve_object(self) -> None:
         fields = self._fields()
         if not self._complete(fields):
@@ -1037,16 +1227,20 @@ class StorageObject(
         t_start: int,
         counts: str,
         keyed: list[dict[str, str]] | None = None,
+        direct: bool = False,
     ) -> None:
         """FR-STORE-009: every archived message must be reachable by the query with a
         timestamp from this store. ``keyed`` (absent for a marker) names the offenders.
         """
-        fresh, _ = self._fresh(t_start)
+        fresh, stale = self._fresh(t_start)
         if len(fresh) < n:
             raise WorkflowError(
                 f"{self.query}: {counts}; {n - len(fresh)} landed outside the query "
                 f"or are duplicates{self._offenders(keyed or [], fresh)} ({STAY_NOTE})"
             )
+        # What the run archived (FR-IFACE-007); what it masked comes from the lookups
+        # before the store, which are the only ones that still see the old fields.
+        summary.RUN.record_archive(self.query, n, direct)
 
     def _fresh(self, since: float) -> tuple[list[Field], list[Field]]:
         """The query's fields in FDB with an index timestamp from ``since`` on, and
@@ -1073,6 +1267,7 @@ class StorageObject(
         )
         fresh, stale = self._fresh(since)
         if len(fresh) >= self._expected():
+            summary.RUN.record_archive(self.query, len(fresh), direct=True)
             return
         message = (
             f"{self.query}: {local} is empty, so the job is taken to have archived "
@@ -1098,7 +1293,7 @@ class StorageObject(
         )
         if marker.fields != self._expected():
             raise WorkflowError(f"{self.query}: {counts}")
-        self._post_check(marker.fields, marker.time, counts)
+        self._post_check(marker.fields, marker.time, counts, direct=True)
 
     def _checked_values(
         self, messages: list[GribMessage], source: str | os.PathLike[str]
@@ -1242,9 +1437,14 @@ class StorageObject(
                 if len(items) == 1
                 else f"not one of {query_value}"
             )
+            example = (
+                f" (e.g. grib_set -s {key}={query_value})" if len(items) == 1 else ""
+            )
             raise WorkflowError(
                 f"{self.query}: message {index} of {source} has {key}={values[key]}, "
-                f"{expected}; nothing was archived"
+                f"{expected}; nothing was archived - set the key in the GRIB before "
+                f"archiving{example}, or declare the output under the keys the data "
+                "carries"
             )
 
     def _archive(
@@ -1273,18 +1473,60 @@ class StorageObject(
             ) from e
 
     def remove(self) -> None:
-        """Never deletes: FDB has no per-field deletion (FR-REMOVE-001)."""
+        """Never deletes: FDB has no per-field deletion (FR-REMOVE-001).
+
+        Snakemake asks for this for the outputs of a *failed* job and for
+        ``--delete-all-output``; the plugin cannot tell the two apart, so the message
+        says what is true of both and branches on what FDB holds (FR-REMOVE-002).
+        """
         policy = self.provider.remove_policy
         if policy == "ignore":
             return
-        message = (
-            f"FDB cannot delete individual fields; existing fields for {self.query} "
-            "will be masked by the next archive. Use `fdb purge` to reclaim space."
-        )
+        if policy == "warn" and not _first_time(_REMOVE_WARNED, self.query):
+            return  # once per query and process
+        message, complete = self._remove_message()
         if policy == "error":
             raise WorkflowError(f"remove_policy=error: {message}")
-        if _first_time(_REMOVE_WARNED, self.query):
+        if complete is False and message.startswith("FDB storage: nothing to remove"):
+            self.provider.logger.info(message)
+        else:
             self.provider.logger.warning(message)
+
+    def _remove_message(self) -> tuple[str, bool | None]:
+        """What removing this output does, given what FDB holds (FR-REMOVE-002);
+        ``(message, complete)``, ``complete`` ``None`` if FDB could not be asked."""
+        head = f"FDB storage: {self.query}: "
+        keep = (
+            "Nothing was removed: FDB cannot delete individual fields. Later archives "
+            "of the same fields mask these; `fdb purge` reclaims the space."
+        )
+        try:
+            fields = self._fields()
+            expected = self._expected()
+        except Exception as e:  # a removal must not fail on a lookup
+            self.provider.logger.debug(f"FDB storage: remove() cannot look up: {e}")
+            return head + keep, None
+        if not fields:
+            return (
+                f"FDB storage: nothing to remove: no field of {self.query} is in FDB.",
+                False,
+            )
+        if len(fields) >= expected:
+            return (
+                head + f"all {expected} fields are in FDB. " + keep + " This output "
+                "therefore still looks complete, and the rule that writes it will not "
+                "be scheduled again: after a failed job, rerun it with `-R <rule>` "
+                "(every job of the rule) or archive the retry under a fresh expver.",
+                True,
+            )
+        return (
+            head
+            + f"{len(fields)} of {expected} fields are in FDB"
+            + self._missing_list(fields, "missing")
+            + ". "
+            + keep,
+            False,
+        )
 
     def touch(self) -> None:
         """``--touch``: nothing to do in FDB (FR-IFACE-006, L-25).
@@ -1309,6 +1551,7 @@ class StorageObject(
     def _list(self, selection: Mapping[str, str]) -> list[Field]:
         return self.provider.backend.list(selection)
 
+    @clean_errors
     def list_candidate_matches(self) -> list[str]:
         """Concrete queries for ``glob_wildcards`` (FR-GLOB-001), sorted.
 

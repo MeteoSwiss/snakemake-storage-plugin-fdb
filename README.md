@@ -129,6 +129,9 @@ src/snakemake_storage_plugin_fdb/
     guard.py             identifier guard hook (reserved)
     api.py               optional helpers: queries from requests, reads, checked archive
     rerun.py             input tracking by lookup (rerun triggers)
+    summary.py           end-of-run summary (fields archived, masked, incomplete queries)
+    frames.py            plugin errors without plugin traceback frames
+    __main__.py          command line: inspect and list FDB fields for a query
 scripts/init_dev_fdb.py  creates and seeds a local development FDB
 examples/ecmwf/          generic example workflow
 examples/forecast-evaluation/

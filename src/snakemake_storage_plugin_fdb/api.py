@@ -177,6 +177,59 @@ def request(
     return dict(zip(keys, distinct_values(expanded, keys), strict=True))
 
 
+@dataclass(frozen=True)
+class FieldInfo:
+    """One field FDB holds for a query (FR-DIRECT-006)."""
+
+    keys: dict[str, str]  # the field's combined key, canonical values
+    timestamp: int  # index flush time (POSIX seconds); 0 if FDB does not give one
+    length: int  # message length in bytes; 0 below schema level 3
+
+
+@dataclass(frozen=True)
+class Lookup:
+    """What FDB holds for a query (``api.exists``, FR-DIRECT-006)."""
+
+    query: str
+    found: int  # fields in FDB
+    expected: int  # fields the query expands to
+    missing: list[str]  # the missing field combinations, e.g. ``"step=18"``
+    fields: list[FieldInfo]
+
+    @property
+    def complete(self) -> bool:
+        """Whether Snakemake would call this object present (FR-READ-001)."""
+        return self.expected > 0 and self.found == self.expected
+
+    def __bool__(self) -> bool:
+        return self.complete
+
+
+MISSING_MAX = 1000  # missing combinations a Lookup lists
+
+
+def exists(
+    query: str, *, config: str | None = None, user_config: str | None = None
+) -> Lookup:
+    """What FDB holds for ``query``, as the plugin's own lookup sees it.
+
+    The same ``inspect`` that decides whether a rule's input exists (FR-READ-001): the
+    field count the query expands to, the fields FDB holds for it with their index
+    timestamps, and the missing combinations (at most ``MISSING_MAX``). Nothing is
+    retrieved. Use it in a Snakefile to decide what to ask for, or from the command
+    line through ``python -m snakemake_storage_plugin_fdb inspect``.
+    """
+    obj = _object(query, config, user_config)
+    fields = obj._fields()
+    return Lookup(
+        query=obj.query,
+        found=len(fields),
+        expected=obj._expected(),
+        missing=obj._missing_combinations(fields, MISSING_MAX),
+        fields=[FieldInfo(dict(f.key), f.timestamp, f.length) for f in fields],
+    )
+
+
 def query(request: Mapping[str, Any]) -> str:
     """The query string of a MARS ``request``, the inverse of ``request(query)``
     (``query.query_of_request``): values are scalars or sequences (joined with ``/``)

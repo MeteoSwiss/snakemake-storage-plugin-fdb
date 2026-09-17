@@ -412,16 +412,20 @@ def test_exists_partial_warns_once(seeded_provider, caplog):
 @needs_samples
 def test_exists_absent_object_does_not_warn(seeded_provider, caplog):
     """Nothing found is the normal case of an output that does not exist yet: the
-    report, with the optional-schema-key hint, goes to the debug log (FR-READ-008)."""
-    obj = seeded_provider().object(
-        f"fdb://{EA.replace(',domain=g', '')},step=0,param=167"
-    )
+    report, with the optional-schema-key hint, goes to the debug log (FR-READ-008).
+    A query that omits a key of the schema's first level is the exception
+    (FR-ERR-008, ``tests/test_messages.py``)."""
+    obj = seeded_provider().object(f"fdb://{EA},step=99,param=167")
     with caplog.at_level(logging.DEBUG, logger="fdb-test"):
         assert obj.exists() is False
     assert not _warnings(caplog)
+    assert not [r for r in caplog.records if r.levelno == logging.INFO]
     debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
     assert any("0 of 1 fields found in FDB" in m for m in debug)
-    assert any("optional schema keys not in the query: domain" in m for m in debug)
+    assert any(
+        "optional schema keys not in the query: levelist, number, quantile" in m
+        for m in debug
+    )
 
 
 @needs_samples
@@ -1160,20 +1164,20 @@ def test_remove_policy(make_provider, caplog, policy):
     provider = make_provider(remove_policy=policy)
     query = f"fdb://{EA2},step=0,param=167"
     obj = provider.object(query)
+    # nothing of this query is in the provider's empty FDB (FR-REMOVE-002)
     if policy == "error":
-        with pytest.raises(WorkflowError, match="remove_policy=error: FDB cannot"):
+        with pytest.raises(WorkflowError, match="remove_policy=error: FDB storage:"):
             obj.remove()
         return
-    obj.remove()
-    provider.object(query).remove()  # warned once per query
-    warnings = _warnings(caplog)
+    with caplog.at_level(logging.INFO):
+        obj.remove()
+        provider.object(query).remove()  # said once per query
+    assert not _warnings(caplog)
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     if policy == "ignore":
-        assert not warnings
+        assert not infos
         return
-    assert warnings == [
-        f"FDB cannot delete individual fields; existing fields for {query} will be "
-        "masked by the next archive. Use `fdb purge` to reclaim space."
-    ]
+    assert infos == [f"FDB storage: nothing to remove: no field of {query} is in FDB."]
 
 
 # --- glob (requirements.md §2.8) ------------------------------------------------------

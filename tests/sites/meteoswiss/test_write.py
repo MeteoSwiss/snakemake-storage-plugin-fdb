@@ -167,4 +167,6 @@ def test_write_remove_policy_warn(write_job):
     assert res["exists_after_remove"] is True  # nothing is deleted
     removes = [w for w in out["warnings"] if "cannot delete" in w]
     assert len(removes) == 1  # once per query
-    assert "Use `fdb purge` to reclaim space." in removes[0]
+    # FR-REMOVE-002: the archived query is complete, so removal says what that means
+    assert "fields are in FDB" in removes[0]
+    assert "`fdb purge` reclaims the space" in removes[0]
