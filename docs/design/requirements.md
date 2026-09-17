@@ -409,6 +409,18 @@ process and are not environment settings.
 - Verification: test `tests/test_settings.py::test_settings_fields`,
   `tests/test_workflow.py::test_workflow_config_from_environment_variable`.
 
+#### FR-CONF-009 Configuration paths in the error
+
+A `config`/`user_config` value that is neither an existing file nor a YAML mapping and
+looks like a path (it contains `/` or ends in `.yaml`/`.yml`, and is not itself YAML)
+has ` (resolved to <absolute path>, working directory <cwd>)` appended to the
+`FDB configuration error` of FR-CONF-002.
+
+- Rationale: relative paths in a profile resolve against Snakemake's working directory
+  (`-d`), not the shell's, which is invisible in the message otherwise.
+- Verification: test
+  `tests/test_backend.py::test_resolve_config_error_names_the_resolved_path`.
+
 ### 2.4 Process environment
 
 #### FR-ENV-001 eccodes definitions
@@ -441,20 +453,23 @@ environment), an effective `METKIT_HOME` without `share/metkit/language.yaml` ra
 
 #### FR-ENV-003 FDB environment untouched
 
-The plugin never clears or overwrites `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`,
-`FDB5_CONFIG_FILE`, `FDB_HOME` or `FDB_SCHEMA_FILE`, and never sets `FDB5_CONFIG_FILE`,
-`FDB_HOME` or `FDB_SCHEMA_FILE` at all (except through `env`). The single exception is
-FR-DIRECT-003: where none of the four configuration variables is set, the provider's
-own `config` is exported as `FDB5_CONFIG` (and `FDB_CONFIG_FILE`) so that jobs reach
-the same FDB.
+The plugin never clears or overwrites `FDB_HOME` or `FDB_SCHEMA_FILE`, and never sets
+`FDB5_CONFIG_FILE`, `FDB_HOME` or `FDB_SCHEMA_FILE` at all (except through `env`). The
+four configuration variables `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE` and
+`FDB5_CONFIG_FILE` are the exception: a provider with a `config` setting exports it
+there (FR-DIRECT-003) and, if one of them names another FDB, unsets all four first and
+warns (ADR-038). Without a `config` setting nothing is exported and FDB's own
+environment applies unchanged.
 Without the two dedicated settings, `ECCODES_DEFINITION_PATH` and `METKIT_HOME` are left
 as they are.
 
-- Rationale: explicit `config` takes precedence inside FDB; the ambient setup of other
-  tools must keep working, so the plugin only fills a gap, never changes an answer.
-- Verification: test `tests/test_settings.py::test_settings_config_leaves_fdb_env_untouched`,
+- Rationale: explicit `config` takes precedence inside FDB, and the jobs must open the
+  FDB the plugin checks or the workflow cannot converge (ADR-038); everything else in
+  the ambient setup of other tools keeps working.
+- Verification: test `tests/test_settings.py::test_settings_config_replaces_the_fdb_config_env`,
+  `::test_settings_without_config_leaves_fdb_env_untouched`,
   `::test_settings_no_env_settings_leave_env_untouched`,
-  `tests/test_direct.py::test_provider_keeps_a_configuration_in_the_environment`.
+  `tests/test_direct.py::test_provider_replaces_a_foreign_configuration`.
 
 #### FR-ENV-004 Explicit environment overrides
 
@@ -872,18 +887,20 @@ wildcard constraints must match that form.
 
 #### FR-SPELL-001 Runtime spelling check
 
-On the first expansion of a storage object's query (first `exists`, `mtime`, `size`,
-`retrieve`, `inventory` or `store`), literal values of keys without `to`/`by` or
-wildcards are compared item by item with metkit's expansion. On a difference,
+Literal values of keys without `to`/`by` or wildcards are compared item by item with
+metkit's expansion: for a query without wildcards when the storage object is
+constructed (FR-ERR-006), for a query with wildcards on its first expansion (first
+`exists`, `mtime`, `size`, `retrieve`, `inventory` or `store`). On a difference,
 `canonical_spelling=warn` (default) logs `Query <query> uses non-canonical spelling:
 <key>=<given> (canonical: <canonical>), ...` once per query per process; `error` raises
-that text on every call; `ignore` does nothing. Local paths never change. Without
+that text (on every call for a wildcard query); `ignore` does nothing. Local paths never change. Without
 metkit expansion the check is skipped.
 
 - Rationale: the same field written two ways gives two local paths (ADR-002).
 - Verification: test `tests/test_plugin.py::test_canonical_spelling_warns_once`,
   `::test_canonical_spelling_error_raises`, `::test_canonical_spelling_silent`,
   `tests/test_backend.py::test_spelling_diffs`, `::test_expansion_fallback`,
+  `tests/test_workflow.py::test_workflow_spelling_error_names_the_snakefile`,
   `tests/sites/meteoswiss/test_read.py::test_canonical_spelling_mch`.
 
 ### 2.10 Errors
@@ -922,7 +939,23 @@ A storage object with an invalid query does not raise at construction; `parsed`,
 `local_suffix()` and every I/O method raise `invalid FDB query <query>: <parser message>`.
 
 - Rationale: Snakemake validates queries separately and may construct objects early.
+  A query metkit rejects also stays on the lazy path, so a workflow whose MARS language
+  is set up in a rule's environment still builds its DAG (FR-ERR-006).
 - Verification: test `tests/test_plugin.py::test_storage_object_invalid_query_raises_on_use`.
+
+#### FR-ERR-006 Spelling errors where the query is written
+
+With `canonical_spelling=error`, a query without wildcards raises its spelling error
+when the storage object is constructed, so Snakemake reports
+`WorkflowError in file "<Snakefile>", line <N>` with the message of FR-SPELL-001 and no
+traceback. Only metkit's expansion of the request is used, so no FDB is opened
+(FR-CONF-005); a query with wildcards, and anything the expansion itself refuses, keep
+the behaviour of FR-ERR-003.
+
+- Rationale: raised from `exists()` during DAG building, a one-value fix was rendered as
+  a ~160-line `ExceptionGroup` traceback (architecture.md ADR-039).
+- Verification: test `tests/test_plugin.py::test_canonical_spelling_error_raises`,
+  `tests/test_workflow.py::test_workflow_spelling_error_names_the_snakefile`.
 
 #### FR-ERR-004 OS-level I/O failures
 
@@ -1029,9 +1062,9 @@ hook (D-011).
 #### FR-IFACE-001 Plugin surface
 
 The plugin registers as `fdb`, is read-write (`StorageObjectRead`,
-`StorageObjectWrite`), supports glob (`StorageObjectGlob`), is not a
-`StorageObjectTouch`, handles files only and passes every `TestStorageBase` test of
-`snakemake-interface-storage-plugins` 4.4.1.
+`StorageObjectWrite`), supports glob (`StorageObjectGlob`) and touch
+(`StorageObjectTouch`, FR-IFACE-006), handles files only and passes every
+`TestStorageBase` test of `snakemake-interface-storage-plugins` 4.4.1.
 
 - Rationale: conformance with the interface Snakemake expects.
 - Verification: test `tests/test_plugin.py::test_interface_conformance`,
@@ -1086,6 +1119,21 @@ on both backends, including for jobs that run in a spawned process.
 - Note: only the default SQLite URL is tested; other SQLAlchemy backends are untested.
   With the `db` backend the records are keyed by the absolute workdir path, so a copied
   or moved workdir loses its provenance (architecture.md §13.8).
+
+#### FR-IFACE-006 `--touch` leaves the fields alone
+
+`touch()` archives nothing and changes nothing in FDB; it logs
+`FDB storage: --touch leaves FDB fields as they are; index timestamps cannot be changed`
+once per process at info level. `--touch` therefore runs for a workflow with FDB
+outputs: Snakemake touches its local outputs, calls the plugin for FDB outputs whose
+fields are in FDB and reports the other FDB outputs as not touched.
+
+- Rationale: an FDB index timestamp is written when a field is archived and cannot be
+  set; without the interface Snakemake refuses `--touch` for the whole workflow, local
+  outputs included, and invites the user to contribute a touch that cannot exist
+  (architecture.md ADR-040, L-25).
+- Verification: test `tests/test_plugin.py::test_interface_conformance`,
+  `tests/test_direct.py::test_direct_workflow_touch_leaves_fdb_alone`.
 
 ### 2.13 Site support
 
@@ -1252,9 +1300,13 @@ as its path in `FDB_CONFIG_FILE`. fdb5 reads the text before any file variable a
 earthkit-data's `fdb` source reads only `FDB5_CONFIG` (architecture.md §13.7, §13.13),
 so a job reaches the same FDB with an unconfigured `pyfdb.FDB()` or
 `from_source("fdb", ...)`: spawned `run:` jobs re-create the provider, `script:`
-subprocesses inherit the environment. A value the environment already carries is never
-overwritten, and providers of one process that disagree (tagged providers) export
-nothing and remove what they exported (never a value found in the environment). fdb5 has
+subprocesses inherit the environment. An environment that names another FDB does not win: the four
+configuration variables are unset and the workflow's configuration is exported in their
+place, with one warning per process naming what was replaced (ADR-038), because the
+jobs and the plugin must open the same FDB. Equal values (a spawned job, a second
+provider with the same setting) change nothing, and providers of one process that
+disagree (tagged providers) export nothing and put the four variables back as the
+process found them. fdb5 has
 no environment variable for the user configuration, so the direct API takes
 `config`/`user_config` arguments and otherwise reads the plugin's own settings variables
 (`SNAKEMAKE_STORAGE_FDB_*`, ignoring tagged values) — which Snakemake sets in every job
@@ -1271,7 +1323,10 @@ A job therefore reads, spells and archives as the workflow does: `archive_mode`,
   (`test_provider_exports_the_configuration_file`,
   `test_provider_exports_relative_config_paths_as_absolute`,
   `test_provider_exports_inline_configuration`,
-  `test_provider_keeps_a_configuration_in_the_environment`,
+  `test_provider_replaces_a_foreign_configuration`,
+  `test_provider_warns_once_about_a_replaced_configuration`,
+  `test_provider_keeps_its_own_configuration_in_a_spawned_job`,
+  `test_direct_workflow_ignores_a_foreign_fdb5_config`,
   `test_earthkit_reads_the_exported_configuration`,
   `test_providers_with_different_configurations_export_nothing`,
   `test_conflicting_providers_leave_a_user_configuration`,
@@ -1291,7 +1346,10 @@ its input-newer-than-output check (architecture.md §13.8). Nothing is written u
 `.snakemake/storage`; everything else is unchanged — the query links producer and
 consumer in the DAG, a missing field is reported as `Missing output files: fdb://...
 (in storage)`, `--summary` lists the output and a second run has nothing to do. The job
-must `flush()` before it ends, or its fields are not visible to that check.
+should `flush()` before it ends; fdb5 also flushes when the `FDB` object is destroyed,
+so a job process that exits normally is usually safe, but a long-lived one (a `run:`
+job that keeps the handle, a server) must flush for its fields to be visible to that
+check.
 
 Only existence is checked, so a job that exits 0 having archived nothing passes when the
 query's fields are already in FDB (L-32); FR-DIRECT-004 is the checked variant.
@@ -1568,7 +1626,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-7 | eckit `SeriousBug` backtraces (e.g. schema mismatch on archive) cannot be silenced from the environment. |
 | L-8 | A `METKIT_HOME` without `language.yaml` hangs FDB; the plugin checks the file exists but cannot validate its content. |
 | L-9 | Request expansion parses the repr of pyfdb's internal `FDBToolRequest` (pinned version range). |
-| L-10 | Not usable as `--default-storage-provider`; no `--touch`; files only. |
+| L-10 | Not usable as `--default-storage-provider`; files only. |
 | L-11 | eccodes definition overrides depend on environment variables read at library load. |
 | L-12 | MeteoSwiss: `model` values need a MARS language override; accumulations need `timespan=fs`; COSMO paramIds (`500011`) must be used, not ECMWF ones (`2t`); `model` is listed lower-case (spelling warning for `ICON-CH2-EPS`); `eccodes-cosmo-mars` must be cloned (not on PyPI); no `eccodes-cosmo-resources` release for eccodes 2.48 yet. |
 | L-13 | `identifier_check=strict` is reserved; the built-in pre-check (both modes) covers only constant query keys the message carries, with light normalisation. |
@@ -1583,7 +1641,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | L-22 | `inspect`/`retrieve` match through query keys the indexed fields do not have (`quantile=1:10` finds quantile-less fields), unlike `list` (architecture.md §13.4). Mitigated by the key check of FR-READ-001; a retrieval whose `inspect` returns matching and non-matching fields together fails on the byte count instead (FR-READ-007). |
 | L-23 | Native mode cannot label a key the message does not carry: naming such a key in the query is an error (FR-STORE-003). Use `archive_mode=identifier`, set the key in the GRIB, or drop it from the query. |
 | L-24 | A single unreadable database directory under an FDB root looks like missing data: FDB skips it and `inspect` returns fewer fields, with no error to map (eckit's own message is silenced by `ECKIT_EXCEPTION_IS_SILENT=1`). The partial-input warning (FR-READ-008) is the only signal; an unreadable root as a whole is an I/O error on every FDB version, because the plugin checks the configured roots itself (FR-ERR-004). |
-| L-25 | Snakemake refuses `--touch` for the whole workflow, not only for FDB outputs, as soon as one output is an FDB query; FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
+| L-25 | `--touch` cannot refresh an FDB field: index timestamps are written by the archive and cannot be set, so the plugin's `touch()` is a no-op (FR-IFACE-006) and only the local outputs of the workflow are touched. FDB queries cannot be command-line targets or `--cleanup-metadata` arguments, because Snakemake path-normalises `fdb://` to `fdb:/` (target rule names or a local sentinel file instead). |
 | L-26 | `ensure(non_empty=True)` on an FDB output always fails ("Detected unexpected empty output files"): Snakemake checks the storage object's size, which is 0 before the store, not the local file (D-014). |
 | L-27 | MARS **key** aliases (`levtyp`, `parameter`) are accepted as unknown keys: they sort to the end of the key order and give their own local path, so two spellings of one request are retrieved twice. |
 | L-28 | Relative dates (`date=-1`) expand at run time, but the local path keeps the text, so a copy kept with `--keep-storage-local-copies` goes stale. |
@@ -1604,7 +1662,6 @@ MeteoSwiss site suite run in CI and are required. Details are in
   fits no MARS request [verified: `snakemake/path_modifier.py:132-136`,
   `snakemake/workflow.py:403-406`]; `is_valid_query` rejects such strings.
 - Directory objects.
-- `--touch` (`StorageObjectTouch`): Snakemake fails upfront for FDB outputs.
 - Per-field deletion, `wipe`, `purge`.
 - Non-GRIB payloads.
 - Relabelling GRIB whose metadata contradicts the query.
@@ -1621,7 +1678,7 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-002 | Lift the pyfdb pin to 5.23 (`pyfdb>=5.23.2.27,<6`, `eccodes>=2.48,<3`) | When COSMO definitions for eccodes 2.48 exist and the `pyfdb-latest` CI canary is green; bump `setup.sh`'s `eccodes-cosmo-resources-python` range with it. |
 | D-003 | Upstream pyfdb pull requests to `ecmwf/fdb` | Bind `ListElement::timestamp()` (`src/pyfdb_bindings/bindings.cc`, `src/fdb5/api/helpers/ListElement.h:71`) and expose `ListElement.timestamp() -> int` in `src/pyfdb/pyfdb_iterator.py` ("index flush time, POSIX seconds; 0 for level < 3 and legacy indexes"), with tests in `tests/pyfdb/integration/test_list.py`; fix the 9-digit timestamp typos in the `pyfdb.py` docstrings; optionally a public `pyfdb.expand(selection) -> dict[str, list[str]]` wrapping `mars_request_from_map`. Plugin follow-up: prefer them when present, keep the fallbacks. |
 | D-004 | Report the Snakemake tagged-settings bug upstream | An issue draft exists but is not posted (architecture.md §11, R-1). |
-| D-005 | `--touch` support | Could re-archive the retrieved bytes to refresh the index timestamp. |
+| D-005 | `--touch` that changes a timestamp | `touch()` is a no-op (FR-IFACE-006); refreshing an index timestamp would mean re-archiving the fields, which `--touch` must not do. |
 | D-006 | A `wipe` remove policy | Only acceptable if `list(level=2)` proves the query covers every field of every index it touches. |
 | D-007 | Test remote FDB backends | See NFR-COMPAT-003. |
 | D-008 | Script to re-download the ECMWF samples | `scripts/fetch_ecmwf_samples.py` from `ecmwf/fdb` at the pinned commit (provenance in architecture.md §13.2); never written, the manual steps are in `contributing.md`. |
@@ -1633,3 +1690,4 @@ MeteoSwiss site suite run in CI and are required. Details are in
 | D-014 | Report two Snakemake behaviours upstream | Command-line targets and `--cleanup-metadata` arguments are path-normalised, so `fdb://` becomes `fdb:/` and storage URIs cannot be named on the command line (L-25); `ensure(non_empty=True)` checks a storage output's `size()` before the store instead of the local file, which no storage plugin can satisfy (L-26). |
 | D-015 | An upstream post-job verify hook for storage outputs | The "no local output" flag exists: `storage.fdb(query, retrieve=False)` on an output makes Snakemake check `exists_in_storage()` after the job instead of a local path (FR-DIRECT-005, ADR-037, architecture.md §13.8). What is missing is a way to run the plugin's own post-check there, since `store_object` is skipped and `exists()` cannot tell a post-job check from a DAG lookup: propose a hook such as `StorageObjectWrite.verify_stored()`, called from `dag.handle_storage` for outputs with `should_not_be_retrieved_from_storage`, so that the freshness check of FR-DIRECT-004 can run without any local file (L-32). Until then, `touch()` plus an empty file is the checked variant (ADR-036); FIFOs (`pipe()`) were considered and rejected: a storage object cannot carry `pipe()` (architecture.md §13.8). |
 | D-016 | Verify the empty-output convention under other executors | The store step runs in the main Snakemake process under the local executor, so the reference time of FR-DIRECT-004 is the start of the workflow; under cluster and cloud executors the store may run in the job process, whose provider gives a later reference time (still before the job's archives). Verify per executor when one is tested (L-19 limits tagged settings there anyway). |
+| D-017 | An `export_config` policy setting | ADR-038 makes the workflow's FDB configuration win over the environment for every site. If a site needs the old precedence (jobs that must follow an inherited `FDB5_CONFIG`), a setting `export_config: always\|missing\|never` would express it; until such a site exists, the direct API's `config=` argument covers the case. |

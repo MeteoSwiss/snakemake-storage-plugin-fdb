@@ -197,8 +197,8 @@ def test_interface_conformance():
     assert not StorageProvider.__abstractmethods__
     assert not StorageObject.__abstractmethods__
     assert issubclass(StorageObject, StorageObjectGlob)
-    # deliberately absent: --touch fails upfront for FDB outputs (requirements.md §6.1)
-    assert not issubclass(StorageObject, StorageObjectTouch)
+    # a no-op touch, so that --touch works for the local outputs (FR-IFACE-006)
+    assert issubclass(StorageObject, StorageObjectTouch)
 
 
 def test_provider_settings_postprocess_invalid_unchanged(make_provider):
@@ -659,11 +659,16 @@ def test_canonical_spelling_warns_once(seeded_provider, caplog):
 
 @needs_samples
 def test_canonical_spelling_error_raises(seeded_provider):
-    obj = seeded_provider(canonical_spelling="error").object(
-        f"fdb://{EA},step=0,param=2t"
-    )
+    """FR-ERR-006: a query without wildcards is checked when the object is built, so
+    Snakemake blames the Snakefile line instead of the first lookup; a wildcard query
+    keeps the lazy check, on every call."""
+    provider = seeded_provider(canonical_spelling="error")
+    with pytest.raises(WorkflowError, match=r"canonical: 167"):
+        provider.object(f"fdb://{EA},step=0,param=2t")
+    obj = provider.object(f"fdb://{EA},step={{step}},param=2t")
     for _ in range(2):
         with pytest.raises(WorkflowError, match=r"canonical: 167"):
+            obj.query = obj.query.replace("{step}", "0")
             obj.exists()
 
 

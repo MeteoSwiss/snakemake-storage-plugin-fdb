@@ -11,6 +11,7 @@ from dataclasses import fields
 from pathlib import Path
 
 import pytest
+import yaml
 from snakemake_interface_common.exceptions import WorkflowError
 
 from snakemake_storage_plugin_fdb import LANGUAGE_FILE, StorageProviderSettings
@@ -22,6 +23,8 @@ from snakemake_storage_plugin_fdb.guard import (
     make_guard,
 )
 from snakemake_storage_plugin_fdb.query import parse
+
+from .conftest import TEST_SCHEMA
 
 # reference.md settings table: name -> default
 SETTINGS = {
@@ -273,15 +276,36 @@ def test_settings_invalid_metkit_home_from_env(
         make_provider(**kwargs)
 
 
-def test_settings_config_leaves_fdb_env_untouched(make_provider, clean_env):
+def test_settings_config_replaces_the_fdb_config_env(make_provider, clean_env):
+    """FR-ENV-003/ADR-038: the configuration variables give way to the workflow's own
+    configuration, the other FDB variables are left alone."""
     values = {
         "FDB_CONFIG": "type: local",
+        "FDB_CONFIG_FILE": "/elsewhere/config.yaml",
+        "FDB_HOME": "/elsewhere",
+        "FDB_SCHEMA_FILE": "/elsewhere/schema",
+    }
+    for name, value in values.items():
+        clean_env.setenv(name, value)
+    make_provider()  # explicit inline config
+    assert _env("FDB_HOME") == "/elsewhere"
+    assert _env("FDB_SCHEMA_FILE") == "/elsewhere/schema"
+    assert _env("FDB_CONFIG") is None
+    assert _env("FDB_CONFIG_FILE") is None  # inline: only FDB5_CONFIG is exported
+    assert _env("FDB5_CONFIG") is not None
+
+
+def test_settings_without_config_leaves_fdb_env_untouched(make_provider, clean_env):
+    """Without a `config` setting there is nothing to export: FDB's own environment
+    applies unchanged (FR-ENV-003)."""
+    values = {
+        "FDB_CONFIG": yaml.safe_dump({"schema": str(TEST_SCHEMA)}),
         "FDB_CONFIG_FILE": "/elsewhere/config.yaml",
         "FDB_HOME": "/elsewhere",
     }
     for name, value in values.items():
         clean_env.setenv(name, value)
-    make_provider()  # explicit inline config
+    make_provider(config=None)
     assert {name: _env(name) for name in values} == values
     assert _env("FDB5_CONFIG") is None
 

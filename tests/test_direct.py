@@ -9,6 +9,7 @@ eccodes and write no GRIB file anywhere: its outputs are declared ``retrieve=Fal
 
 import importlib.util
 import io
+import logging
 import os
 import re
 import sys
@@ -20,7 +21,7 @@ import yaml
 from snakemake_interface_common.exceptions import WorkflowError
 
 from snakemake_storage_plugin_fdb import api
-from snakemake_storage_plugin_fdb.backend import Backend
+from snakemake_storage_plugin_fdb.backend import Backend, config_text
 from snakemake_storage_plugin_fdb.grib import (
     GribError,
     split_messages,
@@ -65,6 +66,12 @@ def _fdb_steps(config, query: str = OUT) -> list[int]:
     """The steps FDB holds for ``query`` (a config path or mapping)."""
     fields = Backend(config).inspect(parse(query).to_request())
     return sorted(int(f.key["step"]) for f in fields)
+
+
+def _fdb_mtime(config, query: str) -> list[int]:
+    """The index timestamps FDB holds for ``query``."""
+    fields = Backend(config).inspect(parse(query).to_request())
+    return sorted(f.timestamp for f in fields)
 
 
 # --- streaming GRIB messages ---------------------------------------------------------
@@ -453,13 +460,48 @@ def test_provider_exports_inline_configuration(make_provider, write_config):
     assert "FDB_CONFIG_FILE" not in os.environ
 
 
-def test_provider_keeps_a_configuration_in_the_environment(
-    make_provider, clean_env, fdb_config_file, tmp_path
+def test_provider_replaces_a_foreign_configuration(
+    make_provider, clean_env, fdb_config_file, tmp_path, caplog
 ):
+    """ADR-038: the workflow's configuration wins over one the environment names, so
+    that the jobs and the plugin cannot look at two databases. All four variables go,
+    because a left-over higher-precedence one would beat the exported FDB5_CONFIG."""
     clean_env.setenv("FDB_CONFIG_FILE", "/elsewhere/config.yaml")
-    make_provider(config=str(fdb_config_file(tmp_path / "fdb1")))
-    assert os.environ["FDB_CONFIG_FILE"] == "/elsewhere/config.yaml"
-    assert "FDB5_CONFIG" not in os.environ
+    clean_env.setenv("FDB_CONFIG", "type: local")
+    config = fdb_config_file(tmp_path / "fdb1")
+    with caplog.at_level(logging.WARNING):
+        make_provider(config=str(config))
+    assert os.environ["FDB_CONFIG_FILE"] == str(config.absolute())
+    assert yaml.safe_load(os.environ["FDB5_CONFIG"]) == yaml.safe_load(
+        config.read_text()
+    )
+    assert "FDB_CONFIG" not in os.environ
+    assert "the environment named another FDB" in caplog.text
+    assert "FDB_CONFIG, FDB_CONFIG_FILE=/elsewhere/config.yaml" in caplog.text
+    assert str(config.absolute()) in caplog.text
+
+
+def test_provider_warns_once_about_a_replaced_configuration(
+    make_provider, clean_env, fdb_config_file, tmp_path, caplog
+):
+    clean_env.setenv("FDB5_CONFIG", "type: local")
+    config = str(fdb_config_file(tmp_path / "fdb1"))
+    with caplog.at_level(logging.WARNING):
+        make_provider(config=config)
+        make_provider(config=config)  # same configuration again: nothing to do
+    assert caplog.text.count("the environment named another FDB") == 1
+
+
+def test_provider_keeps_its_own_configuration_in_a_spawned_job(
+    make_provider, clean_env, fdb_config_file, tmp_path, caplog
+):
+    """A job inherits what the scheduling process exported: equal values, no warning."""
+    config = fdb_config_file(tmp_path / "fdb1")
+    clean_env.setenv("FDB5_CONFIG", config_text(config.absolute()))
+    clean_env.setenv("FDB_CONFIG_FILE", str(config.absolute()))
+    with caplog.at_level(logging.WARNING):
+        make_provider(config=str(config))
+    assert "the environment named another FDB" not in caplog.text
 
 
 def test_providers_with_different_configurations_export_nothing(
@@ -763,12 +805,12 @@ def direct(tmp_path_factory, run_logged) -> dict:
     out["init"] = run("init", init, tmp)
     out["init"].ok()
 
-    def snakemake(name: str, *args: str) -> None:
+    def snakemake(name: str, *args: str, env: dict[str, str] | None = None) -> None:
         cmd = [
             sys.executable, "-m", "snakemake",
             "--storage-fdb-config", str(config), "-c1", *args,
         ]  # fmt: skip
-        out[name] = run(name, cmd, work)
+        out[name] = run(name, cmd, work, env=env)
 
     snakemake("run1", "--verbose")  # the store step's debug line names its process
     out["files_after_run1"] = _files(work)
@@ -778,6 +820,27 @@ def direct(tmp_path_factory, run_logged) -> dict:
         if (work / name).is_file()
     }
     snakemake("run2")
+
+    # ADR-038: a stale FDB5_CONFIG in the shell names another FDB; the workflow's
+    # configuration must win, or the jobs would archive where the plugin does not look.
+    other = tmp / ".fdb2"
+    out["other_config"] = other / "config.yaml"
+    run("init_other", [*init, "--root", other], tmp).ok()
+    snakemake(
+        "foreign_env",
+        "direct_shift",
+        "--force",
+        env={"FDB5_CONFIG": (other / "config.yaml").read_text()},
+    )
+
+    # --touch: the local outputs are touched, the FDB fields are left alone (L-25).
+    out["steps_mtime_before_touch"] = (work / "steps.txt").stat().st_mtime
+    out["direct_mtime_before_touch"] = _fdb_mtime(config, DIRECT_QUERY)
+    snakemake("touch", "--touch", "--forceall")  # --forceall: every output is touched
+    out["steps_mtime_after_touch"] = (work / "steps.txt").stat().st_mtime
+    out["direct_mtime_after_touch"] = _fdb_mtime(config, DIRECT_QUERY)
+    snakemake("after_touch", "--dry-run")
+
     # The target first: the setting takes several (tagged) values.
     snakemake("identifier", "quantile", "--storage-fdb-archive-mode", "identifier")
     snakemake("bad", "bad_count")
@@ -930,6 +993,27 @@ def test_direct_workflow_rearchived_input_reruns(direct):
     log = direct["rerun"].ok()
     assert direct["rerun"].NOTHING_TO_BE_DONE not in log
     assert "plain_shift" in log
+
+
+def test_direct_workflow_ignores_a_foreign_fdb5_config(direct):
+    """ADR-038: with another FDB in FDB5_CONFIG, the job still archives into the
+    workflow's FDB, and the log says which configuration was replaced."""
+    log = direct["foreign_env"].ok()
+    assert "the environment named another FDB (FDB5_CONFIG)" in log
+    assert "so that jobs and the plugin use the same FDB" in log
+    assert _fdb_steps(direct["config"], DIRECT_QUERY) == [0, 6, 12]
+    assert _fdb_steps(direct["other_config"], DIRECT_QUERY) == []
+
+
+def test_direct_workflow_touch_leaves_fdb_alone(direct):
+    """FR-IFACE-006: --touch touches the local outputs of a workflow with FDB outputs
+    and leaves the FDB fields as they are; the workflow stays up to date."""
+    log = direct["touch"].ok()
+    assert "--touch leaves FDB fields as they are" in log
+    assert direct["steps_mtime_after_touch"] > direct["steps_mtime_before_touch"]
+    assert direct["direct_mtime_after_touch"] == direct["direct_mtime_before_touch"]
+    after = direct["after_touch"]
+    assert after.NOTHING_TO_BE_DONE in after.ok()
 
 
 def test_direct_workflow_delete_all_output(direct):

@@ -16,6 +16,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model, removing one reruns no FDB producer, a new model checkpoint is a new `expver`.
 - The `examples` dependency group (earthkit-data, matplotlib) for that example;
   `tests/test_evaluation_example.py` runs it end to end and skips without the group.
+- `--touch` support: the plugin's `touch()` leaves FDB fields as they are (index
+  timestamps cannot be set) and logs so once per run. Snakemake no longer refuses
+  `--touch` for the whole workflow, so the local outputs of a workflow with FDB outputs
+  can be touched again.
 
 ### Changed
 
@@ -32,6 +36,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   producer, but the scorecard is rebuilt and matches `config.yaml`. The example also
   validates its configuration where the Snakefile is read, so a non-numeric `param`, a
   short `truth_expver` or a malformed init time gives a sentence instead of a traceback.
+- The FDB configuration given to the workflow now wins over one the environment already
+  names: where the plugin used to leave a stale `FDB5_CONFIG`/`FDB_CONFIG_FILE` alone —
+  so that jobs archived into one FDB while the plugin checked another and the run failed
+  with `(missing in storage)` — it unsets those variables, exports its own configuration
+  and warns once, naming what it replaced. Nothing changes when the values agree or when
+  no `config` setting is given; a job that must reach another FDB opens it itself.
+- With `canonical_spelling=error`, a query without wildcards now fails where it is
+  written (`WorkflowError in file "Snakefile", line N`) instead of as a long
+  `ExceptionGroup` traceback out of DAG building. Queries with wildcards are unchanged.
+- An `FDB configuration error` for a path-like value says what the path resolved to and
+  in which working directory.
 
 ### Fixed
 

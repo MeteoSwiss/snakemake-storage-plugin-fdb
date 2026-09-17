@@ -1,6 +1,7 @@
 """Backend: config/schema resolution, expansion, error mapping, and temp FDB access."""
 
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -95,6 +96,24 @@ def test_resolve_config_errors(value, message):
     with pytest.raises(WorkflowError, match="FDB configuration error") as e:
         resolve_config(value)
     assert message in str(e.value)
+
+
+def test_resolve_config_error_names_the_resolved_path(tmp_path, monkeypatch):
+    """FR-CONF-009: a path-like value that is not a file says what it resolved to and
+    against which working directory; inline YAML does not get that hint."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(WorkflowError) as e:
+        resolve_config("../../.fdb/config.yaml")
+    text = str(e.value)
+    assert f"(resolved to {os.path.abspath('../../.fdb/config.yaml')}" in text
+    assert f"working directory {tmp_path}" in text
+    for value in ("- a\n- b\n", "type: [unclosed", "nothing"):
+        with pytest.raises(WorkflowError) as e:
+            resolve_config(value)
+        assert "resolved to" not in str(e.value)
+    with pytest.raises(WorkflowError) as e:
+        resolve_config("config.yaml")  # a bare file name is path-like too
+    assert f"(resolved to {tmp_path / 'config.yaml'}" in str(e.value)
 
 
 def test_parse_schema_test_schema():

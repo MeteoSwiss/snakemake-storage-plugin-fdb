@@ -40,7 +40,7 @@ the variable over the default.
 | `ECCODES_DEFINITION_PATH` | Read and prepended to with `eccodes_definitions` (skipped if it already starts with those directories). Read by eccodes, metkit and FDB. |
 | `METKIT_HOME` | Set from `metkit_home` (overriding a different existing value is logged at info level). Its effective value, from any source, must contain `share/metkit/language.yaml`. Read by metkit. |
 | `ECKIT_EXCEPTION_IS_SILENT` | Set to `1` if unset. `scripts/init_dev_fdb.py` and `tests/conftest.py` default it too. |
-| `FDB_CONFIG`, `FDB5_CONFIG` | Read (YAML text) to find the schema when `config` is unset. `FDB5_CONFIG` is *set* to the `config` setting as YAML text for direct access (an inline setting as it is; a file's mapping with its relative paths made absolute against the working directory), but only if none of these four variables is set and no other provider of the process exported a different configuration. fdb5 reads the text before any file variable; earthkit-data's `fdb` source reads only this variable (and `FDB_HOME`). |
+| `FDB_CONFIG`, `FDB5_CONFIG` | Read (YAML text) to find the schema when `config` is unset. `FDB5_CONFIG` is *set* to the `config` setting as YAML text for direct access (an inline setting as it is; a file's mapping with its relative paths made absolute against the working directory). If one of these four variables names *another* FDB, all four are unset first and a warning per process says so: the workflow's configuration wins, so that the jobs and the plugin use the same FDB. Nothing is exported when no `config` setting is given, or when providers of one process disagree (tagged providers), which also restores the four variables. fdb5 reads the text before any file variable; earthkit-data's `fdb` source reads only this variable (and `FDB_HOME`). |
 | `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE` | Read (config path) likewise. `FDB_CONFIG_FILE` is *set* to a `config` setting that is a file, next to `FDB5_CONFIG` and under the same conditions, for tools that want the path. |
 | `FDB_HOME` | Read for `$FDB_HOME/etc/fdb/config.{yaml,json}` and `~fdb` expansion; never set. |
 | `FDB_SCHEMA_FILE` | Read when the config has no `schema`; never set. |
@@ -169,6 +169,7 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `retrieve_object` | Requires `exists`; streams `retrieve` into `<local>.part` in 8 MiB chunks, fsyncs, checks the byte count, renames over the local path; removes the part file on any error. |
 | `store_object` | If the local file is empty ([empty-output convention](#the-empty-output-convention)), archives nothing and requires all `E` fields to be in FDB with an index timestamp not older than the run's reference time. If it is an [archive marker](#the-archive-marker), archives nothing and only post-checks with the marker's field count and timestamp (errors if the marker names another query or a field count other than `E`). Otherwise: expands the query, splits the local file into GRIB messages, requires exactly `E` of them, pre-checks every message's MARS keys against the query (both modes), builds identifiers (`identifier` mode) or requires every indexed query key to be present in the message (`native` mode), rejects duplicates, archives and flushes, then post-checks with one `inspect` that every message is reachable with a timestamp from this store, naming the offending messages if not. Never retried. |
 | `remove` | Never deletes; applies `remove_policy`. Snakemake 9.27 calls it only for `--delete-all-output`: not before a rerun, not on failed-job cleanup (its "Removing output files of failed job" line removes nothing from FDB), and never for `temp()`, which cannot be combined with storage. |
+| `touch` | No-op: FDB index timestamps are written by the archive and cannot be set. `--touch` therefore works: Snakemake touches the workflow's local outputs, calls this for FDB outputs whose fields are in FDB (logging `--touch leaves FDB fields as they are` once per process) and reports FDB outputs whose fields are absent as not touched. |
 | `list_candidate_matches` | Checks `glob_required_keys`; one `list` of the pattern's constant pairs; returns the sorted unique pattern texts with wildcard-bearing values replaced by listed values, skipping fields that lack them. |
 | `cleanup` | No-op. |
 | `rate_limiter_key`, `default_max_requests_per_second`, `use_rate_limiter` | `"fdb"`, `10.0`, `False`. |
@@ -177,8 +178,11 @@ class=od/expver=0001/stream=oper/date={date}/time=0000/domain=g/type=fc/levtype=
 | `covered_by(recorded)` | Whether every field of this query is a field of one of the `recorded` queries. A recorded query with the same text covers it outright; otherwise fields are compared on the expanded (canonical) `key=value` pairs, so order, `to`/`by` ranges and non-canonical spellings do not matter, while a key only one query names makes the fields differ. A query that cannot be expanded, or that names more than 100 000 fields, covers nothing. |
 
 `exists`, `mtime`, `size`, `inventory`, `retrieve_object` and `store_object` expand the
-request with metkit first (once per object and query), which runs the canonical-spelling
-check and raises invalid requests before any FDB I/O. Queries with unresolved wildcards
+request with metkit first (once per object and query), which raises invalid requests
+before any FDB I/O. The canonical-spelling check runs there for a query with wildcards;
+a query without wildcards is checked when the storage object is constructed, so
+`canonical_spelling=error` is reported against the Snakefile line that wrote the query
+and not as a traceback out of DAG building. Queries with unresolved wildcards
 raise `FDB query <query> has unresolved wildcards`. The FDB `inspect`, `retrieve` and
 `list` calls use a fresh FDB handle each and are retried (3 attempts, exponential wait
 from 3 s) unless the failure is one of the mapped permanent ones below (invalid MARS
@@ -204,6 +208,16 @@ earthkit-data (the provider exports the configuration, see
 [Environment variables](#environment-variables)) and archives with plain `pyfdb`. Every
 FDB object a job handles itself is declared `storage.fdb(query, retrieve=False)`, input
 or output alike ([Direct outputs](#direct-outputs) below).
+
+Which settings reach such a job: `config` and `user_config` through the environment
+(`FDB5_CONFIG`/`FDB_CONFIG_FILE` and `SNAKEMAKE_STORAGE_FDB_USER_CONFIG`), and
+`canonical_spelling`, `key_order` and `glob_required_keys` wherever the *query* is
+handled — in the Snakefile and in the plugin's own checks. `archive_mode` and
+`identifier_check` reach only `api.archive`: plain `pyfdb.archive()` lets FDB derive
+every key from the GRIB, whatever the settings say. Errors a job raises through plain
+pyfdb are raw fdb5/eckit text (`Failed system call: mkdir ... (Success)`), not the
+plugin's mapped messages of [Errors and messages](#errors-and-messages); only calls made
+through `api` and the plugin's own store and read steps are mapped.
 
 `from snakemake_storage_plugin_fdb import api` is the optional helper module for a
 Snakefile and for a job that wants the plugin's own checks
@@ -234,11 +248,11 @@ would give.
 An output a job archives itself is declared one of three ways; they differ in what is
 checked and in what appears at the output's [local path](#local-path-mapping):
 
-| declaration | checked after the job | local file |
-|---|---|---|
-| `storage.fdb(query, retrieve=False)` | every field of the query is in FDB (`exists`) | none: nothing is written, the store step does not run |
-| `touch(storage.fdb(query))` | every field is in FDB **with an index timestamp from this run** (the [empty-output convention](#the-empty-output-convention)) | an empty file, removed after the run unless `--keep-storage-local-copies` |
-| `storage.fdb(query)` with `api.archive` | the checks of a file-based store before the archive, then the marker's count and timestamp | the [archive marker](#the-archive-marker), removed with the other local copies |
+| declaration | checked after the job | on failure | local file |
+|---|---|---|---|
+| `storage.fdb(query, retrieve=False)` | every field of the query is in FDB (`exists`) | Snakemake's `Job ... completed successfully, but some output files are missing ... <query> (missing in storage)` after the latency wait; which fields are missing is in the plugin's `--verbose` line | none: nothing is written, the store step does not run |
+| `touch(storage.fdb(query))` | every field is in FDB **with an index timestamp from this run** (the [empty-output convention](#the-empty-output-convention)) | the plugin's own error, at once, naming the missing fields and how many are from before this run | an empty file, removed after the run unless `--keep-storage-local-copies` |
+| `storage.fdb(query)` with `api.archive` | the checks of a file-based store before the archive, then the marker's count and timestamp | the plugin's own error, mostly before anything is archived | the [archive marker](#the-archive-marker), removed with the other local copies |
 
 A plain `storage.fdb(query)` whose job writes no local GRIB file and does not use
 `api.archive` fails with Snakemake's missing-output message: nothing is at the local
@@ -298,6 +312,7 @@ characters with `…`; the full text is logged at debug level.
 | `eccodes_definitions: '<entry>' is not an existing directory` | bad definitions entry |
 | `METKIT_HOME=<dir> (from <metkit_home \| the env setting \| the environment>) has no share/metkit/language.yaml; FDB would hang instead of failing` | invalid metkit home |
 | `FDB configuration error: '<value>' is neither an existing file nor an inline YAML mapping` | `config`/`user_config` not a file and not a mapping |
+| `... (resolved to <absolute path>, working directory <cwd>)` | appended when the value looks like a path (contains `/` or ends in `.yaml`/`.yml`) and is not itself YAML; relative paths resolve against Snakemake's working directory |
 | `... (looks like a tagged setting mangled by a spawned job, see the user guide on tagged settings)` | appended when the value has the shape `TAG:<existing file>` (L-19) |
 | `FDB configuration error: '<value>' is neither an existing file nor valid YAML: <error>` | unparsable YAML |
 | `FDB configuration error: schema <path>: <detail>` | schema unreadable or without rule keys |
@@ -311,7 +326,7 @@ characters with `…`; the full text is logged at debug level.
 | `FDB query <query> has unresolved wildcards` | wildcards left in a job query |
 | `Invalid MARS request <query>: <detail>` | metkit rejects the request (unknown key or value, context error, several values for `class`/`stream`/`type`/`expver`) |
 | `... (if this value is valid for your FDB, point metkit_home at a MARS language that defines it)` | appended when `<detail>` contains `cannot expand` |
-| `Query <query> uses non-canonical spelling: <key>=<given> (canonical: <value>), <key>=<given> (<value>). Use canonical spellings to avoid duplicate local paths for the same field.` | `canonical_spelling=error` (a warning with `warn`) |
+| `Query <query> uses non-canonical spelling: <key>=<given> (canonical: <value>), <key>=<given> (<value>). Use canonical spellings to avoid duplicate local paths for the same field.` | `canonical_spelling=error` (a warning with `warn`); raised where the query is written for a query without wildcards, on use for one with wildcards |
 | `<query>: <n> of <E> fields found in FDB; missing: <combinations> (and <k> more)` | retrieving an incomplete object; at most 10 combinations. Also logged, as a warning (`0 < n < E`) or at debug level (`n = 0`), by `exists` and `inventory` |
 | `. FDB matches keys exactly; optional schema keys not in the query: <keys>` | appended when nothing was found (so only in the retrieve error and the debug log) |
 | `retrieved <n> bytes for <local>, expected <m>` | retrieval byte count mismatch |
@@ -359,8 +374,10 @@ characters with `…`; the full text is logged at debug level.
 | warning | `FDB storage: <query>: <n> of <E> fields found in FDB; missing: ...` (once per query per process, when FDB holds some but not all fields) |
 | warning | `FDB storage: a field of <query> has no index timestamp and no local data file; its mtime is taken as 0` |
 | warning | `FDB storage: providers in one process use different <VARIABLE> settings (<a> vs <b>); the last one wins` |
+| warning | `FDB storage: the environment named another FDB (<variables>); replaced by the workflow's configuration (<path or "inline YAML">) so that jobs and the plugin use the same FDB. Unset the variable to silence this.` (once per process) |
 | warning | `FDB storage: input tracking by lookup is unavailable with snakemake <version> (<reason>); falling back to query tracking. Set input_tracking=query to silence this warning.` (per provider with `input_tracking=lookup`) |
 | info | `FDB storage: metkit_home overrides METKIT_HOME=<old> with <new>` |
+| info | `FDB storage: --touch leaves FDB fields as they are; index timestamps cannot be changed` (once per process) |
 | debug | `FDB storage: <query>: 0 of <E> fields found in FDB ...` (nothing found; includes the optional-schema-key hint) |
 | debug | `FDB storage: full error text: <full pyfdb message>` (for every error mapped to a `WorkflowError`) |
 | debug | `FDB storage: <query>: <k> of <n> inspected fields lack a query key and are not counted (FR-READ-001)` |

@@ -445,8 +445,11 @@ expansion gives canonical spellings: `2t`→`167`, `T_2M`→`500011`, `EA`→`ea
 `ICON-CH1-EPS`→`icon-ch1-eps`, `2020-01-01`→`20200101`, `time=0`→`0000`,
 `expver=1`→`0001`. `Backend.spelling_diffs(parsed, expanded)` compares item by item
 (whole value if counts differ), skipping ranges (their expansion is long) and wildcard
-keys. The check runs once per object and query text, because `_expanded()` caches only
-successful computations; with `error` it therefore repeats on every call. eccodes-cosmo-mars
+keys. A query without wildcards is checked when the storage object is constructed, so a
+spelling error is reported against the Snakefile line that wrote it (ADR-039); a query
+with wildcards is checked on its first expansion. The check runs once per object and
+query text, because `_expanded()` caches only successful computations; with `error` it
+therefore repeats on every call of a wildcard query. eccodes-cosmo-mars
 emits `model` upper-case in the GRIB `mars` namespace while FDB lists it lower-case, so
 MeteoSwiss users copying `grib_ls -n mars` output see the warning until they lower-case
 it. The evalml read path is consistent with this: it builds requests from FDB's own
@@ -462,7 +465,8 @@ imported. All values are validated and computed first, then exported under a loc
 |---|---|---|---|
 | `ECCODES_DEFINITION_PATH` | kept | `eccodes_definitions` | `<setting dirs>:<existing>`; if unset, `<setting dirs>` only (the wheel appends `/MEMFS/definitions` itself [verified: `codes_definition_path()`]) |
 | `METKIT_HOME` | kept, validated | `metkit_home` | setting wins; logged at info level |
-| `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE`, `FDB_HOME` | kept | `config`, `user_config` | passed to `FDB(config, user_config)`, which takes precedence inside FDB [verified]; with none of the first four set, `config` is exported as YAML text in `FDB5_CONFIG` (a file's mapping with relative paths made absolute against the cwd, `backend.config_text`) plus, for a file, its path in `FDB_CONFIG_FILE`, for direct access (FR-DIRECT-003, §13.7, §13.13) |
+| `FDB_CONFIG`, `FDB5_CONFIG`, `FDB_CONFIG_FILE`, `FDB5_CONFIG_FILE` | replaced by `config`, with a warning | `config`, `user_config` | passed to `FDB(config, user_config)`, which takes precedence inside FDB [verified]; `config` is exported as YAML text in `FDB5_CONFIG` (a file's mapping with relative paths made absolute against the cwd, `backend.config_text`) plus, for a file, its path in `FDB_CONFIG_FILE`, for direct access (FR-DIRECT-003, §13.7, §13.13); the four variables are unset first if any of them names another FDB (ADR-038) |
+| `FDB_HOME`, `FDB_SCHEMA_FILE` | kept | – | read to find the schema when `config` is unset; never set |
 | `ECKIT_EXCEPTION_IS_SILENT` | kept | – | set to `1` if unset |
 | any | kept | `env` | explicit override |
 
@@ -476,11 +480,14 @@ last value is exported, for `ECCODES_DEFINITION_PATH` the last provider's direct
 end up first.
 
 The export for direct access (`_export_fdb_config`, the last step of the export under
-the lock) is what the plugin adds on its own: only when the environment names no FDB
-configuration at all, only the provider's own `config`, and never a second, different
-one — providers that disagree (tagged providers) remove what this process exported
-(never a value found in the environment) and export nothing for the rest of the
-process, since one process has one environment. The text form (`FDB5_CONFIG`) is the
+the lock) is what the plugin adds on its own: the provider's own `config`, and never a
+second, different one — providers that disagree (tagged providers) put the four
+variables back as this process found them and export nothing for the rest of the
+process, since one process has one environment. An environment that names *another* FDB
+does not win: all four variables are unset (fdb5's precedence would otherwise let a
+left-over `FDB_CONFIG` beat the exported `FDB5_CONFIG`, §13.7) and one warning per
+process names what was replaced, so that the jobs and the plugin cannot open two
+databases (ADR-038). The text form (`FDB5_CONFIG`) is the
 one both consumers read: fdb5 takes text before a file variable, and earthkit-data's
 `fdb` source looks at nothing else (§13.7, §13.13); `FDB_CONFIG_FILE` goes with it for
 tools that want the path. fdb5 has no variable for the user configuration (§13.7), so a
@@ -1186,6 +1193,73 @@ design round, provided requirements, architecture and code are updated together.
   nothing passes when the fields pre-exist (L-32), which is what the checked variants
   are for; R-17 narrows to outputs that opt into a local file; nothing in `src/` changes.
 
+### ADR-038 The workflow's FDB configuration wins in the job environment
+
+- Context: `_export_fdb_config` exported the provider's configuration only when none of
+  the four FDB configuration variables was set (FR-ENV-003's "the plugin adds what is
+  missing"). With direct access (ADR-035, ADR-037) the jobs open FDB themselves, so a
+  stale `FDB5_CONFIG` or `FDB_CONFIG_FILE` in a login profile or a site module file
+  sends the jobs' archives to another database while the plugin checks the one from
+  `--storage-fdb-config`. The run then fails with Snakemake's
+  `... (missing in storage)` and nothing above debug level says why; the fields are in
+  a database nobody looks at, and FDB cannot delete them.
+- Decision: when a provider has a `config` setting and the environment names a
+  *different* FDB, the workflow's configuration wins: all four variables are unset
+  (fdb5's precedence is `FDB_CONFIG` > `FDB5_CONFIG` > `FDB_CONFIG_FILE` >
+  `FDB5_CONFIG_FILE`, §13.7, so a left-over higher-precedence one would beat the export),
+  `FDB5_CONFIG` (and `FDB_CONFIG_FILE` for a file) is exported as before, and one
+  warning per process names what was replaced and why. Equal values (a spawned job, a
+  second provider with the same setting) stay silent; providers that disagree still
+  export nothing and now restore the environment as they found it.
+- Alternatives: keep the precedence and warn loudly (rejected: the trap stays, and a
+  workflow that cannot converge is expensive at a weather service); a setting
+  `export_config: always|missing|never` (rejected for now: a third policy for a case
+  where only one answer is correct; D-017 if a site needs it); documentation only
+  (rejected: the failure gives the user nothing to search for).
+- Status: accepted (reversible), 2026-09-17.
+- Consequences: FR-ENV-003's exception widens from "fills a gap" to "wins for the four
+  configuration variables"; `FDB_HOME` and `FDB_SCHEMA_FILE` are still left alone, so a
+  job that must reach another FDB passes `config=` to the direct API or opens
+  `pyfdb.FDB(config=...)` itself; the plugin and the jobs cannot look at two databases.
+
+### ADR-039 Spelling errors at construction for queries without wildcards
+
+- Context: FR-SPELL-001 runs on the first expansion of a storage object, i.e. from
+  `exists()` during DAG building. With `canonical_spelling=error` Snakemake renders the
+  resulting `WorkflowError` at the bottom of a ~160-line `ExceptionGroup`/`TaskGroup`
+  traceback through `snakemake/io/__init__.py`: a one-character fix looks like a crash.
+- Decision: a storage object whose query has no wildcards runs the spelling check in
+  `__post_init__`, where Snakemake reports `WorkflowError in file "Snakefile", line N`.
+  Only metkit's expansion of the request is used, which is language, not data, so no FDB
+  handle is opened (FR-CONF-005); the expansion is kept as the object's cached one.
+  A query with wildcards keeps the lazy check (its values are known at DAG time only),
+  and anything the expansion itself refuses (an invalid MARS request, a missing metkit
+  language) stays on the lazy path, so FR-ERR-003 is unchanged.
+- Alternatives: check in `postprocess_query` (rejected: it runs before the provider's
+  own objects exist and would have to expand queries Snakemake never turns into
+  objects); leave it lazy and document the traceback (rejected: the message is the fix).
+- Status: accepted (reversible), 2026-09-17.
+- Consequences: `warn` also warns earlier, still once per query per process; a
+  non-canonical query in a rule that never runs is now reported.
+
+### ADR-040 `--touch` is a no-op on FDB fields, not a refusal
+
+- Context: without `StorageObjectTouch`, `dag.py::check_touch_compatible` aborts the
+  *whole* workflow (§13.8), so the local outputs of a workflow with one FDB output
+  cannot be touched either, and the message invites the user to contribute a touch that
+  cannot exist: an FDB index timestamp is written when a field is archived and cannot
+  be set.
+- Decision: `StorageObject` implements `touch()` as a no-op that logs once per process.
+  Snakemake's touch executor then touches the local outputs, calls `managed_touch()`
+  for FDB outputs that exist in storage and reports the others as "not touched because
+  they don't exist" (`executors/touch.py`).
+- Alternatives: raise a WorkflowError naming FDB (rejected: it fails the run for the
+  local outputs, which is exactly what `--touch` was reached for); re-archive the fields
+  to refresh their timestamps (rejected: `--touch` must not write data).
+- Status: accepted (reversible), 2026-09-17.
+- Consequences: L-25 shrinks to the command-line-target half; `--touch` does not make an
+  FDB output up to date, which is harmless because reruns follow the fields (§8.10).
+
 ## 10. Quality requirements
 
 Quality scenarios are the non-functional requirements in
@@ -1530,7 +1604,12 @@ Committed in `tests/data/grib/ecmwf/`; pyfdb's schema is `tests/data/pyfdb-tests
   error, and mask parts of each other's output.
 - `--touch` fails upfront if an output's plugin lacks `StorageObjectTouch`
   (`dag.py:776-787`, called from `workflow.py:1364`); the check aborts the whole
-  workflow, so its local outputs cannot be touched either (L-25).
+  workflow, so its local outputs could not be touched either. With the interface
+  implemented (ADR-040), the touch executor touches the local outputs, calls
+  `managed_touch()` for storage outputs that exist in storage and warns
+  `Output files not touched because they don't exist` for the others
+  (`executors/touch.py`, `io/__init__.py::touch_storage_and_local`) [verified: the
+  direct workflow's `--touch` stage in `tests/test_direct.py`].
 - Command-line targets and `--cleanup-metadata` arguments go through path normalisation,
   which turns `fdb://…` into `fdb:/…`, so storage URIs cannot be named there (L-25,
   D-014).

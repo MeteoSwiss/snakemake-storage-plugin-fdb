@@ -25,6 +25,7 @@ from snakemake_interface_storage_plugins.settings import StorageProviderSettings
 from snakemake_interface_storage_plugins.storage_object import (
     StorageObjectGlob,
     StorageObjectRead,
+    StorageObjectTouch,
     StorageObjectWrite,
     retry_decorator,
 )
@@ -88,9 +89,15 @@ _REMOVE_WARNED: set[str] = set()
 _PARTIAL_WARNED: set[str] = set()
 # The FDB configuration this process exported for direct access (FR-DIRECT-003), as
 # {variable: value}, and whether providers disagreed on it (then nothing is exported).
+# In fdb5's own precedence order (architecture.md §13.7).
 FDB_CONFIG_VARS = ("FDB_CONFIG", "FDB5_CONFIG", "FDB_CONFIG_FILE", "FDB5_CONFIG_FILE")
 _FDB_EXPORTED: dict[str, str] | None = None
 _FDB_EXPORT_CONFLICT = False
+# The four variables as this process found them, to restore on a conflict (ADR-038).
+_FDB_ENV_BEFORE: dict[str, str] | None = None
+_FDB_REPLACED_WARNED = False
+# Whether ``--touch`` was already explained in this process (FR-IFACE-006).
+_TOUCH_NOTED = False
 _WARNED_LOCK = threading.Lock()
 FieldId = tuple[tuple[str, str], ...]  # one field of a query: its key=value pairs
 COVERAGE_MAX = 100_000  # fields enumerated for the input-set trigger (§8.10)
@@ -403,25 +410,33 @@ class StorageProvider(StorageProviderBase):
         §13.13), and a configuration file also as ``FDB_CONFIG_FILE`` for tools that
         want the path; fdb5 reads the text first, so both name the same FDB. A job then
         opens it with an unconfigured ``pyfdb.FDB()`` or ``from_source("fdb", ...)``
-        (fdb5 has no variable for the user configuration). A configuration the
-        environment already names is never overwritten, and providers with different
-        configurations (tagged providers) export nothing at all: one process has one
-        environment (architecture.md §8.3).
+        (fdb5 has no variable for the user configuration).
+
+        An environment that names a *different* FDB is replaced: all four variables are
+        unset (a left-over higher-precedence one would otherwise win over the exported
+        ``FDB5_CONFIG``, architecture.md §13.7) and one warning per process says so, so
+        that the jobs and the plugin cannot look at two databases (ADR-038,
+        FR-DIRECT-003). Providers with different configurations (tagged providers)
+        export nothing at all and put the environment back as they found it: one process
+        has one environment (architecture.md §8.3).
         """
-        global _FDB_EXPORTED, _FDB_EXPORT_CONFLICT
+        global _FDB_EXPORTED, _FDB_EXPORT_CONFLICT, _FDB_ENV_BEFORE
         exports = {}
         if text := config_text(self.config):
             exports["FDB5_CONFIG"] = text
         if isinstance(self.config, Path):
             exports["FDB_CONFIG_FILE"] = str(self.config)
-        if _FDB_EXPORT_CONFLICT or all(
-            os.environ.get(n) == v for n, v in exports.items()
-        ):
+        if _FDB_EXPORT_CONFLICT:
+            return
+        foreign = {
+            name: os.environ[name]
+            for name in FDB_CONFIG_VARS
+            if name in os.environ and os.environ[name] != exports.get(name)
+        }
+        if not foreign and all(os.environ.get(n) == v for n, v in exports.items()):
             return  # nothing to do: a spawned job, or the same configuration again
         if _FDB_EXPORTED is not None and _FDB_EXPORTED != exports:
-            for name, before in _FDB_EXPORTED.items():
-                if os.environ.get(name) == before:
-                    del os.environ[name]
+            self._restore_fdb_config()
             _FDB_EXPORTED, _FDB_EXPORT_CONFLICT = None, True
             self.logger.debug(
                 "FDB storage: providers in one process use different FDB "
@@ -429,16 +444,46 @@ class StorageProvider(StorageProviderBase):
                 "to the direct API"
             )
             return
-        if foreign := [n for n in FDB_CONFIG_VARS if n in os.environ]:
-            self.logger.debug(
-                f"FDB storage: {', '.join(foreign)} already set; not exporting "
-                f"{', '.join(exports)} for direct access"
-            )
-            return
+        if _FDB_ENV_BEFORE is None:
+            _FDB_ENV_BEFORE = {
+                name: os.environ[name] for name in FDB_CONFIG_VARS if name in os.environ
+            }
+        if foreign:
+            self._warn_replaced(foreign)
+            for name in FDB_CONFIG_VARS:
+                os.environ.pop(name, None)
         os.environ.update(exports)
         _FDB_EXPORTED = exports
         self.logger.debug(
             f"FDB storage: exported {', '.join(exports)} for direct FDB access"
+        )
+
+    @staticmethod
+    def _restore_fdb_config() -> None:
+        """The four configuration variables as this process found them (ADR-038)."""
+        before = _FDB_ENV_BEFORE or {}
+        for name in FDB_CONFIG_VARS:
+            if name in before:
+                os.environ[name] = before[name]
+            else:
+                os.environ.pop(name, None)
+
+    def _warn_replaced(self, foreign: Mapping[str, str]) -> None:
+        """One warning per process for a replaced foreign configuration (ADR-038)."""
+        global _FDB_REPLACED_WARNED
+        with _WARNED_LOCK:
+            if _FDB_REPLACED_WARNED:
+                return
+            _FDB_REPLACED_WARNED = True
+        named = ", ".join(
+            name if name.endswith("CONFIG") else f"{name}={value}"
+            for name, value in foreign.items()
+        )
+        mine = self.config if isinstance(self.config, Path) else "inline YAML"
+        self.logger.warning(
+            f"FDB storage: the environment named another FDB ({named}); replaced by "
+            f"the workflow's configuration ({mine}) so that jobs and the plugin use "
+            "the same FDB. Unset the variable to silence this."
         )
 
     @staticmethod
@@ -555,7 +600,9 @@ class StorageProvider(StorageProviderBase):
         return "fdb"
 
 
-class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
+class StorageObject(
+    StorageObjectRead, StorageObjectWrite, StorageObjectGlob, StorageObjectTouch
+):
     """One query: a MARS request mapped to one local GRIB file (FR-QUERY-002)."""
 
     provider: StorageProvider
@@ -597,6 +644,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         self._expansion: dict[str, list[str]] = {}
         self._no_mtime_warned = False
         parsed = self._parse()
+        self._check_spelling_early()
         if parsed is None or self.provider.is_normalised(self.query):
             return
         # Built by Snakemake from apply_wildcards(), bypassing postprocess_query:
@@ -690,6 +738,33 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     def _expected(self) -> int:
         """Expected field count ``E`` of the query."""
         return count_fields(self._expanded())
+
+    def _check_spelling_early(self) -> None:
+        """FR-SPELL-001 at construction for a query without wildcards (FR-ERR-006).
+
+        Snakemake then reports a spelling error against the Snakefile line that wrote
+        the query instead of raising it from ``exists()`` during DAG building, where it
+        arrives wrapped in a task group. Only metkit's expansion of the request is
+        needed, which is language, not data, so no FDB is opened (FR-CONF-005); a query
+        with wildcards is checked on first use, when its values are known, and anything
+        the expansion itself refuses stays on the lazy path (FR-ERR-003).
+        """
+        if self.provider.canonical_spelling == "ignore":
+            return
+        parsed = self._parse()
+        if parsed is None or parsed.has_wildcards():
+            return
+        try:
+            expanded = self.provider.backend.expand(parsed.to_request())
+        except Exception as e:
+            self.provider.logger.debug(
+                f"FDB storage: {self.query} is not expanded at construction ({e}); "
+                "the spelling check runs on first use"
+            )
+            return
+        self._check_spelling(expanded)
+        if expanded is not None:  # what _expanded() would cache
+            self._expansion, self._expansion_for = expanded, self.query
 
     def _check_spelling(self, expanded: dict[str, list[str]] | None) -> None:
         """FR-SPELL-001 on ``expanded`` (metkit's expansion of the request, if any)."""
@@ -1210,6 +1285,23 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             raise WorkflowError(f"remove_policy=error: {message}")
         if _first_time(_REMOVE_WARNED, self.query):
             self.provider.logger.warning(message)
+
+    def touch(self) -> None:
+        """``--touch``: nothing to do in FDB (FR-IFACE-006, L-25).
+
+        FDB index timestamps are set when a field is archived and cannot be changed,
+        and re-archiving to refresh them would write data. The fields are therefore
+        left as they are; Snakemake touches the local outputs of the same workflow,
+        which is what ``--touch`` is reached for. Logged once per process.
+        """
+        global _TOUCH_NOTED
+        with _WARNED_LOCK:
+            note, _TOUCH_NOTED = not _TOUCH_NOTED, True
+        if note:
+            self.provider.logger.info(
+                "FDB storage: --touch leaves FDB fields as they are; index timestamps "
+                "cannot be changed"
+            )
 
     # --- glob (requirements.md §2.8) --------------------------------------------------
 

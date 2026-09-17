@@ -75,6 +75,53 @@ rule steps:
 """
 
 
+SPELLING_SNAKEFILE = """\
+storage:
+    provider="fdb"
+
+
+rule t2m:
+    input:
+        storage.fdb(
+            "fdb://class=ea,expver=0002,stream=oper,date=20200101,time=0000,domain=g,"
+            "type=an,levtype=sfc,step=0,param=2t"
+        ),
+    output:
+        "t2m.grib",
+    shell:
+        "cp {input} {output}"
+"""
+
+
+def _cmd(config: Path) -> list:
+    return [
+        sys.executable, "-m", "snakemake",
+        "--storage-fdb-config", str(config),
+        "--storage-fdb-canonical-spelling", "error", "-c1", "--dry-run",
+    ]  # fmt: skip
+
+
+def test_workflow_spelling_error_names_the_snakefile(tmp_path, run_logged):
+    """FR-ERR-006: with canonical_spelling=error a query without wildcards fails where
+    it is written, as a plain WorkflowError, not as a task-group traceback out of the
+    first lookup (the check needs metkit only, so a dry run is enough)."""
+    run = run_logged(tmp_path / "logs")
+    run("init", [sys.executable, INIT_DEV_FDB, "--root", tmp_path / ".fdb"], tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "Snakefile").write_text(SPELLING_SNAKEFILE)
+    spelling = run(
+        "spelling",
+        _cmd(tmp_path / ".fdb" / "config.yaml"),
+        work,
+    )
+    assert spelling.returncode != 0
+    assert "WorkflowError in file" in spelling.log
+    assert "uses non-canonical spelling: param=2t (canonical: 167)" in spelling.log
+    assert "ExceptionGroup" not in spelling.log
+    assert len(spelling.log.splitlines()) < 20  # no traceback
+
+
 def _fields(config: Path) -> list[dict[str, str]]:
     from snakemake_storage_plugin_fdb.backend import Backend
 

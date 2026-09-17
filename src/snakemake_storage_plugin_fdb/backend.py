@@ -125,14 +125,27 @@ def resolve_config(value: str | None) -> Path | str | None:
     except yaml.YAMLError as e:
         raise WorkflowError(
             f"FDB configuration error: {value!r} is neither an existing file nor "
-            f"valid YAML: {e}{_tag_hint(value)}"
+            f"valid YAML: {e}{_path_hint(value)}{_tag_hint(value)}"
         ) from e
     if not isinstance(parsed, dict):
         raise WorkflowError(
             f"FDB configuration error: {value!r} is neither an existing file nor an "
-            f"inline YAML mapping{_tag_hint(value)}"
+            f"inline YAML mapping{_path_hint(value)}{_tag_hint(value)}"
         )
     return value
+
+
+def _path_hint(value: str) -> str:
+    """What a path-like setting resolved to, and against what (FR-CONF-009): a relative
+    path resolves against Snakemake's working directory, not the shell's."""
+    looks_like_yaml = "\n" in value or ": " in value
+    if looks_like_yaml or ("/" not in value and not value.endswith((".yaml", ".yml"))):
+        return ""
+    try:
+        resolved = os.path.abspath(value)
+    except (OSError, ValueError):
+        return ""
+    return f" (resolved to {resolved}, working directory {os.getcwd()})"
 
 
 def _tag_hint(value: str) -> str:

@@ -59,7 +59,21 @@ spaces:
 ```
 
 Without `config`, FDB's own environment applies (`FDB_CONFIG`, `FDB_CONFIG_FILE`,
-`FDB_HOME`). The plugin reads the schema named by the configuration to order query keys
+`FDB_HOME`). With `config`, the plugin also puts that configuration in the environment
+(`FDB5_CONFIG`, and `FDB_CONFIG_FILE` for a file) so that jobs reading or writing FDB
+themselves reach the same database. If your shell already names another FDB in one of
+those variables, the workflow's configuration wins and the log says so once:
+
+```text
+FDB storage: the environment named another FDB (FDB5_CONFIG); replaced by the workflow's
+configuration (/path/to/fdb/config.yaml) so that jobs and the plugin use the same FDB.
+Unset the variable to silence this.
+```
+
+Unset the variable to silence the warning; a job that really must read another FDB opens
+it itself (`pyfdb.FDB(config=...)`).
+
+The plugin reads the schema named by the configuration to order query keys
 (see [Writing queries](#writing-queries)). A relative path resolves against
 Snakemake's working directory, which is the directory the command was typed in unless
 `-d`/`--directory` moves it elsewhere; with `-d` the path must be relative to that
@@ -349,8 +363,10 @@ rule steps:
 text in `FDB5_CONFIG` (and, for a configuration file, its path in `FDB_CONFIG_FILE`
 too) before the FDB libraries load, and Snakemake carries the plugin's own settings into
 every job as `SNAKEMAKE_STORAGE_FDB_*`. A configuration the environment already carries
-is never overwritten, and providers of one process with different configurations (tagged
-providers) export nothing — such a workflow must configure its jobs itself. FDB has no
+for another FDB is replaced, with a warning (see
+[Choosing the FDB](#choosing-the-fdb)), and providers of one process with different
+configurations (tagged providers) export nothing — such a workflow must configure its
+jobs itself. FDB has no
 environment variable for a `user_config`, so a plain `pyfdb.FDB()` does not see one.
 
 With earthkit-data installed the same read is one call, and no argument either: its
@@ -767,10 +783,13 @@ ones.
 
 Most of Snakemake works unchanged with FDB objects; these are the exceptions.
 
-- **`--touch`** is refused for the *whole* workflow if a single output is an FDB query:
-  `Touching output files is impossible. The workflow uses remote storage but the storage
-  plugin does not support the touch operation.` Local outputs of that workflow cannot be
-  touched either.
+- **`--touch`** works, but it cannot change an FDB field: index timestamps are written
+  when a field is archived. The local outputs of the workflow are touched, FDB outputs
+  are left as they are (`FDB storage: --touch leaves FDB fields as they are; index
+  timestamps cannot be changed`), and FDB outputs whose fields are not in FDB are
+  reported as `Output files not touched because they don't exist`. Since reruns follow
+  the fields a query names, not their timestamps, this is enough to stop a cosmetic
+  Snakefile edit from rebuilding everything.
 - **FDB queries cannot be command-line targets**, because Snakemake sends targets
   through path normalisation and `fdb://...` becomes `fdb:/...`
   (`MissingRuleException: No rule to produce fdb:/class=...`). Drive such a workflow by
@@ -859,7 +878,7 @@ explain the two example workflows.
 | A query you know is complete is reported partial, or missing | A database directory under the FDB root may be unreadable: FDB skips it silently. Check the permissions of the `root/<class>:<expver>:...` directories. |
 | `FDB I/O error for ...: ... (check permissions, free space and the roots ...)` | The FDB root is unreadable, read-only or full. Check the roots in the configuration, the permissions and the free space. |
 | `FDB configuration error: Cannot open .../fdb5lib/etc/fdb/schema ... (no FDB configuration was given ...)` | No FDB configuration reached the plugin. Set `--storage-fdb-config`, `SNAKEMAKE_STORAGE_FDB_CONFIG` or `FDB_CONFIG_FILE`. |
-| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping` | Wrong path. Relative paths resolve against Snakemake's working directory (`-d`), not the directory the command was typed in. If the message ends with "looks like a tagged setting mangled by a spawned job", see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
+| `FDB configuration error: '...' is neither an existing file nor an inline YAML mapping (resolved to ..., working directory ...)` | Wrong path; the message says what it resolved to. Relative paths resolve against Snakemake's working directory (`-d`), not the directory the command was typed in. If the message ends with "looks like a tagged setting mangled by a spawned job", see [Tagged settings and spawned jobs](#tagged-settings-and-spawned-jobs). |
 | `FDB configuration error: Cannot open ...` / `No writable roots available ...` | The schema file or database root in the FDB configuration does not exist. |
 | `GRIB keys do not match the FDB schema for ...: Keywords not used: {number}` | The GRIB carries a key the schema does not accept. Use a schema with that key (e.g. `number?`), or `archive_mode=identifier`. |
 | `...: cannot determine <key> for message 1 ...` | Identifier mode with a multi-rule schema. Use `archive_mode=native` or add the key to the query. |
@@ -868,14 +887,14 @@ explain the two example workflows.
 | `... has 2 fields, the query expands to 3; nothing was archived` | The output file has the wrong number of fields. Fix the rule: a partial store could never satisfy the query anyway. |
 | `... message 1 of ... lacks quantile, which native archiving takes from the message ...` | The query names a key the GRIB does not carry. Set it in the GRIB, drop it from the query, or use `archive_mode=identifier`. |
 | An input with a key the fields lack is reported missing | Correct: `quantile=1:10` on fields without a quantile does not exist, even though FDB's `inspect` matches through the key. Drop the key or archive the fields with it. |
-| `Query ... uses non-canonical spelling: ...` | Use the canonical value shown (see [Canonical spelling](#canonical-spelling)). |
+| `Query ... uses non-canonical spelling: ...` | Use the canonical value shown (see [Canonical spelling](#canonical-spelling)). With `canonical_spelling=error` a query without wildcards fails at the Snakefile line that wrote it; a query with wildcards fails when the rule's inputs are first looked up. |
 | `FDB glob pattern ... needs constant values for class (glob_required_keys)` | Give `class` a constant value, or change `glob_required_keys`. |
 | `METKIT_HOME=... has no share/metkit/language.yaml ...` | Point `metkit_home` or `METKIT_HOME` at a complete metkit home (FDB would hang otherwise). |
 | `WARNING: definitions.edzw version ... is NOT compatible ...` | Harmless; set `ECCODES_VERSION_CHECK_OFF=1`. |
 | A log file is truncated or full of NUL bytes | A job decoded GRIB with the COSMO definitions while its stderr went to that file; use a per-job log. |
 | Site definitions seem to be ignored | `eccodes` was imported before the provider was set up; export `ECCODES_DEFINITION_PATH` before starting Snakemake. |
 | `--delete-all-output` leaves data in FDB | By design, and the producing job is not rerun afterwards (see [Removing outputs](#removing-outputs)). Use `--forceall`. |
-| `Touching output files is impossible ...` | `--touch` is not supported and the check covers the whole workflow (see [Snakemake flags and features](#snakemake-flags-and-features)). |
+| `--touch` left the FDB outputs alone | By design: FDB index timestamps cannot be set (see [Snakemake flags and features](#snakemake-flags-and-features)). The local outputs were touched. |
 | `MissingRuleException: No rule to produce fdb:/...` | An FDB query was used as a command-line target; Snakemake normalised it. Target the rule by name or a local file. |
 | `Flags ({'storage_object': ...}) ... given to expand() are invalid` | `expand()` was applied outside `storage.fdb(...)`; swap them (see [Several fields in one rule](#several-fields-in-one-rule)). |
 | `Job ... completed successfully, but some output files are missing ... consider to increase the wait time with --latency-wait: fdb://... (in storage) (missing locally, parent dir contents: )` | A job archived its output itself but the output is declared neither `retrieve=False` nor `touch()`, so Snakemake waits for a local GRIB file that no one writes. The latency is not the problem, and the message names no FDB cause: for an `fdb://` output, `(missing locally, parent dir contents: )` means the declaration is wrong. Declare the output `storage.fdb(query, retrieve=False)` (see [Archiving in the job](#archiving-in-the-job)). |
@@ -885,11 +904,12 @@ explain the two example workflows.
 | `Detected unexpected empty output files ...` for an FDB output | `ensure(non_empty=True)` cannot work on FDB outputs; drop it. |
 | "Nothing to be done" although the FDB inputs are gone | Snakemake only re-evaluates inputs of jobs it already plans to run, so a workflow whose inputs were wiped (retention, `fdb wipe`) while its outputs exist reports success. Force the rerun, or check the inputs yourself. |
 | A rule reruns after a query edit although the fields are unchanged | Input tracking by lookup is off; see the warning in the log and [Reruns](#reruns). |
+| `Job ... completed successfully, but some output files are missing ... fdb://... (missing in storage)` | The job of a `retrieve=False` output did not archive every field of its query: wrong keys (`expver`, `time`, `param`), too few fields, another FDB (check `env \| grep FDB`; see [Choosing the FDB](#choosing-the-fdb)), or no `flush()` in a long-lived process. The latency is not the problem, so `--latency-wait` does not help. Re-run with `--verbose` for the plugin's `n of N fields found in FDB; missing: ...` line, or declare the output `touch(storage.fdb(query))`, which names the missing fields at once (see [The checked variant](#the-checked-variant-touch)). |
 
 ## Limitations
 
-- Not usable as `--default-storage-provider`; files only; no `--touch` (refused for the
-  whole workflow); FDB queries cannot be command-line targets.
+- Not usable as `--default-storage-provider`; files only; `--touch` cannot refresh an
+  FDB field; FDB queries cannot be command-line targets.
 - No deletion; reruns mask old fields.
 - Modification times have one-second resolution.
 - A narrowed query does not rerun, so the output — and any local file derived from it —
