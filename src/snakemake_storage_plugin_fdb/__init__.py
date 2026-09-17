@@ -1078,9 +1078,7 @@ class StorageObject(
         """
         since = self.provider.run_time
         fresh = sum(1 for f in fields if self._field_time(f) >= since)
-        summary.RUN.record_lookup(self.query, len(fields) - fresh)
-        if fresh:
-            summary.RUN.record_archive(self.query, fresh)
+        summary.RUN.record_lookup(self.query, len(fields) - fresh, fresh)
 
     def _record_incomplete(self, fields: list[Field]) -> None:
         """Remember an incomplete lookup for the end-of-run summary (FR-IFACE-007).

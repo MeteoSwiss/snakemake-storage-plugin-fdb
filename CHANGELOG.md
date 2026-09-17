@@ -7,6 +7,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The run summary no longer counts fields another process archived in the FDB clock
+  second the run started in as archived by the run (it counted a development FDB seeded
+  just before the run; CI caught it on one interpreter). Fresh fields of a query count
+  once a later lookup sees more of them than an earlier one did.
+
 ## [0.5.0] - 2026-09-17
 
 Usability: the plugin says what a run does in FDB, fails early and clearly, and the

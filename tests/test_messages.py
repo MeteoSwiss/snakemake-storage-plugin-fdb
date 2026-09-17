@@ -215,6 +215,21 @@ def test_summary_counts_archived_and_masked_fields():
     assert summary.MASK_NOTE in lines[0]
 
 
+def test_summary_counts_a_direct_output_only_after_its_lookups_change():
+    """L-35: fields that look fresh in the first lookup of a query (archived by another
+    process in the second the run started) are not the run's; a later lookup that sees
+    more fresh fields than an earlier one is."""
+    run = summary.RunState()
+    run.record_lookup("fdb://seeded", 0, 6)  # an input seeded in the same second
+    run.record_lookup("fdb://seeded", 0, 6)
+    run.record_lookup("fdb://out", 0, 0)  # the output before its job
+    run.record_lookup("fdb://out", 0, 3)  # and after it
+    run.record_lookup("fdb://forced", 3, 0)  # a forced rerun: old fields first
+    run.record_lookup("fdb://forced", 0, 3)  # then the fresh ones
+    (line,) = run.lines()
+    assert line.startswith("6 fields archived (2 queries), 3 of which masked")
+
+
 def test_summary_lists_incomplete_queries_and_omits_produced_ones():
     run = summary.RunState()
     run.record_incomplete("fdb://a", _incomplete())

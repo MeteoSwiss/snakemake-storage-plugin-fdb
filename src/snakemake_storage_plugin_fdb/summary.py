@@ -57,6 +57,7 @@ class RunState:
 
     archived: dict[str, int] = field(default_factory=dict)
     before: dict[str, int] = field(default_factory=dict)
+    seen: dict[str, int] = field(default_factory=dict)  # fresh fields per lookup
     incomplete: dict[str, Incomplete] = field(default_factory=dict)
     archive_modes: set[str] = field(default_factory=set)
     direct: set[str] = field(default_factory=set)  # archived by the job itself
@@ -77,10 +78,24 @@ class RunState:
             self.incomplete.pop(query, None)
             (self.direct if direct else self.plugin).add(query)
 
-    def record_lookup(self, query: str, before: int) -> None:
-        """``before`` fields of ``query`` are older than this run's reference time."""
+    def record_lookup(self, query: str, before: int, fresh: int = 0) -> None:
+        """A lookup saw ``before`` fields older than this run's reference time and
+        ``fresh`` fields from it.
+
+        Fresh fields count as archived by this run only once a later lookup of the
+        same query sees more of them than an earlier one did: the reference time is a
+        whole FDB clock second, so a field another process archived in the second the
+        run started looks fresh too, and it must not be counted (L-35). An output the
+        run produces is always looked up before its job (nothing or old fields) and
+        after it (fresh fields), which is the transition counted here; a store of the
+        plugin's own step records itself (``record_archive``).
+        """
         with _LOCK:
             self.before[query] = max(self.before.get(query, 0), before)
+            previous = self.seen.get(query)
+            self.seen[query] = max(self.seen.get(query, 0), fresh)
+        if previous is not None and fresh > previous:
+            self.record_archive(query, fresh)
 
     def record_incomplete(self, query: str, incomplete: Incomplete) -> None:
         with _LOCK:
