@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-17
+
 ### Fixed
 
 - The run summary no longer counts fields another process archived in the FDB clock
@@ -346,7 +348,8 @@ First release.
 - Documentation: a user guide, a reference and contributing notes under `docs/`, and a
   rewritten README with a quick start.
 
-[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MeteoSwiss/snakemake-storage-plugin-fdb/compare/v0.3.0...v0.3.1

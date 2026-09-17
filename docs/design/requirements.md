@@ -2,7 +2,7 @@
 
 Status: living document, kept consistent with the code and with
 [`architecture.md`](architecture.md) (see [`contributing.md`](../contributing.md)).
-Structure loosely follows ISO/IEC/IEEE 29148. The plugin is pre-1.0 (version 0.5.0, not
+Structure loosely follows ISO/IEC/IEEE 29148. The plugin is pre-1.0 (version 0.5.1, not
 on PyPI).
 
 ## 1. Introduction
