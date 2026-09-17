@@ -456,20 +456,71 @@ with open(snakemake.input[0], "rb") as fi, open(snakemake.output[0], "w") as fo:
         eccodes.codes_release(handle)
 ```
 
-### Direct access: plain libraries, no local files
+### Direct access: no local files
 
 A `run:` or `script:` body can read the fields straight from FDB and archive straight
-into FDB with **plain pyfdb, eccodes or earthkit-data**; no rule imports the plugin
-([user guide](user-guide.md#direct-access-from-run-and-script-rules)). Flag every FDB
-object the job handles itself `retrieve=False`, input or output alike — an input so
-flagged reaches the job as the query string instead of a path — and derive
-the MARS request from that string in the job (strip `fdb://`, split on `,` and `=`; `/`
-lists stay strings, which pyfdb and earthkit-data take as MARS lists). The provider puts
-its FDB configuration in the job environment, so `pyfdb.FDB()` and
-`from_source("fdb", request)` need no arguments. Nothing GRIB-shaped is written under
-`.snakemake/storage`, which the rules below print (`GRIB FILES: 0`).
+into FDB, with no GRIB file anywhere ([user
+guide](user-guide.md#direct-access-from-run-and-script-rules)). Both forms below flag
+every FDB **input** the job reads itself `retrieve=False`, which hands the job the query
+string instead of a local path; they differ in what the job's code imports. The rules
+below print what is under `.snakemake/storage` (`GRIB FILES: 0`).
 [`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) is a whole
 workflow built this way.
+
+The first form is a `run:` body with the plugin's optional `api`: the Snakefile already
+imports the plugin, so the body may too. `api.messages(input[0])` reads the query's
+fields one message at a time, and `api.archive(output[0], ...)` runs the checks of a
+file-based store (field count, every message's keys against the query, duplicates)
+**before** the first archive, so a failed check archives nothing. The output keeps its
+plain declaration: the job writes an archive marker at its local path, which the store
+step reads.
+
+<!-- pattern: run-api; expect: Storing in storage: fdb://class=ea,expver=0022; expect: GRIB FILES: 0 -->
+```snakemake
+storage:
+    provider="fdb"
+
+
+QUERY = (
+    "fdb://class=ea,expver={expver},stream=oper,date=20200101,time=0000,domain=g,"
+    "type=an,levtype=sfc,step=0/6/12,param=167"
+)
+
+
+rule shift_expver:
+    input:
+        storage.fdb(QUERY.format(expver="0001"), retrieve=False),
+    output:
+        storage.fdb(QUERY.format(expver="0022")),
+    run:
+        import sys
+        from pathlib import Path
+
+        import eccodes
+
+        from snakemake_storage_plugin_fdb import api
+
+        def shifted():
+            """One message at a time: nothing is held but the message in hand."""
+            for message in api.messages(input[0]):
+                handle = eccodes.codes_new_from_message(message)
+                eccodes.codes_set(handle, "expver", "0022")
+                yield eccodes.codes_get_message(handle)
+                eccodes.codes_release(handle)
+
+        marker = api.archive(output[0], shifted())  # checks, archives, writes the marker
+
+        storage = Path(".snakemake/storage")
+        grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
+        print("GRIB FILES:", len(grib), "->", marker.fields, "fields", file=sys.stderr)
+```
+
+The second form is for code that must not depend on the plugin — a `script:` file, a
+notebook, a model container: **plain pyfdb, eccodes or earthkit-data**, with the MARS
+request derived from the query string in the job (strip `fdb://`, split on `,` and `=`;
+`/` lists stay strings, which pyfdb and earthkit-data take as MARS lists). The provider
+puts its FDB configuration in the job environment, so `pyfdb.FDB()` and
+`from_source("fdb", request)` need no arguments.
 
 <!-- pattern: run-plain; expect: STEPS: 0 6 12; expect: GRIB FILES: 0 -->
 ```snakemake
@@ -654,58 +705,15 @@ rule shift_expver:
         fdb.flush()  # before the job ends: the store step looks the fields up
 ```
 
-Nothing is checked before such an archive either, so a job that writes the wrong fields
-puts them in FDB and the store step's post-check reports them afterwards. Where that
-matters, the plugin's optional `api.archive` runs the checks of a file-based store first
-(field count, every message's keys against the query, duplicates), archives nothing if
-one fails and leaves an archive marker instead of an empty file. Such an output keeps
-the plain declaration, so that the job gets the local path to write the marker at:
+Where the plain form's missing checks matter, use `api.archive` as in the first pattern
+of this section: it is the only variant that refuses a wrong set of messages before
+anything reaches FDB.
 
-<!-- pattern: run-api-archive; expect: Storing in storage: fdb://class=ea,expver=0022; expect: GRIB FILES: 0 -->
-```snakemake
-storage:
-    provider="fdb"
-
-
-QUERY = (
-    "fdb://class=ea,expver={expver},stream=oper,date=20200101,time=0000,domain=g,"
-    "type=an,levtype=sfc,step=0/6/12,param=167"
-)
-
-
-rule shift_expver:
-    input:
-        storage.fdb(QUERY.format(expver="0001"), retrieve=False),
-    output:
-        storage.fdb(QUERY.format(expver="0022")),
-    run:
-        import sys
-        from pathlib import Path
-
-        import eccodes
-
-        from snakemake_storage_plugin_fdb import api
-
-        def shifted():
-            """One message at a time: nothing is held but the message in hand."""
-            for message in api.messages(input[0]):
-                handle = eccodes.codes_new_from_message(message)
-                eccodes.codes_set(handle, "expver", "0022")
-                yield eccodes.codes_get_message(handle)
-                eccodes.codes_release(handle)
-
-        marker = api.archive(output[0], shifted())  # checks, archives, writes the marker
-
-        storage = Path(".snakemake/storage")
-        grib = [p for p in storage.rglob("*.grib") if p.open("rb").read(4) == b"GRIB"]
-        print("GRIB FILES:", len(grib), "->", marker.fields, "fields", file=sys.stderr)
-```
-
-Two things such a job does not get: the plugin's mapped error messages — a failure in
-plain `pyfdb` surfaces as fdb5/eckit text such as `Failed system call: mkdir … (Success)`
-— and the store-level settings `archive_mode` and `identifier_check`, whose store step
-never runs (only `api.archive` reads them). A rule may also have a direct FDB output and
-a local file output together; the two are then checked independently.
+Two things a plain-library job does not get: the plugin's mapped error messages — a
+failure in plain `pyfdb` surfaces as fdb5/eckit text such as `Failed system call: mkdir
+… (Success)` — and the store-level settings `archive_mode` and `identifier_check`, whose
+store step never runs (only `api.archive` reads them). A rule may also have a direct FDB
+output and a local file output together; the two are then checked independently.
 
 With `retrieve=False` outputs nothing is written under `.snakemake/storage` at all; with
 `touch()` or `api.archive` the only file there is the output's empty file or marker,
@@ -1018,6 +1026,7 @@ patterns add to that table:
 | [writing outputs](#writing-outputs) | a rerun archives the fields again and masks the previous copy; the output keeps existing, so `--delete-all-output` does not make the producer rerun (use `--forceall`, see [removing outputs](user-guide.md#removing-outputs)) |
 | [one field, one rule](#one-field-one-rule) | per-step jobs rerun per step; a whole-forecast rule reruns as one job. Extending the step list rebuilds the whole forecast with a multi-step query and only the new step with a `{step}` wildcard in the output query, at the price of more jobs and more FDB round trips |
 | [a chain through FDB](#a-chain-through-fdb) | re-archiving the first query reruns the whole chain, one job per link |
+| [direct access](#direct-access-no-local-files) | a second experiment (a new `expver` in the output queries) reruns its own producers only — but the local artefacts it feeds must carry that key as a wildcard too (`metrics/{expver}/...`), or the second run overwrites the first one's results and nothing recomputes them; see [`examples/forecast-evaluation/`](../examples/forecast-evaluation/README.md) and [reruns](user-guide.md#reruns) |
 
 Two edits deserve care, because nothing flags them: a **narrowed input** query reruns
 nothing, so the output keeps the extra fields the wider query produced (see

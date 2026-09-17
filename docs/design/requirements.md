@@ -1190,21 +1190,27 @@ fetcher (`fetch_ogd_samples.py`); `docs/sites/meteoswiss.md` documents them.
 #### FR-DEV-003 Forecast-evaluation example
 
 `examples/forecast-evaluation/` is a generic workflow whose every rule reads and writes
-FDB directly (§2.15): a dummy truth and an "ML model" (one job each per initialisation
-time), a verification and an animation rule (one job per initialisation time and
-parameter) and a `scorecard` rule aggregating the local metrics files, with every FDB
-object declared `retrieve=False` — inputs the jobs read themselves and outputs they
-archive themselves with plain pyfdb (FR-DIRECT-005) — and the GRIB template read from
-FDB too, so it needs no file outside its directory. Its configuration values are
-validated where the Snakefile is read, so a mistyped parameter or initialisation time
-gives a sentence instead of a traceback. It
+FDB directly (§2.15): a dummy truth and an "ML model" (one job per initialisation time,
+and per model checkpoint for the model), a verification and an animation rule (one job
+per experiment, initialisation time and parameter) and a `scorecard` rule aggregating
+the local metrics files, with every FDB object declared `retrieve=False` — inputs the
+jobs read themselves and outputs they archive themselves with plain pyfdb
+(FR-DIRECT-005) — and the GRIB template read from FDB too, so it needs no file outside
+its directory. Its configuration values are validated where the Snakefile is read, so a
+mistyped parameter or initialisation time gives a sentence instead of a traceback. Every
+checkpoint of `model.checkpoints` is one experiment with an `expver` of its own, and that
+`expver` is a wildcard of every local artefact path
+(`metrics/{expver}/{init_time}/{param}.csv`), so that two experiments coexist instead of
+overwriting one another and the scorecard compares them. It
 needs a development FDB (FR-DEV-001, `--seed --variants`) and the `examples` dependency
 group (earthkit-data, matplotlib).
 
 - Rationale: one runnable workflow showing what the plugin is for — no local copies,
-  reruns by lookup (FR-RERUN-002), FDB as the only data store — and the aggregation
+  reruns by lookup (FR-RERUN-002), FDB as the only data store — the aggregation
   shape that keeps a summary of the declared set exact under those rerun semantics
-  (L-33).
+  (L-33), and the shape rule that follows from FDB's versioning: every FDB key that
+  distinguishes two runs of the same workflow is a wildcard of the local artefact paths
+  too, since FDB keeps both copies while a local path would keep only the last one.
 - Verification: test `tests/test_evaluation_example.py` (skips without the group).
 
 ### 2.15 Direct access from rule bodies

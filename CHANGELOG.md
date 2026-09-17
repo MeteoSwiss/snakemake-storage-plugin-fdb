@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation teaching order for Python rules: a `run:` body uses the optional `api`
+  (`api.messages(input[0])`, `api.archive(output[0], messages)`) with a plain output
+  declaration, and plain `pyfdb`/`eccodes`/earthkit-data come second, as the portable
+  form for `script:` files and code that must not import the plugin. An input a job
+  reads itself is declared `retrieve=False` in both forms. `docs/patterns.md` leads its
+  direct-access section with the `api` pattern.
+- `examples/forecast-evaluation/`: `model.checkpoints` is a list, one experiment per
+  checkpoint, and the `expver` is a wildcard of every local artefact path
+  (`metrics/{expver}/{init_time}/{param}.csv`,
+  `animations/{expver}/{init_time}/{param}.gif`); `scorecard.csv` compares the
+  experiments, with a `mean` row per (expver, param, step). Adding a checkpoint runs the
+  model, the verification and the animation for the new experiment only; the truth is
+  shared and the previous experiment's files are untouched.
+
+### Documentation
+
+- The rule behind that change, in the user guide's "Reruns" and in the patterns' rerun
+  table: every FDB key that distinguishes two runs of the same workflow must also be a
+  wildcard in the local artefact paths.
+- A wildcard in a query must expand to a MARS value ("Writing queries"), with the
+  example's `{init_time}` → `{date}`/`{time}` conversion as the illustration;
+  `--keep-storage-local-copies` while iterating by hand ("When a local file is still
+  needed"); a bare `"fdb://..."` string is a filename unless it is wrapped in
+  `storage.fdb(...)` ("Concepts"); `-R <rule>` reruns every job of the rule even with a
+  single target, and a single FDB job cannot be targeted ("Snakemake flags and
+  features").
+- The `touch()` check does not cover the fields a *failed* job archived: the rule is
+  never scheduled again, so no check runs. The example's README says what to do instead.
+
 ## [0.4.0] - 2026-09-17
 
 The forecast-evaluation example, `retrieve=False` for direct outputs, and the

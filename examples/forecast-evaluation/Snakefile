@@ -1,7 +1,8 @@
 """A dummy forecast-evaluation pipeline on a development FDB (../../.fdb).
 
     uv run snakemake --profile profile -c4
-    uv run snakemake --profile profile -c1 metrics/2020-01-04T00:00/167.csv   # any init time
+    uv run snakemake --profile profile -c1 metrics/d2bf/2020-01-04T00:00/167.csv
+                                           # <expver>/<any init time>/<param>
 
 All fields are read from and written to FDB directly, with plain pyfdb, eccodes and
 earthkit-data: no rule sees a local GRIB file and nothing here imports the storage
@@ -16,20 +17,25 @@ Stages, all data passing through FDB:
     truth      random analyses (type=an) for the requested params and steps, one job
                  per initialisation time -> expver=<truth_expver>
     run_model  the "ML model": reads the truth at step 0 as initial condition, writes
-                 forecasts (type=fc), one job per initialisation time
+                 forecasts (type=fc), one job per (init time, checkpoint)
                  -> expver=<hash of the model checkpoint>
-    verify     RMSE of the forecast against the truth, one job per (init time, param)
-                 -> metrics/{init_time}/{param}.csv
-    animate    one GIF per (init time, param), a frame per step
-                 -> animations/{init_time}/{param}.gif
+    verify     RMSE of the forecast against the truth, one job per (expver, init time,
+                 param) -> metrics/{expver}/{init_time}/{param}.csv
+    animate    one GIF per (expver, init time, param), a frame per step
+                 -> animations/{expver}/{init_time}/{param}.gif
     scorecard  one job over all the metrics files -> scorecard.csv
+
+Every model checkpoint of config.yaml is one experiment, and its `expver` is a wildcard
+of every local path: **every FDB key that distinguishes two runs of the same workflow
+must also be a wildcard in the local artefact paths**, or the second run overwrites the
+first one's results while FDB keeps both copies (see the user guide, "Reruns").
 
 The local artefacts mirror the declared granularity on purpose, and the summary
 aggregates *local* files rather than FDB inputs: reruns of an FDB input follow the
 fields a query names, so narrowing `params` reruns nothing, whereas the set of local
 files `scorecard` reads changes and Snakemake's own input-set trigger fires.
 
-config.yaml decides the init times, params, steps and the model checkpoint. The
+config.yaml decides the init times, params, steps and the model checkpoints. The
 params are what gets evaluated and what the model writes: adding one makes the model
 rerun (its FDB output is missing), removing one does not (input tracking by lookup)
 but does rebuild the scorecard.
@@ -90,13 +96,40 @@ require(
     "every init_times entry must be an ISO 8601 date and time to the minute, "
     "quoted, e.g. \"2020-01-01T00:00\"",
 )
+require(
+    config.get("model", {}).get("checkpoints"),
+    "model.checkpoints is empty; list at least one model checkpoint to evaluate",
+)
 
 PARAMS = [str(p) for p in config["params"]]
 STEPS = [int(s) for s in config["steps"]]
 TRUTH = str(config["truth_expver"])
-# The experiment version of the model: 4 hex characters of the checkpoint's hash.
-EXPVER = hashlib.sha256(config["model"]["checkpoint"].encode()).hexdigest()[:4]
-print(f"model checkpoint {config['model']['checkpoint']} -> expver={EXPVER}", file=sys.stderr)
+
+
+def expver_of(checkpoint):
+    """The experiment version of a checkpoint: 4 hex characters of its hash."""
+    return hashlib.sha256(str(checkpoint).encode()).hexdigest()[:4]
+
+
+# One experiment per checkpoint. The expver is the FDB key that tells two model runs
+# apart, so it is a wildcard of every local path as well (see the module docstring).
+CHECKPOINTS = {expver_of(c): str(c) for c in config["model"]["checkpoints"]}
+require(
+    len(CHECKPOINTS) == len(config["model"]["checkpoints"]),
+    "two model.checkpoints entries are the same, or their hashes collide",
+)
+require(
+    TRUTH not in CHECKPOINTS,
+    f"a model checkpoint hashes to truth_expver ({TRUTH}); rename it",
+)
+EXPVERS = list(CHECKPOINTS)
+for expver, checkpoint in CHECKPOINTS.items():
+    print(f"model checkpoint {checkpoint} -> expver={expver}", file=sys.stderr)
+
+
+# {expver} is one of the configured experiments, never the truth's or an old run's.
+wildcard_constraints:
+    expver="|".join(EXPVERS),
 
 # The GRIB message every generated field is a copy of: one field of the development FDB
 # (`init_dev_fdb.py --seed --variants`). Reading the template from FDB too keeps the
@@ -139,12 +172,17 @@ def per_param(expver, type_):
     return inputs
 
 
-def one_param(expver, type_):
-    """Input function factory: the one query of the job's {init_time} and {param}."""
+def one_param(type_, expver=None):
+    """Input function factory: the one query of the job's {init_time} and {param}.
+
+    Without an `expver` the job's own `{expver}` wildcard is used, which is how a
+    verification or an animation job stays inside its experiment.
+    """
 
     def inputs(wildcards):
         date, time = mars_date_time(wildcards.init_time)
-        return storage.fdb(query(expver, type_, date, time, wildcards.param), retrieve=False)
+        version = expver if expver is not None else wildcards.expver
+        return storage.fdb(query(version, type_, date, time, wildcards.param), retrieve=False)
 
     return inputs
 
@@ -167,7 +205,8 @@ rule all:
     input:
         "scorecard.csv",
         expand(
-            "animations/{init_time}/{param}.gif",
+            "animations/{expver}/{init_time}/{param}.gif",
+            expver=EXPVERS,
             init_time=config["init_times"],
             param=PARAMS,
         ),
@@ -201,6 +240,8 @@ rule truth:
 
 
 # The ML model: initial condition = truth at step 0, forecast = growing random error.
+# One job per (initialisation time, checkpoint): the output queries carry {expver}, so
+# adding a checkpoint to config.yaml runs the model for the new experiment only.
 # The input is the whole truth query (all steps), not a step=0 sub-query: Snakemake
 # links inputs to outputs by query text, so a sub-query of what `truth` produces would
 # have no producer in the DAG (docs/patterns.md, "One field, one rule"). The job reads
@@ -210,7 +251,7 @@ rule run_model:
         template=storage.fdb(TEMPLATE, retrieve=False),
         truth=per_param(TRUTH, "an"),
     output:
-        per_param_outputs(EXPVER, "fc"),
+        per_param_outputs("{expver}", "fc"),
     run:
         import numpy as np
         from dummy import (
@@ -222,13 +263,15 @@ rule run_model:
         )
 
         template = read_message(input.template)
-        rng = np.random.default_rng(int(hashlib.sha256(EXPVER.encode()).hexdigest()[:8], 16))
+        # Every checkpoint is a different model: seed the "weights" with its expver.
+        seed = int(hashlib.sha256(wildcards.expver.encode()).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
         for param, truth_query in zip(PARAMS, input.truth):
             initial = read_query(truth_query)[0]  # the analysis at step 0
             archive_fields(
                 build_fields(
                     template=template,
-                    expver=EXPVER,
+                    expver=wildcards.expver,
                     date=wildcards.date,
                     time=wildcards.time,
                     type_="fc",
@@ -239,13 +282,14 @@ rule run_model:
 
 
 # Verification: RMSE per step of one parameter, forecast against truth. One job per
-# (init time, parameter), so that the local files mirror the declared parameters.
+# (experiment, init time, parameter), so that the local files mirror the declared
+# experiments and parameters. The truth is shared: it carries no {expver}.
 rule verify:
     input:
-        forecast=one_param(EXPVER, "fc"),
-        truth=one_param(TRUTH, "an"),
+        forecast=one_param("fc"),
+        truth=one_param("an", TRUTH),
     output:
-        "metrics/{init_time}/{param}.csv",
+        "metrics/{expver}/{init_time}/{param}.csv",
     run:
         import numpy as np
         from dummy import read_query
@@ -256,19 +300,20 @@ rule verify:
             for s in STEPS:
                 rmse = float(np.sqrt(np.mean((fc[s] - an[s]) ** 2)))
                 print(
-                    f"{wildcards.init_time},{EXPVER},{wildcards.param},{s},{rmse:.4f}",
+                    f"{wildcards.init_time},{wildcards.expver},{wildcards.param},{s},{rmse:.4f}",
                     file=f,
                 )
 
 
-# The summary of the declared set: it aggregates the *local* metrics files, not the FDB
-# inputs. Narrowing `params` reruns no FDB producer (the fields are all still there),
-# but this rule's input set shrinks, so Snakemake reruns it and the scorecard matches
-# config.yaml again.
+# The summary of the declared set: it aggregates the *local* metrics files of every
+# experiment, not the FDB inputs. Narrowing `params` reruns no FDB producer (the fields
+# are all still there), but this rule's input set shrinks, so Snakemake reruns it and
+# the scorecard matches config.yaml again. Adding a checkpoint widens the same set.
 rule scorecard:
     input:
         expand(
-            "metrics/{init_time}/{param}.csv",
+            "metrics/{expver}/{init_time}/{param}.csv",
+            expver=EXPVERS,
             init_time=config["init_times"],
             param=PARAMS,
         ),
@@ -279,25 +324,28 @@ rule scorecard:
         for path in input:
             with open(path) as f:
                 rows += [line.strip().split(",") for line in f.readlines()[1:]]
-        by_param_step = {}
+        by_expver_param_step = {}
         for init_time, expver, param, step, rmse in rows:
-            by_param_step.setdefault((param, int(step)), []).append(float(rmse))
+            by_expver_param_step.setdefault((expver, param, int(step)), []).append(
+                float(rmse)
+            )
         with open(output[0], "w") as f:
             print("init_time,expver,param,step,rmse", file=f)
             for row in rows:
                 print(",".join(row), file=f)
-            # The mean over the initialisation times, one row per (param, step).
-            for (param, step), values in sorted(by_param_step.items()):
+            # The mean over the initialisation times, per (expver, param, step): the
+            # comparison of the experiments this workflow exists to make.
+            for (expver, param, step), values in sorted(by_expver_param_step.items()):
                 mean = sum(values) / len(values)
-                print(f"mean,{EXPVER},{param},{step},{mean:.4f}", file=f)
+                print(f"mean,{expver},{param},{step},{mean:.4f}", file=f)
 
 
-# Animation: one GIF per (init time, parameter), one frame per step.
+# Animation: one GIF per (experiment, init time, parameter), one frame per step.
 rule animate:
     input:
-        one_param(EXPVER, "fc"),
+        one_param("fc"),
     output:
-        "animations/{init_time}/{param}.gif",
+        "animations/{expver}/{init_time}/{param}.gif",
     run:
         import matplotlib
 
@@ -316,7 +364,8 @@ rule animate:
         def frame(step):
             image.set_data(data[step].reshape(GRID))
             title.set_text(
-                f"{wildcards.init_time} expver={EXPVER} param={wildcards.param} step={step}"
+                f"{wildcards.init_time} expver={wildcards.expver} "
+                f"param={wildcards.param} step={step}"
             )
             return [image]
 

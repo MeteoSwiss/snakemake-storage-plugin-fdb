@@ -13,8 +13,9 @@ Logs are written to ``<tmp>/logs/``. The stages cover the documented behaviour: 
 run, a second run with nothing to do, widening ``params`` (the model reruns because its
 FDB output is missing), narrowing them again (no FDB producer reruns — input tracking by
 lookup, FR-RERUN-002 — but ``scorecard`` does, because it aggregates one local file per
-parameter, L-33) and a new model checkpoint (a new ``expver``: the model and everything
-downstream rerun, the truth does not).
+parameter, L-33) and a second model checkpoint (a second experiment: its expver is a
+wildcard of every local path, so the model, the verification and the animation run for
+it alone, the truth is shared and the first experiment's files are untouched).
 """
 
 import hashlib
@@ -34,7 +35,7 @@ SAMPLES = REPO / "tests" / "data" / "grib" / "ecmwf"
 INIT_TIMES = ["2020-01-01T00:00", "2020-01-02T12:00"]
 STEPS = [0, 6, 12]
 CHECKPOINT = "unet-v3-2026-08.ckpt"
-NEW_CHECKPOINT = "unet-v4-2026-09.ckpt"
+SECOND_CHECKPOINT = "unet-v4-2026-09.ckpt"
 HEADER = "init_time,expver,param,step,rmse"
 
 
@@ -60,12 +61,12 @@ def _missing() -> str | None:
 pytestmark = pytest.mark.skipif(_missing() is not None, reason=_missing() or "")
 
 
-def _config(params: list[int], checkpoint: str = CHECKPOINT) -> dict:
+def _config(params: list[int], checkpoints: list[str] | None = None) -> dict:
     return {
         "init_times": INIT_TIMES,
         "params": params,
         "steps": STEPS,
-        "model": {"checkpoint": checkpoint},
+        "model": {"checkpoints": checkpoints or [CHECKPOINT]},
         "truth_expver": "0002",
     }
 
@@ -95,7 +96,17 @@ def _rows(path: Path) -> list[list[str]]:
     return [line.split(",") for line in lines[1:]]
 
 
-def _results(example: Path, params: list[int]) -> dict[tuple[str, str], object]:
+def _artefacts(example: Path, expver: str, params: list[int]) -> dict[str, Path]:
+    """The local artefacts of one experiment, by path relative to the workflow."""
+    paths = []
+    for init_time in INIT_TIMES:
+        for param in params:
+            paths.append(example / "metrics" / expver / init_time / f"{param}.csv")
+            paths.append(example / "animations" / expver / init_time / f"{param}.gif")
+    return {str(p.relative_to(example)): p for p in paths}
+
+
+def _results(example: Path, expver: str, params: list[int]) -> dict:
     """Per (init time, param): the rows of its CSV and the size of its GIF.
 
     Read while the run that produced them is the last one: the later stages overwrite
@@ -104,24 +115,24 @@ def _results(example: Path, params: list[int]) -> dict[tuple[str, str], object]:
     results: dict[tuple[str, str], object] = {}
     for init_time in INIT_TIMES:
         for param in params:
-            rows = _rows(example / "metrics" / init_time / f"{param}.csv")
-            gif = example / "animations" / init_time / f"{param}.gif"
+            rows = _rows(example / "metrics" / expver / init_time / f"{param}.csv")
+            gif = example / "animations" / expver / init_time / f"{param}.gif"
             results[(init_time, str(param))] = (rows, gif.stat().st_size)
     return results
 
 
 @pytest.fixture(scope="module")
 def example(tmp_path_factory, run_logged) -> dict:
-    """Runs, in order: init, the example, a second run, a widened ``params`` (dry run
-    and run), the narrowed ``params`` again (run) and a new checkpoint (dry run)."""
+    """Runs, in order: init, the example, a second run, a widened ``params``, the
+    narrowed ``params`` again and a second model checkpoint."""
     tmp = tmp_path_factory.mktemp("forecast-evaluation")
     run = run_logged(tmp / "logs")
     config = tmp / ".fdb" / "config.yaml"
     work = tmp / "forecast-evaluation"
     out: dict = {"tmp": tmp, "config": config, "example": work}
 
-    def write_config(params: list[int], checkpoint: str = CHECKPOINT) -> None:
-        (work / "config.yaml").write_text(yaml.safe_dump(_config(params, checkpoint)))
+    def write_config(params: list[int], checkpoints: list[str] | None = None) -> None:
+        (work / "config.yaml").write_text(yaml.safe_dump(_config(params, checkpoints)))
 
     def snakemake(name: str, *args: str) -> None:
         cmd = [sys.executable, "-m", "snakemake", "--profile", "profile"]
@@ -144,19 +155,19 @@ def example(tmp_path_factory, run_logged) -> dict:
             ".snakemake", "__pycache__", "metrics", "animations"
         ),
     )
+    first, second = _expver(CHECKPOINT), _expver(SECOND_CHECKPOINT)
 
     write_config([167])
     snakemake("run1")
     out["storage_after_run1"] = _storage_files(work)
-    out["results_after_run1"] = _results(work, [167])
+    out["results_after_run1"] = _results(work, first, [167])
     out["scorecard_after_run1"] = _rows(work / "scorecard.csv")
     snakemake("run2")
 
     write_config([167, 165])
-    snakemake("widen_dry", "--dry-run")
     snakemake("widen")
     out["storage_after_widen"] = _storage_files(work)
-    out["results_after_widen"] = _results(work, [167, 165])
+    out["results_after_widen"] = _results(work, first, [167, 165])
     out["scorecard_after_widen"] = _rows(work / "scorecard.csv")
 
     write_config([167])
@@ -166,14 +177,28 @@ def example(tmp_path_factory, run_logged) -> dict:
         str(p.relative_to(work)) for p in work.rglob("165.*")
     )
 
-    write_config([167], NEW_CHECKPOINT)
-    snakemake("checkpoint_dry", "--dry-run")
+    # A second experiment: the first one's artefacts must survive it untouched.
+    before = {
+        name: path.stat().st_mtime_ns
+        for name, path in _artefacts(work, first, [167]).items()
+    }
+    write_config([167], [CHECKPOINT, SECOND_CHECKPOINT])
+    snakemake("add_checkpoint")
+    out["first_experiment_mtimes"] = (
+        before,
+        {
+            name: path.stat().st_mtime_ns
+            for name, path in _artefacts(work, first, [167]).items()
+        },
+    )
+    out["results_of_second"] = _results(work, second, [167])
+    out["scorecard_after_second"] = _rows(work / "scorecard.csv")
     return out
 
 
 def test_example_produces_metrics_and_animations(example):
-    """One CSV and one GIF per initialisation time and parameter; the CSV has a row per
-    step, with the model's expver and a finite RMSE."""
+    """One CSV and one GIF per experiment, initialisation time and parameter; the CSV
+    has a row per step, with the model's expver and a finite RMSE."""
     example["run1"].ok()
     for (init_time, param), (rows, gif_size) in example["results_after_run1"].items():
         assert len(rows) == len(STEPS)
@@ -186,8 +211,8 @@ def test_example_produces_metrics_and_animations(example):
 
 
 def test_example_scorecard_aggregates_the_metrics_files(example):
-    """``scorecard.csv`` holds every metrics row plus a ``mean`` row per parameter and
-    step over the initialisation times."""
+    """``scorecard.csv`` holds every metrics row plus a ``mean`` row per experiment,
+    parameter and step over the initialisation times."""
     rows = example["scorecard_after_run1"]
     detail = [row for row in rows if row[0] != "mean"]
     means = [row for row in rows if row[0] == "mean"]
@@ -221,7 +246,7 @@ def test_example_second_run_nothing_to_be_done(example):
 def test_example_widening_params_reruns_everything(example):
     """A new parameter has no fields in FDB, so the model reruns and with it the whole
     chain, for every initialisation time."""
-    counts = _job_counts(example["widen_dry"].ok())
+    counts = _job_counts(example["widen"].ok())
     assert counts == {
         "truth": len(INIT_TIMES),
         "run_model": len(INIT_TIMES),
@@ -230,7 +255,6 @@ def test_example_widening_params_reruns_everything(example):
         "scorecard": 1,
         "all": 1,
     }
-    example["widen"].ok()
     assert len(example["results_after_widen"]) == 2 * len(INIT_TIMES)
     scorecard = example["scorecard_after_widen"]
     assert {row[2] for row in scorecard} == {"167", "165"}
@@ -251,11 +275,11 @@ def test_example_narrowing_params_reruns_only_the_scorecard(example):
     assert example["metrics_165_after_narrow"]
 
 
-def test_example_new_checkpoint_reruns_the_model_only(example):
-    """A new checkpoint is a new expver: the model's outputs are missing, the truth's
-    are not."""
-    log = example["checkpoint_dry"].ok()
-    assert f"expver={_expver(NEW_CHECKPOINT)}" in log
+def test_example_second_checkpoint_runs_the_model_only(example):
+    """A second checkpoint is a second experiment: its FDB outputs are missing, the
+    truth's are not, and the {expver} wildcard keeps the two apart."""
+    log = example["add_checkpoint"].ok()
+    assert f"expver={_expver(SECOND_CHECKPOINT)}" in log
     counts = _job_counts(log)
     assert counts == {
         "run_model": len(INIT_TIMES),
@@ -264,3 +288,19 @@ def test_example_new_checkpoint_reruns_the_model_only(example):
         "scorecard": 1,
         "all": 1,
     }
+    assert len(example["results_of_second"]) == len(INIT_TIMES)
+
+
+def test_example_second_checkpoint_keeps_the_first_experiment(example):
+    """The expver is a wildcard of every local path, so the second experiment writes
+    its own files and the scorecard compares both (D's F6: without it, the second run
+    overwrites the first one's results)."""
+    before, after = example["first_experiment_mtimes"]
+    assert before == after and before
+    rows = example["scorecard_after_second"]
+    expvers = {_expver(CHECKPOINT), _expver(SECOND_CHECKPOINT)}
+    assert {row[1] for row in rows} == expvers
+    means = [row for row in rows if row[0] == "mean"]
+    assert sorted((row[1], row[2], int(row[3])) for row in means) == sorted(
+        (expver, "167", step) for expver in expvers for step in STEPS
+    )
